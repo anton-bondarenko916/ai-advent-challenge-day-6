@@ -1,0 +1,9 @@
+# Зависимости проекта DeepSeek Chat
+# Установка: pip install -r requirements.txt
+
+# Официальный SDK OpenAI — используется как HTTP-клиент для DeepSeek API
+# (DeepSeek совместим с API OpenAI).
+openai>=1.30.0
+
+# Загрузка переменных окружения из файла .env
+python-dotenv>=1.0.0

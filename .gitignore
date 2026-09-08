@@ -1,0 +1,29 @@
+# --- Секреты: никогда не коммитить ---
+.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- IDE / ОС ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Логи и скриншоты ---
+logs/
+*.log
+docs/screenshots/
+
+# --- Временные каталоги тестов ---
+tests/tmp*/
