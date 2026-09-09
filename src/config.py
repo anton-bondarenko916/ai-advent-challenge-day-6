@@ -64,10 +64,13 @@ DEFAULTS: Dict[str, Any] = {
     "UI_HEIGHT": 700,
     "MOCK_MODE": False,  # True — имитация ответов без обращения к API
     "MAX_HISTORY_MESSAGES": 50,  # ограничение истории диалога
+    # Персистентность контекста (SQLite)
+    "STORAGE_ENABLED": True,  # False — отключить сохранение контекста
+    "STORAGE_PATH": "data/chat_history.db",  # путь к БД (относительно корня)
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
-_BOOL_KEYS = ("MOCK_MODE",)
+_BOOL_KEYS = ("MOCK_MODE", "STORAGE_ENABLED")
 
 # Переменные, значения которых нужно приводить к числу
 _INT_KEYS = ("UI_WIDTH", "UI_HEIGHT", "DEFAULT_MAX_TOKENS", "MAX_HISTORY_MESSAGES")

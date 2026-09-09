@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import sys
 import traceback
+from pathlib import Path
 from typing import List
 
 from src import utils
 from src.agent import DeepSeekAgent
-from src.config import load_config, validate_api_key
+from src.config import PROJECT_ROOT, load_config, validate_api_key
+from src.storage import ContextStore
 from src.utils import AgentConfigError, get_logger
 
 logger = get_logger("deepseek-chat")
@@ -64,7 +66,17 @@ def main(argv: List[str]) -> int:
               "либо запустите с флагом --mock.", file=sys.stderr)
         return 1
 
-    # 3. Создание агента
+    # 3. Хранилище контекста (SQLite). Передаётся агенту; в mock-режиме
+    #    агент сам игнорирует хранилище (не читает и не пишет).
+    storage = None
+    if config.get("STORAGE_ENABLED", True):
+        raw_path = str(config.get("STORAGE_PATH", "data/chat_history.db"))
+        db_path = Path(raw_path)
+        if not db_path.is_absolute():
+            db_path = PROJECT_ROOT / db_path
+        storage = ContextStore(db_path=db_path, enabled=True)
+
+    # 4. Создание агента
     try:
         agent = DeepSeekAgent(
             api_key=config["DEEPSEEK_API_KEY"],
@@ -74,12 +86,13 @@ def main(argv: List[str]) -> int:
             max_tokens=config["DEFAULT_MAX_TOKENS"],
             mock_mode=config["MOCK_MODE"],
             max_history_messages=config["MAX_HISTORY_MESSAGES"],
+            storage=storage,
         )
     except AgentConfigError as exc:
         print(f"[ОШИБКА] Некорректная конфигурация агента: {exc}", file=sys.stderr)
         return 1
 
-    # 4. GUI
+    # 5. GUI
     try:
         # Импортируем tkinter-модуль здесь, чтобы CLI/тесты могли
         # пользоваться агентом без установленного графического стека.
@@ -107,6 +120,9 @@ def main(argv: List[str]) -> int:
                      traceback.format_exc())
         print("[ОШИБКА] См. лог выше.", file=sys.stderr)
         return 1
+    finally:
+        # Финальный flush контекста при любом исходе завершения GUI
+        agent.close()
 
 
 if __name__ == "__main__":

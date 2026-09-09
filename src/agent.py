@@ -10,7 +10,10 @@
 - потокобезопасен (все операции под RLock);
 - не выбрасывает исключений наружу из send_message — ошибки
   возвращаются в результирующем словаре под ключом "error";
-- поддерживает mock-режим (имитация ответа без сети) для тестов.
+- поддерживает mock-режим (имитация ответа без сети) для тестов;
+- умеет сохранять контекст (историю + параметры) в SQLite через
+  ContextStore и восстанавливать его при следующем запуске; в
+  mock-режиме хранилище не читается и не пишется.
 """
 
 from __future__ import annotations
@@ -24,7 +27,10 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from . import utils
+from .storage import ContextStore
 from .utils import AgentConfigError, ApiError, humanize_api_error
+
+logger = utils.get_logger("deepseek-chat.agent")
 
 # Тип сообщения истории: {"role": "system"|"user"|"assistant", "content": str}
 Message = Dict[str, str]
@@ -66,8 +72,14 @@ class DeepSeekAgent:
         max_tokens: Optional[int] = None,
         mock_mode: bool = False,
         max_history_messages: int = utils.MAX_HISTORY_LIMIT,
+        storage: Optional[ContextStore] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
+
+        Если передано хранилище (ContextStore), агент пытается загрузить
+        сохранённый ранее контекст: восстановленные параметры переопределяют
+        значения, переданные в конструктор. В mock-режиме хранилище
+        игнорируется (ни чтение, ни запись).
 
         Args:
             api_key: ключ DeepSeek API (обязателен вне mock-режима).
@@ -77,6 +89,7 @@ class DeepSeekAgent:
             max_tokens: лимит токенов ответа; по умолчанию 1000.
             mock_mode: если True, ответы имитируются без обращения к API.
             max_history_messages: максимум сообщений истории без system.
+            storage: хранилище контекста (SQLite); None — без персиста.
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -96,6 +109,8 @@ class DeepSeekAgent:
         self._mock_mode: bool = bool(mock_mode)
         self._max_history: int = int(max_history_messages)
         self._lock = threading.RLock()
+        self._storage: Optional[ContextStore] = storage
+        self._closed: bool = False
 
         # Клиент создаётся только вне mock-режима
         self._client: Optional[OpenAI] = None
@@ -110,6 +125,10 @@ class DeepSeekAgent:
         # История начинается с системного промпта
         self._message_history: List[Message] = []
         self._init_history()
+
+        # Восстановление контекста из хранилища (только вне mock-режима)
+        if not self._mock_mode:
+            self._load_context()
 
     # ------------------------------------------------------------------
     # Публичное API
@@ -157,6 +176,8 @@ class DeepSeekAgent:
                     {"role": "assistant", "content": payload["content"]}
                 )
                 self._trim_history()
+                # Сохраняем контекст после каждого успешного обмена
+                self._persist()
 
                 return {
                     "text": payload["content"],
@@ -183,9 +204,15 @@ class DeepSeekAgent:
                 )
 
     def clear_history(self) -> None:
-        """Очищает историю диалога, оставляя только системный промпт."""
+        """Очищает историю диалога, оставляя только системный промпт.
+
+        Сохранённый на диске контекст также очищается (остаётся только
+        системный промпт и параметры агента).
+        """
         with self._lock:
             self._init_history()
+            # Перезаписываем хранилище согласованным состоянием
+            self._persist()
 
     def update_config(self, **kwargs: Any) -> None:
         """Обновляет параметры агента «на лету» с проверкой валидности.
@@ -250,6 +277,35 @@ class DeepSeekAgent:
             if "max_history_messages" in kwargs:
                 self._max_history = new_max_history
                 self._trim_history()
+
+            # Персист: смена системного промпта перезаписывает диалог
+            # на диске, смена остальных параметров обновляет параметры.
+            if self._persistence_active():
+                if "system_prompt" in kwargs:
+                    self._persist()
+                elif any(k in kwargs for k in
+                         ("model", "temperature", "max_tokens")):
+                    self._persist_params()
+
+    def close(self) -> None:
+        """Закрывает агента: финальный flush контекста и хранилища.
+
+        Метод идемпотентен и безопасен для повторного вызова. Финальный
+        flush выполняется только если на диске уже есть сохранённый
+        контекст или в памяти есть диалог — чтобы пустой запуск не
+        создавал файл БД «просто так».
+        """
+        with self._lock:
+            if self._closed:
+                return
+            # Сначала финальный flush, только потом закрытие хранилища:
+            # установка _closed раньше отключила бы персист.
+            if self._persistence_active() and self._storage is not None:
+                has_dialog = len(self._message_history) > 1
+                if self._storage.exists or has_dialog:
+                    self._persist()
+                self._storage.close()
+            self._closed = True
 
     # ------------------------------------------------------------------
     # Приватные методы
@@ -399,6 +455,113 @@ class DeepSeekAgent:
             "error": message,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
+
+    # ------------------------------------------------------------------
+    # Персистентность контекста
+    # ------------------------------------------------------------------
+
+    def _persistence_active(self) -> bool:
+        """True, если хранилище подключено и агент не в mock-режиме."""
+        return (
+            self._storage is not None
+            and not self._mock_mode
+            and not self._closed
+        )
+
+    def _current_params(self) -> Dict[str, Any]:
+        """Текущие параметры агента для сохранения в хранилище."""
+        return {
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+
+    def _persist(self) -> None:
+        """Сохраняет текущую историю и параметры (ошибки не пробрасываются)."""
+        if not self._persistence_active() or self._storage is None:
+            return
+        try:
+            self._storage.save_state(self._message_history, self._current_params())
+        except Exception as exc:
+            logger.error("Не удалось сохранить контекст: %s", exc)
+
+    def _persist_params(self) -> None:
+        """Сохраняет только параметры агента (ошибки не пробрасываются)."""
+        if not self._persistence_active() or self._storage is None:
+            return
+        try:
+            self._storage.save_params(self._current_params())
+        except Exception as exc:
+            logger.error("Не удалось сохранить параметры: %s", exc)
+
+    def _load_context(self) -> None:
+        """Загружает сохранённый контекст (историю и параметры) из хранилища.
+
+        Вызывается в конце __init__ (вне mock-режима). Восстановленные
+        параметры проходят валидацию: невалидные значения игнорируются
+        с предупреждением в логе. Если хранилище отсутствует/пусто/бито —
+        агент остаётся в исходном состоянии.
+        """
+        if self._storage is None:
+            return
+        try:
+            state = self._storage.load_state()
+        except Exception as exc:  # хранилище не должно ронять запуск
+            logger.warning("Не удалось прочитать сохранённый контекст: %s", exc)
+            return
+        if not state:
+            return
+
+        params = state.get("params") or {}
+        messages = state.get("messages") or []
+
+        # 1. Восстанавливаем параметры с валидацией и мягким fallback
+        for key, validator in (
+            ("model", utils.validate_model),
+            ("temperature", utils.validate_temperature),
+            ("max_tokens", utils.validate_max_tokens),
+            ("system_prompt", utils.validate_system_prompt),
+        ):
+            if key not in params:
+                continue
+            try:
+                setattr(self, key, validator(params[key]))
+            except (AgentConfigError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Сохранённый параметр %r=%r невалиден (%s) — "
+                    "оставлено текущее значение.",
+                    key, params.get(key), exc,
+                )
+
+        # 2. Если параметра system_prompt нет — берём из первого сообщения
+        if "system_prompt" not in params and messages:
+            first = messages[0]
+            if first.get("role") == "system" and first.get("content"):
+                try:
+                    self.system_prompt = utils.validate_system_prompt(
+                        str(first["content"])
+                    )
+                except AgentConfigError:
+                    pass
+
+        # 3. Пересоздаём историю: system из параметра, диалог — из БД
+        self._init_history()
+        restored = 0
+        for message in messages:
+            role = message.get("role")
+            if role in ("user", "assistant"):
+                self._message_history.append(
+                    {"role": role, "content": str(message.get("content", ""))}
+                )
+                restored += 1
+        self._trim_history()
+
+        if restored:
+            logger.info(
+                "Контекст восстановлен: %d сообщений, модель=%s.",
+                restored, self.model,
+            )
 
     # ------------------------------------------------------------------
     # Служебные свойства (для UI и отладки)

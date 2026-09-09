@@ -88,11 +88,29 @@ class ChatApplication:
         self._configure_window()
         self._build_widgets()
         self._bind_events()
+        # ВАЖНО: агент уже загрузил сохранённый контекст в своём __init__,
+        # поэтому синхронизация виджетов ниже отражает восстановленные
+        # параметры (модель, температура, max tokens, системный промпт).
         self._apply_config_to_controls()
         self._refresh_chat()
-        self._set_status(
-            "Готов" + (" · mock-режим (без реального API)" if agent.is_mock else "")
-        )
+        self._set_initial_status()
+
+    def _set_initial_status(self) -> None:
+        """Показывает стартовый статус в статус-баре.
+
+        Если агент восстановил сохранённый контекст (в истории больше
+        одного сообщения), сообщаем об этом пользователю.
+        """
+        history_len = len(self.agent.history) - 1  # минус системный промпт
+        if self.agent.is_mock:
+            self._set_status("Готов · mock-режим (без реального API)")
+        elif history_len > 0:
+            self._set_status(
+                f"Контекст восстановлен: {history_len} сообщений · "
+                f"модель {self.agent.model}"
+            )
+        else:
+            self._set_status("Готов")
 
     # ------------------------------------------------------------------
     # Построение интерфейса
@@ -729,5 +747,11 @@ class ChatApplication:
             self.input.focus_set()
 
     def _on_close(self) -> None:
-        """Корректно завершает приложение при закрытии окна."""
+        """Корректно завершает приложение при закрытии окна.
+
+        Сначала — финальный flush контекста агентом (сохранение истории
+        и параметров в хранилище), затем закрытие окна. Метод агента
+        close() идемпотентен, повторный вызов из main.py безопасен.
+        """
+        self.agent.close()
         self.root.destroy()
