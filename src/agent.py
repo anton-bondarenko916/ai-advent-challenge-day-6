@@ -13,7 +13,11 @@
 - поддерживает mock-режим (имитация ответа без сети) для тестов;
 - умеет сохранять контекст (историю + параметры) в SQLite через
   ContextStore и восстанавливать его при следующем запуске; в
-  mock-режиме хранилище не читается и не пишется.
+  mock-режиме хранилище не читается и не пишется;
+- считает токены: точные значения из usage API для запроса и ответа,
+  локальную оценку — для контекста истории и (при отсутствии usage)
+  для запроса/ответа; накапливает статистику сессии и считает стоимость
+  по ценам из конфигурации.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from openai import OpenAI
 
 from . import utils
 from .storage import ContextStore
+from .tokens import TokenCounter, create_counter
 from .utils import AgentConfigError, ApiError, humanize_api_error
 
 logger = utils.get_logger("deepseek-chat.agent")
@@ -73,6 +78,8 @@ class DeepSeekAgent:
         mock_mode: bool = False,
         max_history_messages: int = utils.MAX_HISTORY_LIMIT,
         storage: Optional[ContextStore] = None,
+        token_counter: Optional[TokenCounter] = None,
+        prices: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -90,6 +97,12 @@ class DeepSeekAgent:
             mock_mode: если True, ответы имитируются без обращения к API.
             max_history_messages: максимум сообщений истории без system.
             storage: хранилище контекста (SQLite); None — без персиста.
+            token_counter: счётчик токенов; None — создать автоматически
+                (tiktoken при наличии, иначе встроенная эвристика).
+            prices: цены токенов (USD за 1M) вида
+                {"default": {"input": .., "output": ..},
+                 "models": {"<model>": {"input": .., "output": ..}}};
+                None/нули — стоимость не считается.
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -111,6 +124,15 @@ class DeepSeekAgent:
         self._lock = threading.RLock()
         self._storage: Optional[ContextStore] = storage
         self._closed: bool = False
+
+        # Учёт токенов: счётчик, цены, статистика сессии и последний обмен
+        self._counter: TokenCounter = (
+            token_counter if token_counter is not None
+            else create_counter(model=self.model)
+        )
+        self._prices: Dict[str, Any] = dict(prices) if prices else {}
+        self._session_stats: Dict[str, Any] = self._default_session_stats()
+        self._last_exchange: Dict[str, Any] = self._default_last_exchange()
 
         # Клиент создаётся только вне mock-режима
         self._client: Optional[OpenAI] = None
@@ -151,18 +173,27 @@ class DeepSeekAgent:
             Словарь с полями:
             - text: текст ответа (None при ошибке);
             - model: использованная модель;
-            - tokens: {prompt_tokens, completion_tokens, total_tokens}
-              или None, если API не вернул статистику;
+            - tokens: словарь статистики последнего обмена:
+              prompt_tokens/completion_tokens/total_tokens (значения API,
+              либо оценка, если API не вернул usage), estimated (True —
+              значения оценочные), context_tokens (оценка всего контекста),
+              session_total_tokens, cost_usd, session_cost_usd,
+              cache_hit_tokens, cache_miss_tokens;
             - response_time: время запроса в секундах;
             - finish_reason: причина завершения (stop, length и т.п.);
             - error: None либо текст ошибки;
             - timestamp: локальное время ответа (строка).
+
+            При ошибке запроса поле tokens = None, а счётчики сессии
+            не изменяются.
         """
         if not user_input or not user_input.strip():
             return self._error_result("Пустое сообщение.")
 
         with self._lock:
             self._append_message({"role": "user", "content": user_input.strip()})
+            # Снимок того, что реально уйдёт в API (для оценки токенов)
+            request_messages = list(self._message_history)
 
             start = time.perf_counter()
             try:
@@ -176,13 +207,15 @@ class DeepSeekAgent:
                     {"role": "assistant", "content": payload["content"]}
                 )
                 self._trim_history()
+                # Учитываем токены обмена (точные из API или оценку)
+                token_info = self._update_token_stats(payload, request_messages)
                 # Сохраняем контекст после каждого успешного обмена
                 self._persist()
 
                 return {
                     "text": payload["content"],
                     "model": payload.get("model", self.model),
-                    "tokens": payload.get("tokens"),
+                    "tokens": token_info,
                     "response_time": elapsed,
                     "finish_reason": payload.get("finish_reason"),
                     "error": None,
@@ -207,10 +240,13 @@ class DeepSeekAgent:
         """Очищает историю диалога, оставляя только системный промпт.
 
         Сохранённый на диске контекст также очищается (остаётся только
-        системный промпт и параметры агента).
+        системный промпт и параметры агента). Накопленная статистика
+        токенов сессии при этом сбрасывается — и в памяти, и на диске.
         """
         with self._lock:
             self._init_history()
+            self._session_stats = self._default_session_stats()
+            self._last_exchange = self._default_last_exchange()
             # Перезаписываем хранилище согласованным состоянием
             self._persist()
 
@@ -388,6 +424,10 @@ class DeepSeekAgent:
                 "prompt_tokens": getattr(usage, "prompt_tokens", None),
                 "completion_tokens": getattr(usage, "completion_tokens", None),
                 "total_tokens": getattr(usage, "total_tokens", None),
+                "estimated": False,
+                # Поля кэша промпта (если API их возвращает)
+                "cache_hit_tokens": getattr(usage, "prompt_cache_hit_tokens", None),
+                "cache_miss_tokens": getattr(usage, "prompt_cache_miss_tokens", None),
             }
 
         return {
@@ -414,6 +454,10 @@ class DeepSeekAgent:
                 "prompt_tokens": len(self._message_history),
                 "completion_tokens": len(text.split()),
                 "total_tokens": len(self._message_history) + len(text.split()),
+                # mock-значения синтетические — помечаем как оценочные
+                "estimated": True,
+                "cache_hit_tokens": None,
+                "cache_miss_tokens": None,
             },
             "finish_reason": "stop",
         }
@@ -478,11 +522,15 @@ class DeepSeekAgent:
         }
 
     def _persist(self) -> None:
-        """Сохраняет текущую историю и параметры (ошибки не пробрасываются)."""
+        """Сохраняет историю, параметры и статистику (ошибки не пробрасываются)."""
         if not self._persistence_active() or self._storage is None:
             return
         try:
-            self._storage.save_state(self._message_history, self._current_params())
+            self._storage.save_state(
+                self._message_history,
+                self._current_params(),
+                stats=dict(self._session_stats),
+            )
         except Exception as exc:
             logger.error("Не удалось сохранить контекст: %s", exc)
 
@@ -557,11 +605,289 @@ class DeepSeekAgent:
                 restored += 1
         self._trim_history()
 
+        # 4. Восстанавливаем накопленную статистику токенов
+        self._restore_session_stats(state.get("stats"))
+
         if restored:
             logger.info(
                 "Контекст восстановлен: %d сообщений, модель=%s.",
                 restored, self.model,
             )
+
+    # ------------------------------------------------------------------
+    # Учёт токенов и стоимости
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _default_session_stats() -> Dict[str, Any]:
+        """Пустая накопленная статистика сессии."""
+        return {
+            # Точные значения из usage API
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "requests": 0,
+            "exact_requests": 0,
+            # Оценочные значения (usage недоступен)
+            "estimated_prompt_tokens": 0,
+            "estimated_completion_tokens": 0,
+            "estimated_total_tokens": 0,
+            # Стоимость (USD): точная и по оценкам
+            "cost_usd": 0.0,
+            "estimated_cost_usd": 0.0,
+        }
+
+    @staticmethod
+    def _default_last_exchange() -> Dict[str, Any]:
+        """Пустая статистика последнего обмена."""
+        return {
+            "request_tokens": None,
+            "response_tokens": None,
+            "total_tokens": None,
+            "estimated": False,
+            "cost_usd": None,
+            "cache_hit_tokens": None,
+            "cache_miss_tokens": None,
+        }
+
+    def _restore_session_stats(self, stats: Optional[Dict[str, Any]]) -> None:
+        """Восстанавливает статистику сессии из хранилища (с валидацией).
+
+        Неизвестные ключи и значения неверного типа игнорируются, поэтому
+        старая/повреждённая статистика не ломает запуск.
+        """
+        if not isinstance(stats, dict):
+            return
+        restored = self._default_session_stats()
+        for key, default in restored.items():
+            value = stats.get(key)
+            if isinstance(default, float):
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    restored[key] = float(value)
+            elif isinstance(value, int) and not isinstance(value, bool):
+                restored[key] = value
+        self._session_stats = restored
+
+    def _resolve_prices(self) -> tuple:
+        """Возвращает (цена_входа, цена_выхода) за 1M токенов для модели.
+
+        Приоритет: цена по модели → общая цена → None (не задана).
+        """
+        cfg = self._prices or {}
+        default = cfg.get("default") or {}
+        per_model = (cfg.get("models") or {}).get(self.model) or {}
+
+        def _norm(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        price_in = per_model.get("input", default.get("input"))
+        price_out = per_model.get("output", default.get("output"))
+        return _norm(price_in), _norm(price_out)
+
+    def _prices_set(self) -> bool:
+        """True, если задана хотя бы одна ненулевая цена."""
+        price_in, price_out = self._resolve_prices()
+        return bool(price_in) or bool(price_out)
+
+    def _compute_cost(self, prompt_tokens: int,
+                      completion_tokens: int) -> Optional[float]:
+        """Считает стоимость обмена в USD (None, если цены не заданы)."""
+        price_in, price_out = self._resolve_prices()
+        if not price_in and not price_out:
+            return None
+        try:
+            cost = (
+                prompt_tokens / 1_000_000 * (price_in or 0.0)
+                + completion_tokens / 1_000_000 * (price_out or 0.0)
+            )
+        except (TypeError, ValueError):
+            return None
+        return round(cost, 6)
+
+    def _update_token_stats(self, payload: Dict[str, Any],
+                            request_messages: List[Message]) -> Dict[str, Any]:
+        """Обновляет статистику по завершённому обмену и возвращает её срез.
+
+        Точные значения берутся из usage API; если usage нет (или значения
+        помечены как оценочные, например в mock-режиме) — используется
+        локальная оценка счётчиком токенов.
+
+        Args:
+            payload: результат _handle_response/_mock_response.
+            request_messages: снимок истории, отправленной в API.
+
+        Returns:
+            Словарь статистики обмена для поля "tokens" результата.
+        """
+        raw = payload.get("tokens") or {}
+        api_prompt = raw.get("prompt_tokens")
+        api_completion = raw.get("completion_tokens")
+        api_total = raw.get("total_tokens")
+        marked_estimated = bool(raw.get("estimated", False))
+
+        estimated = (
+            marked_estimated
+            or api_prompt is None
+            or api_completion is None
+        )
+
+        if estimated:
+            # Локальная оценка: снимок запроса + текст ответа
+            prompt_tokens = self._counter.count_messages(request_messages)
+            completion_tokens = self._counter.count_text(
+                payload.get("content") or ""
+            )
+            total_tokens = prompt_tokens + completion_tokens
+            self._session_stats["estimated_prompt_tokens"] += prompt_tokens
+            self._session_stats["estimated_completion_tokens"] += completion_tokens
+            self._session_stats["estimated_total_tokens"] += total_tokens
+            cost = self._compute_cost(prompt_tokens, completion_tokens)
+            if cost is not None:
+                self._session_stats["estimated_cost_usd"] = round(
+                    self._session_stats["estimated_cost_usd"] + cost, 6
+                )
+        else:
+            prompt_tokens = int(api_prompt)
+            completion_tokens = int(api_completion)
+            if api_total is None:
+                total_tokens = prompt_tokens + completion_tokens
+            else:
+                total_tokens = int(api_total)
+            self._session_stats["prompt_tokens"] += prompt_tokens
+            self._session_stats["completion_tokens"] += completion_tokens
+            self._session_stats["total_tokens"] += total_tokens
+            cost = self._compute_cost(prompt_tokens, completion_tokens)
+            if cost is not None:
+                self._session_stats["cost_usd"] = round(
+                    self._session_stats["cost_usd"] + cost, 6
+                )
+
+        self._session_stats["requests"] += 1
+        if not estimated:
+            self._session_stats["exact_requests"] += 1
+
+        self._last_exchange = {
+            "request_tokens": prompt_tokens,
+            "response_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "estimated": estimated,
+            "cost_usd": cost,
+            "cache_hit_tokens": raw.get("cache_hit_tokens"),
+            "cache_miss_tokens": raw.get("cache_miss_tokens"),
+        }
+
+        return {
+            # «Старые» ключи: точные значения API, либо оценка (см. estimated)
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            # Новые ключи
+            "estimated": estimated,
+            "context_tokens": self.count_history_tokens(),
+            "session_total_tokens": self._session_total_with_estimates(),
+            "cost_usd": cost,
+            "session_cost_usd": self._session_cost_total(),
+            "cache_hit_tokens": raw.get("cache_hit_tokens"),
+            "cache_miss_tokens": raw.get("cache_miss_tokens"),
+        }
+
+    def _session_total_with_estimates(self) -> int:
+        """Суммарные токены сессии: точные + оценочные."""
+        return int(
+            self._session_stats.get("total_tokens", 0)
+            + self._session_stats.get("estimated_total_tokens", 0)
+        )
+
+    def _session_cost_total(self) -> Optional[float]:
+        """Суммарная стоимость сессии (точная + оценочная) или None."""
+        if not self._prices_set():
+            return None
+        return round(
+            float(self._session_stats.get("cost_usd", 0.0))
+            + float(self._session_stats.get("estimated_cost_usd", 0.0)),
+            6,
+        )
+
+    def count_tokens(self, text: str) -> int:
+        """Оценивает число токенов в произвольном тексте.
+
+        Args:
+            text: текст для оценки.
+
+        Returns:
+            Оценка токенов (0 для пустой строки).
+        """
+        try:
+            return int(self._counter.count_text(str(text or "")))
+        except Exception as exc:  # счётчик не должен ломать вызывающий код
+            logger.warning("Ошибка счётчика токенов: %s", exc)
+            return 0
+
+    def count_history_tokens(self) -> int:
+        """Оценивает токены всего текущего контекста диалога (включая system).
+
+        Returns:
+            Оценка токенов истории, которая уйдёт в следующий запрос.
+        """
+        with self._lock:
+            try:
+                return int(self._counter.count_messages(self._message_history))
+            except Exception as exc:
+                logger.warning("Ошибка счётчика токенов: %s", exc)
+                return 0
+
+    def get_token_stats(self) -> Dict[str, Any]:
+        """Возвращает полную статистику токенов для UI.
+
+        Returns:
+            Словарь:
+            - request: {"tokens", "estimated"} — последний запрос;
+            - response: {"tokens", "estimated"} — последний ответ;
+            - context: {"tokens", "messages", "estimated"} — текущий контекст;
+            - session: накопленные суммы (точные и оценочные), стоимость,
+              признак prices_set, total_with_estimates;
+            - counter: имя активного счётчика ("tiktoken:..." | "heuristic").
+        """
+        with self._lock:
+            context_tokens = self.count_history_tokens()
+            session = dict(self._session_stats)
+            session["requests"] = int(session.get("requests", 0))
+            session["total_with_estimates"] = self._session_total_with_estimates()
+            session["prices_set"] = self._prices_set()
+            session["cost_usd"] = (
+                round(float(session.get("cost_usd", 0.0)), 6)
+                if session["prices_set"] else None
+            )
+            session["estimated_cost_usd"] = (
+                round(float(session.get("estimated_cost_usd", 0.0)), 6)
+                if session["prices_set"] else None
+            )
+            return {
+                "request": {
+                    "tokens": self._last_exchange.get("request_tokens"),
+                    "estimated": bool(self._last_exchange.get("estimated", False)),
+                },
+                "response": {
+                    "tokens": self._last_exchange.get("response_tokens"),
+                    "estimated": bool(self._last_exchange.get("estimated", False)),
+                },
+                "context": {
+                    "tokens": context_tokens,
+                    "messages": max(0, len(self._message_history) - 1),
+                    "estimated": True,  # контекст всегда оценивается локально
+                },
+                "session": session,
+                "counter": self._counter.name,
+            }
+
+    @property
+    def session_stats(self) -> Dict[str, Any]:
+        """Копия накопленной статистики сессии (только для чтения)."""
+        with self._lock:
+            return dict(self._session_stats)
 
     # ------------------------------------------------------------------
     # Служебные свойства (для UI и отладки)

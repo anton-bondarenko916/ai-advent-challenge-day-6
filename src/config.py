@@ -10,8 +10,11 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+from .utils import AVAILABLE_MODELS
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -67,14 +70,25 @@ DEFAULTS: Dict[str, Any] = {
     # Персистентность контекста (SQLite)
     "STORAGE_ENABLED": True,  # False — отключить сохранение контекста
     "STORAGE_PATH": "data/chat_history.db",  # путь к БД (относительно корня)
+    # Подсчёт токенов
+    "TOKENIZER_ENABLED": True,  # False — всегда использовать эвристику
+    "TOKENIZER_ENCODING": "cl100k_base",  # резервная кодировка tiktoken
+    # Цены за 1M токенов в USD (0.0 — цена не задана, стоимость не считается)
+    "PRICE_INPUT_PER_1M": 0.0,
+    "PRICE_OUTPUT_PER_1M": 0.0,
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
-_BOOL_KEYS = ("MOCK_MODE", "STORAGE_ENABLED")
+_BOOL_KEYS = ("MOCK_MODE", "STORAGE_ENABLED", "TOKENIZER_ENABLED")
 
 # Переменные, значения которых нужно приводить к числу
 _INT_KEYS = ("UI_WIDTH", "UI_HEIGHT", "DEFAULT_MAX_TOKENS", "MAX_HISTORY_MESSAGES")
-_FLOAT_KEYS = ("DEFAULT_TEMPERATURE",)
+_FLOAT_KEYS = ("DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M")
+
+# Суффиксы переменных окружения с ценами по конкретной модели:
+# PRICE_<MODEL>_INPUT_PER_1M / PRICE_<MODEL>_OUTPUT_PER_1M
+_PRICE_INPUT_SUFFIX = "INPUT_PER_1M"
+_PRICE_OUTPUT_SUFFIX = "OUTPUT_PER_1M"
 
 
 def load_config(env_file: str | os.PathLike | None = None) -> Dict[str, Any]:
@@ -162,3 +176,61 @@ def validate_api_key(config: Dict[str, Any]) -> None:
             "Либо задайте переменную окружения DEEPSEEK_API_KEY.\n"
             "Для тестирования без ключа можно включить mock-режим: MOCK_MODE=true"
         )
+
+
+def _price_prefix(model: str) -> str:
+    """Возвращает префикс переменных окружения с ценами для модели.
+
+    Пример: "deepseek-v4-flash" → "PRICE_DEEPSEEK_V4_FLASH".
+    """
+    normalized = re.sub(r"[^A-Za-z0-9]", "_", model).upper()
+    return f"PRICE_{normalized}"
+
+
+def get_prices(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает цены токенов (USD за 1M) из конфигурации и окружения.
+
+    Приоритет: цена по конкретной модели → общая цена → 0.0 (не задана).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь вида::
+
+            {
+              "default": {"input": float, "output": float},
+              "models": {"deepseek-v4-flash": {"input": float, "output": float}},
+            }
+    """
+    cfg = config if config is not None else get_config()
+
+    def _to_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    prices: Dict[str, Any] = {
+        "default": {
+            "input": _to_float(cfg.get("PRICE_INPUT_PER_1M", 0.0)),
+            "output": _to_float(cfg.get("PRICE_OUTPUT_PER_1M", 0.0)),
+        },
+        "models": {},
+    }
+
+    # Переопределения по моделям читаем из окружения: имена переменных
+    # зависят от имени модели и не перечислены в DEFAULTS.
+    for model in AVAILABLE_MODELS:
+        prefix = _price_prefix(model)
+        entry: Dict[str, float] = {}
+        raw_input = os.getenv(f"{prefix}_{_PRICE_INPUT_SUFFIX}")
+        raw_output = os.getenv(f"{prefix}_{_PRICE_OUTPUT_SUFFIX}")
+        if raw_input not in (None, ""):
+            entry["input"] = _to_float(raw_input)
+        if raw_output not in (None, ""):
+            entry["output"] = _to_float(raw_output)
+        if entry:
+            prices["models"][model] = entry
+
+    return prices

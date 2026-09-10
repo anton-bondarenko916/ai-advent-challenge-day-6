@@ -32,6 +32,7 @@ SCHEMA_VERSION = "1"
 # Ключи в таблице meta
 _KEY_PARAMS = "params"
 _KEY_SCHEMA = "schema_version"
+_KEY_STATS = "stats"
 
 
 class ContextStore:
@@ -68,11 +69,12 @@ class ContextStore:
         return self.db_path.exists()
 
     def load_state(self) -> Optional[Dict[str, Any]]:
-        """Загружает сохранённый диалог и параметры агента.
+        """Загружает сохранённый диалог, параметры и статистику токенов.
 
         Returns:
-            Словарь {"messages": [...], "params": {...}} либо None, если:
-            файла нет, хранилище отключено, схема не совпадает или диалог пуст.
+            Словарь {"messages": [...], "params": {...}, "stats": {...}}
+            либо None, если: файла нет, хранилище отключено, схема не
+            совпадает или диалог пуст.
 
         Raises:
             Не выбрасывает: ошибки БД логируются, возвращается None.
@@ -107,15 +109,32 @@ class ContextStore:
                     except (ValueError, TypeError):
                         self._log.warning("Не удалось разобрать параметры из БД.")
 
+                stats: Dict[str, Any] = {}
+                stats_raw = self._read_meta(conn, _KEY_STATS)
+                if stats_raw:
+                    try:
+                        parsed_stats = json.loads(stats_raw)
+                        if isinstance(parsed_stats, dict):
+                            stats = parsed_stats
+                    except (ValueError, TypeError):
+                        self._log.warning(
+                            "Не удалось разобрать статистику токенов из БД."
+                        )
+
                 messages = [
                     {"role": role, "content": content} for role, content in rows
                 ]
-                return {"messages": messages, "params": params}
+                return {
+                    "messages": messages,
+                    "params": params,
+                    "stats": stats,
+                }
         except sqlite3.Error as exc:
             self._log.error("Ошибка загрузки контекста из БД: %s", exc)
             return None
 
-    def save_state(self, messages: List[Message], params: Dict[str, Any]) -> bool:
+    def save_state(self, messages: List[Message], params: Dict[str, Any],
+                   stats: Optional[Dict[str, Any]] = None) -> bool:
         """Полностью перезаписывает диалог и параметры в одной транзакции.
 
         Полная перезапись таблицы messages (≤ 50–60 строк) надёжнее
@@ -124,6 +143,8 @@ class ContextStore:
         Args:
             messages: список сообщений {role, content} (включая system).
             params: словарь параметров агента для сохранения.
+            stats: накопленная статистика токенов; None — не изменять
+                уже сохранённое значение (обратная совместимость).
 
         Returns:
             True при успехе, False при ошибке БД (ошибка залогирована).
@@ -145,8 +166,12 @@ class ContextStore:
                 self._write_meta(
                     conn, _KEY_PARAMS, json.dumps(params, ensure_ascii=False)
                 )
+                if stats is not None:
+                    self._write_meta(
+                        conn, _KEY_STATS, json.dumps(stats, ensure_ascii=False)
+                    )
             return True
-        except (sqlite3.Error, OSError) as exc:
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
             self._log.error("Ошибка сохранения контекста в БД: %s", exc)
             return False
 
@@ -174,7 +199,7 @@ class ContextStore:
             return False
 
     def clear(self) -> bool:
-        """Удаляет диалог и параметры из БД (схема и версия остаются).
+        """Удаляет диалог, параметры и статистику из БД (схема остаётся).
 
         Returns:
             True при успехе, False при ошибке БД или отсутствии файла.
@@ -185,7 +210,10 @@ class ContextStore:
             with self._session() as conn:
                 self._ensure_schema(conn)
                 conn.execute("DELETE FROM messages")
-                conn.execute("DELETE FROM meta WHERE key = ?", (_KEY_PARAMS,))
+                conn.execute(
+                    "DELETE FROM meta WHERE key IN (?, ?)",
+                    (_KEY_PARAMS, _KEY_STATS),
+                )
             return True
         except sqlite3.Error as exc:
             self._log.error("Ошибка очистки контекста в БД: %s", exc)

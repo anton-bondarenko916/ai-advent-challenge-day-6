@@ -18,8 +18,9 @@ from typing import List
 
 from src import utils
 from src.agent import DeepSeekAgent
-from src.config import PROJECT_ROOT, load_config, validate_api_key
+from src.config import PROJECT_ROOT, get_prices, load_config, validate_api_key
 from src.storage import ContextStore
+from src.tokens import create_counter
 from src.utils import AgentConfigError, get_logger
 
 logger = get_logger("deepseek-chat")
@@ -76,7 +77,16 @@ def main(argv: List[str]) -> int:
             db_path = PROJECT_ROOT / db_path
         storage = ContextStore(db_path=db_path, enabled=True)
 
-    # 4. Создание агента
+    # 4. Счётчик токенов и цены (для оценки контекста и расчёта стоимости).
+    #    tiktoken используется при наличии; иначе — встроенная эвристика.
+    token_counter = create_counter(
+        model=config["DEFAULT_MODEL"],
+        enabled=bool(config.get("TOKENIZER_ENABLED", True)),
+        encoding_name=str(config.get("TOKENIZER_ENCODING", "cl100k_base")),
+    )
+    prices = get_prices(config)
+
+    # 5. Создание агента
     try:
         agent = DeepSeekAgent(
             api_key=config["DEEPSEEK_API_KEY"],
@@ -87,12 +97,14 @@ def main(argv: List[str]) -> int:
             mock_mode=config["MOCK_MODE"],
             max_history_messages=config["MAX_HISTORY_MESSAGES"],
             storage=storage,
+            token_counter=token_counter,
+            prices=prices,
         )
     except AgentConfigError as exc:
         print(f"[ОШИБКА] Некорректная конфигурация агента: {exc}", file=sys.stderr)
         return 1
 
-    # 5. GUI
+    # 6. GUI
     try:
         # Импортируем tkinter-модуль здесь, чтобы CLI/тесты могли
         # пользоваться агентом без установленного графического стека.

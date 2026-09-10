@@ -56,6 +56,40 @@ PLACEHOLDER = "Введите сообщение..."
 TEMP_MIN, TEMP_MAX = 0.0, 2.0
 TOKENS_MIN, TOKENS_MAX = 50, 4000
 
+# Поле ввода: минимальная/максимальная высота в строках и порог, после
+# которого авто-подгонка высоты отключается (чтобы не тормозить на
+# очень больших вставках).
+INPUT_MIN_LINES = 3
+INPUT_MAX_LINES = 10
+_AUTOSIZE_MAX_CHARS = 20_000
+
+# Максимум символов сообщения, отображаемых в области чата (в поле ввода
+# ограничений нет: там текст любого размера). Длинные сообщения рисуются
+# частично, чтобы перерисовка чата не подвисала.
+_CHAT_DISPLAY_MAX_CHARS = 20_000
+
+# Виртуальные коды клавиш (Windows VK) для Ctrl-сочетаний.
+# ВАЖНО: при русской (или любой нелатинской) раскладке Tk присылает в
+# event.keysym значение вида "Cyrillic_em" (а иногда и вовсе "??"), поэтому
+# стандартные привязки <Control-v> НЕ срабатывают и вставка «молчит».
+# Определяем клавишу по физическому коду, а keysym используем как запасной путь.
+VK_SELECT_ALL = 65   # A
+VK_COPY = 67         # C
+VK_CUT = 88          # X
+VK_REDO = 89         # Y
+VK_PASTE = 86        # V
+VK_UNDO = 90         # Z
+VK_RETURN = 13       # Enter
+
+# Запасные keysym-имена (латиница + кириллическая раскладка ЙЦУКЕН)
+_PASTE_KEYSYMS = {"v", "cyrillic_em"}
+_SELECT_ALL_KEYSYMS = {"a", "cyrillic_ef"}
+_COPY_KEYSYMS = {"c", "cyrillic_es"}
+_CUT_KEYSYMS = {"x", "cyrillic_che"}
+_UNDO_KEYSYMS = {"z", "cyrillic_ya"}
+_REDO_KEYSYMS = {"y", "cyrillic_en"}
+_RETURN_KEYSYMS = {"return", "kp_enter"}
+
 
 class ChatApplication:
     """Главное окно и логика взаимодействия пользователя с агентом.
@@ -82,8 +116,8 @@ class ChatApplication:
         # Потокобезопасная очередь результатов запросов
         self._result_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._busy = False          # идёт ли запрос к API
-        self._placeholder_active = True  # показан ли плейсхолдер во вводе
         self._last_retry_text: Optional[str] = None  # текст для «Повторить»
+        self._autosize_job: Optional[str] = None     # отложенная подгонка высоты
 
         self._configure_window()
         self._build_widgets()
@@ -94,6 +128,8 @@ class ChatApplication:
         self._apply_config_to_controls()
         self._refresh_chat()
         self._set_initial_status()
+        # Показываем статистику токенов (в т.ч. восстановленную сессию)
+        self._update_token_stats()
 
     def _set_initial_status(self) -> None:
         """Показывает стартовый статус в статус-баре.
@@ -175,9 +211,9 @@ class ChatApplication:
 
         self._configure_text_tags()
 
-        # ---- 3. Панель параметров (110 px) ----
+        # ---- 3. Панель параметров (150 px: модель/темп/токены, промпт, статистика) ----
         self.params_bar = tk.Frame(
-            root, bg=COLORS["params_bg"], height=110
+            root, bg=COLORS["params_bg"], height=150
         )
         self.params_bar.pack(fill="x")
         self.params_bar.pack_propagate(False)
@@ -188,9 +224,13 @@ class ChatApplication:
         self.input_bar = tk.Frame(root, bg=COLORS["bg"])
         self.input_bar.pack(fill="x", padx=8, pady=(0, 6))
 
+        # Поле ввода со скроллбаром: принимает текст любого размера
+        self.input_wrap = tk.Frame(self.input_bar, bg=COLORS["bg"])
+        self.input_wrap.pack(side="left", fill="both", expand=True)
+
         self.input = tk.Text(
-            self.input_bar,
-            height=3,
+            self.input_wrap,
+            height=INPUT_MIN_LINES,
             wrap="word",
             bg=COLORS["input_bg"],
             fg=COLORS["text"],
@@ -200,8 +240,45 @@ class ChatApplication:
             highlightthickness=1,
             highlightbackground=COLORS["input_border"],
             insertbackground=COLORS["text"],
+            undo=True,
+            maxundo=-1,
+            autoseparators=True,
         )
-        self.input.pack(side="left", fill="x", expand=True)
+        input_scroll = ttk.Scrollbar(
+            self.input_wrap, orient="vertical", command=self.input.yview
+        )
+        self.input.configure(yscrollcommand=input_scroll.set)
+        input_scroll.pack(side="right", fill="y")
+        self.input.pack(side="left", fill="both", expand=True)
+
+        # Подсказка — отдельная метка ПОВЕРХ поля, а не текст внутри него:
+        # так ввод и вставка никогда не смешиваются с плейсхолдером.
+        self.placeholder_label = tk.Label(
+            self.input_wrap,
+            text=PLACEHOLDER,
+            bg=COLORS["input_bg"],
+            fg=COLORS["muted"],
+            font=FONTS["default"],
+            cursor="xterm",
+        )
+        self.placeholder_label.bind(
+            "<Button-1>", lambda _event: self.input.focus_set()
+        )
+
+        # Контекстное меню поля ввода (в т.ч. «Вставить» правой кнопкой)
+        self.input_menu = tk.Menu(self.root, tearoff=0)
+        self.input_menu.add_command(
+            label="Вырезать", command=lambda: self.input.event_generate("<<Cut>>")
+        )
+        self.input_menu.add_command(
+            label="Копировать",
+            command=lambda: self.input.event_generate("<<Copy>>"),
+        )
+        self.input_menu.add_command(label="Вставить", command=self._on_paste)
+        self.input_menu.add_separator()
+        self.input_menu.add_command(
+            label="Выделить всё", command=self._select_all_input
+        )
 
         send_btn_wrap = tk.Frame(self.input_bar, bg=COLORS["bg"])
         send_btn_wrap.pack(side="right", padx=(8, 0), fill="y")
@@ -218,7 +295,7 @@ class ChatApplication:
         self.clear_input_btn.pack(fill="x")
         self.clear_input_btn.config(width=12)
 
-        self._show_placeholder()
+        self._refresh_input_placeholder()
 
         # ---- 5. Статус-бар (30 px) ----
         self.status_bar = tk.Frame(root, bg=COLORS["status_bg"], height=30)
@@ -329,6 +406,45 @@ class ChatApplication:
         )
         self.apply_prompt_btn.pack(side="left")
 
+        # --- Ряд 3: статистика токенов (запрос / ответ / контекст / сессия) ---
+        row3 = tk.Frame(bar, bg=COLORS["params_bg"])
+        row3.pack(fill="x", padx=10, pady=(0, 8))
+
+        tk.Label(
+            row3, text="Токены:", bg=COLORS["params_bg"],
+            font=FONTS["header"], fg=COLORS["text"],
+        ).pack(side="left", padx=(0, 8))
+
+        self.token_request_label = tk.Label(
+            row3, text="Запрос: —", bg=COLORS["params_bg"],
+            font=FONTS["default"], fg=COLORS["text"],
+        )
+        self.token_request_label.pack(side="left", padx=(0, 12))
+
+        self.token_response_label = tk.Label(
+            row3, text="Ответ: —", bg=COLORS["params_bg"],
+            font=FONTS["default"], fg=COLORS["text"],
+        )
+        self.token_response_label.pack(side="left", padx=(0, 12))
+
+        self.token_context_label = tk.Label(
+            row3, text="Контекст: —", bg=COLORS["params_bg"],
+            font=FONTS["default"], fg=COLORS["text"],
+        )
+        self.token_context_label.pack(side="left", padx=(0, 12))
+
+        self.token_session_label = tk.Label(
+            row3, text="Сессия: —", bg=COLORS["params_bg"],
+            font=FONTS["default"], fg=COLORS["text"],
+        )
+        self.token_session_label.pack(side="left", padx=(0, 12))
+
+        self.token_counter_label = tk.Label(
+            row3, text="", bg=COLORS["params_bg"],
+            font=FONTS["small"], fg=COLORS["muted"],
+        )
+        self.token_counter_label.pack(side="right")
+
     # ------------------------------------------------------------------
     # Вспомогательные конструкторы
     # ------------------------------------------------------------------
@@ -376,12 +492,25 @@ class ChatApplication:
         )
 
     def _bind_events(self) -> None:
-        """Привязывает события клавиатуры и фокуса."""
+        """Привязывает события клавиатуры, вставки и фокуса."""
         # Ctrl+Enter — отправка сообщения
         self.input.bind("<Control-Return>", self._on_send_clicked)
-        # Плейсхолдер
-        self.input.bind("<FocusIn>", self._on_input_focus_in)
-        self.input.bind("<FocusOut>", self._on_input_focus_out)
+        # Любое изменение текста (набор, вставка, вырезание, undo) —
+        # обновляем подсказку и высоту поля
+        self.input.bind("<<Modified>>", self._on_input_modified)
+        # Ctrl+<клавиша> — раскладко-независимая обработка (вставка, копирование,
+        # выделение, отмена). При русской раскладке Tk НЕ вызывает <Control-v>,
+        # поэтому используется общий обработчик с проверкой физического кода.
+        self.input.bind("<Control-KeyPress>", self._on_input_ctrl_key)
+        # Виртуальное событие вставки + классические Shift+Insert / Ctrl+Insert
+        self.input.bind("<<Paste>>", self._on_paste)
+        self.input.bind("<Control-Insert>", self._on_paste)
+        self.input.bind("<Shift-Insert>", self._on_paste)
+        # Правая кнопка мыши — контекстное меню
+        self.input.bind("<Button-3>", self._show_input_menu)
+        # Подсказка показывается/скрывается по фокусу
+        self.input.bind("<FocusIn>", lambda _e: self._refresh_input_placeholder())
+        self.input.bind("<FocusOut>", lambda _e: self._refresh_input_placeholder())
         # Применение max_tokens по Enter / уходу с поля
         self.tokens_spin.bind("<Return>", self._on_max_tokens_change)
         self.tokens_spin.bind("<FocusOut>", self._on_max_tokens_change)
@@ -414,39 +543,230 @@ class ChatApplication:
         self.prompt_entry.insert(0, self.agent.system_prompt)
 
     # ------------------------------------------------------------------
-    # Плейсхолдер поля ввода
+    # Поле ввода: подсказка, вставка, авторазмер
     # ------------------------------------------------------------------
 
-    def _show_placeholder(self) -> None:
-        """Вставляет серый текст-подсказку, если поле пустое."""
-        if not self.input.get("1.0", "end-1c"):
-            self.input.configure(fg=COLORS["muted"])
-            self.input.insert("1.0", PLACEHOLDER)
-            self._placeholder_active = True
+    def _widgets_alive(self) -> bool:
+        """True, если виджеты приложения ещё существуют.
 
-    def _on_input_focus_in(self, _event=None) -> None:
-        """Удаляет плейсхолдер при получении фокуса."""
-        if self._placeholder_active:
-            self.input.delete("1.0", "end")
-            self.input.configure(fg=COLORS["text"])
-            self._placeholder_active = False
+        Защищает отложенные колбэки (авто-высота и т.п.) от обращения к уже
+        уничтоженным виджетам — иначе Tk печатает TclError в фоне.
+        """
+        try:
+            return bool(self.input.winfo_exists())
+        except (tk.TclError, AttributeError):
+            return False
 
-    def _on_input_focus_out(self, _event=None) -> None:
-        """Возвращает плейсхолдер, если поле осталось пустым."""
-        if not self._busy and not self.input.get("1.0", "end-1c"):
-            self._show_placeholder()
+    def _input_text(self) -> str:
+        """Возвращает сырой текст поля ввода (без обрезки пробелов)."""
+        return self.input.get("1.0", "end-1c")
+
+    def _refresh_input_placeholder(self) -> None:
+        """Показывает подсказку, только если поле пусто и не заблокировано.
+
+        Подсказка — отдельная метка поверх поля, поэтому ввод и вставка
+        никогда не смешиваются с ней (исправляет «залипание» плейсхолдера).
+        """
+        if not self._widgets_alive():
+            return
+        if self._busy or self._input_text().strip():
+            self.placeholder_label.place_forget()
+        else:
+            self.placeholder_label.place(x=10, y=6)
+            self.placeholder_label.lift()
+
+    def _cancel_autosize(self) -> None:
+        """Отменяет отложенную подгонку высоты поля ввода."""
+        if self._autosize_job is None:
+            return
+        try:
+            self.root.after_cancel(self._autosize_job)
+        except tk.TclError:
+            pass
+        self._autosize_job = None
+
+    def _on_input_modified(self, _event=None) -> None:
+        """Реакция на любое изменение текста (в т.ч. вставку из буфера)."""
+        if not self._widgets_alive():
+            return
+        # Сбрасываем флаг, иначе Tk не пришлёт <<Modified>> в следующий раз
+        self.input.edit_modified(False)
+        self._refresh_input_placeholder()
+        # Высоту пересчитываем с небольшой задержкой (крупный текст/вставка)
+        self._cancel_autosize()
+        self._autosize_job = self.root.after(60, self._autosize_input)
+
+    def _set_input_height(self, lines: int) -> None:
+        """Устанавливает высоту поля ввода в строках (с ограничениями)."""
+        lines = max(INPUT_MIN_LINES, min(INPUT_MAX_LINES, int(lines)))
+        try:
+            if int(self.input.cget("height")) != lines:
+                self.input.configure(height=lines)
+        except (tk.TclError, ValueError):
+            pass
+
+    def _autosize_input(self) -> None:
+        """Подгоняет высоту поля под содержимое (3–10 строк).
+
+        Для очень больших текстов подсчёт строк не выполняется — высота
+        сразу выставляется максимальной, чтобы UI не подвисал.
+        """
+        self._autosize_job = None
+        if not self._widgets_alive():
+            return
+        text = self._input_text()
+        if len(text) > _AUTOSIZE_MAX_CHARS:
+            self._set_input_height(INPUT_MAX_LINES)
+            return
+        try:
+            self.input.update_idletasks()
+            counted = self.input.count("1.0", "end-1c", "displaylines")
+            lines = int(counted[0]) if counted else 1
+        except (tk.TclError, TypeError, IndexError, ValueError):
+            lines = len(text.split("\n")) or 1
+        self._set_input_height(lines + 1)
+
+    def _insert_into_input(self, text: str) -> None:
+        """Вставляет текст в позицию курсора, заменяя выделение.
+
+        Поддерживает текст произвольного размера (вставка не ограничена).
+        Для очень больших вставок прокрутка к курсору не выполняется:
+        ``see()`` заставляет Tk пересчитать разметку всего текста и надолго
+        подвешивает интерфейс.
+        """
+        if not text:
+            return
+        try:
+            if self.input.tag_ranges("sel"):
+                self.input.delete("sel.first", "sel.last")
+            self.input.insert("insert", text)
+            if len(text) <= _AUTOSIZE_MAX_CHARS:
+                self.input.see("insert")
+            else:
+                self.input.yview_moveto(0.0)
+        except tk.TclError:
+            return
+        self._on_input_modified()
+
+    def _clipboard_text(self) -> Optional[str]:
+        """Читает текст из буфера обмена, пробуя несколько форматов.
+
+        Returns:
+            Текст из буфера или None, если текста там нет/он недоступен.
+        """
+        for kind in (None, "UTF8_STRING", "STRING"):
+            try:
+                data = (self.root.clipboard_get(type=kind) if kind
+                        else self.root.clipboard_get())
+            except tk.TclError:
+                continue
+            if isinstance(data, str) and data:
+                return data
+        return None
+
+    def _on_input_ctrl_key(self, event):
+        """Обрабатывает Ctrl+<клавиша> независимо от раскладки клавиатуры.
+
+        Ключевая причина бага со вставкой: при русской раскладке физическая
+        клавиша V приходит с ``event.keysym == "Cyrillic_em"`` (в некоторых
+        сборках Tk — вовсе ``"??"``), поэтому привязка ``<Control-v>`` не
+        срабатывает. Здесь клавиша определяется по ``event.keycode``
+        (физический код клавиши), а keysym используется как запасной вариант.
+
+        Args:
+            event: событие нажатия клавиши с зажатым Ctrl.
+
+        Returns:
+            "break", если событие обработано, иначе None.
+        """
+        key = (event.keysym or "").lower()
+        code = getattr(event, "keycode", None)
+
+        if code == VK_PASTE or key in _PASTE_KEYSYMS:
+            return self._on_paste()
+        if code == VK_SELECT_ALL or key in _SELECT_ALL_KEYSYMS:
+            return self._select_all_input()
+        if code == VK_COPY or key in _COPY_KEYSYMS:
+            self.input.event_generate("<<Copy>>")
+            return "break"
+        if code == VK_CUT or key in _CUT_KEYSYMS:
+            self.input.event_generate("<<Cut>>")
+            return "break"
+        if code == VK_UNDO or key in _UNDO_KEYSYMS:
+            return self._undo_input()
+        if code == VK_REDO or key in _REDO_KEYSYMS:
+            return self._redo_input()
+        if code == VK_RETURN or key in _RETURN_KEYSYMS:
+            # Ctrl+Enter (на случай, если сработала общая привязка)
+            return self._on_send_clicked()
+        return None
+
+    def _undo_input(self):
+        """Отменяет последнее изменение текста в поле ввода."""
+        try:
+            self.input.edit_undo()
+        except tk.TclError:
+            return "break"  # стек отмены пуст
+        self._on_input_modified()
+        return "break"
+
+    def _redo_input(self):
+        """Повторяет отменённое изменение текста в поле ввода."""
+        try:
+            self.input.edit_redo()
+        except tk.TclError:
+            return "break"  # нечего повторять
+        self._on_input_modified()
+        return "break"
+
+    def _on_paste(self, _event=None):
+        """Вставляет текст из буфера обмена.
+
+        Вызывается из Ctrl+V (через _on_input_ctrl_key), Shift+Insert,
+        виртуального события ``<<Paste>>`` и пункта меню «Вставить».
+        Всегда возвращает "break", чтобы стандартная привязка Tk не вставила
+        текст второй раз.
+
+        Returns:
+            "break".
+        """
+        if self._busy:  # во время запроса поле заблокировано
+            self._set_status("Дождитесь ответа — поле ввода временно заблокировано.")
+            return "break"
+        text = self._clipboard_text()
+        if not text:
+            self._set_status("В буфере обмена нет текста для вставки.")
+            return "break"
+        self._insert_into_input(text)
+        return "break"
+
+    def _select_all_input(self, _event=None):
+        """Выделяет весь текст в поле ввода (Ctrl+A в любой раскладке)."""
+        try:
+            self.input.tag_add("sel", "1.0", "end-1c")
+            self.input.mark_set("insert", "1.0")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _show_input_menu(self, event) -> None:
+        """Показывает контекстное меню поля ввода по правой кнопке мыши."""
+        self.input.focus_set()
+        try:
+            self.input_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.input_menu.grab_release()
 
     def _get_input_text(self) -> str:
-        """Возвращает введённый текст (пустая строка, если это плейсхолдер)."""
-        if self._placeholder_active:
-            return ""
-        return self.input.get("1.0", "end-1c").strip()
+        """Возвращает введённый текст (подсказка — отдельная метка, не текст)."""
+        return self._input_text().strip()
 
     def _clear_input(self) -> None:
-        """Очищает поле ввода и восстанавливает плейсхолдер."""
+        """Очищает поле ввода и возвращает подсказку."""
         self.input.delete("1.0", "end")
-        self._placeholder_active = False
-        self._show_placeholder()
+        self.input.edit_modified(False)
+        self._autosize_input()
+        self._refresh_input_placeholder()
 
     # ------------------------------------------------------------------
     # Отображение чата
@@ -480,7 +800,11 @@ class ChatApplication:
         timestamp = utils.format_time()
 
         header = f"[{timestamp}] {name}:"
-        paragraphs = content.split("\n") or [""]
+        # Очень длинные сообщения рисуем частично — иначе перерисовка
+        # чата заметно подтормаживает (в поле ввода ограничений нет).
+        truncated = len(content) > _CHAT_DISPLAY_MAX_CHARS
+        display_text = content[:_CHAT_DISPLAY_MAX_CHARS] if truncated else content
+        paragraphs = display_text.split("\n") or [""]
 
         self.chat.insert("end", "\n")  # отступ между сообщениями
 
@@ -489,6 +813,14 @@ class ChatApplication:
         # Тело сообщения
         for paragraph in paragraphs:
             self.chat.insert("end", paragraph + "\n", (base_tag,))
+        if truncated:
+            self.chat.insert(
+                "end",
+                f"… сообщение показано частично "
+                f"({len(content)} символов, лимит отображения "
+                f"{_CHAT_DISPLAY_MAX_CHARS})\n",
+                (base_tag,),
+            )
 
     def _scroll_to_end(self) -> None:
         """Прокручивает область чата вниз."""
@@ -506,6 +838,72 @@ class ChatApplication:
     def _set_info(self, text: str) -> None:
         """Показывает служебную информацию справа в статус-баре."""
         self.info_label.config(text=text)
+
+    # ------------------------------------------------------------------
+    # Статистика токенов
+    # ------------------------------------------------------------------
+
+    def _update_token_stats(self) -> None:
+        """Обновляет блок «Токены» на панели параметров.
+
+        Точные значения API показываются без пометки, оценочные — с «≈»,
+        неизвестные — «—». Ошибки агента/счётчика не должны ломать UI.
+        """
+        try:
+            stats = self.agent.get_token_stats()
+        except Exception:
+            return
+
+        def _fmt(value, estimated: bool) -> str:
+            if value is None:
+                return "—"
+            return f"≈{value}" if estimated else str(value)
+
+        request = stats.get("request") or {}
+        response = stats.get("response") or {}
+        context = stats.get("context") or {}
+        session = stats.get("session") or {}
+
+        self.token_request_label.config(
+            text="Запрос: " + _fmt(request.get("tokens"),
+                                   bool(request.get("estimated")))
+        )
+        self.token_response_label.config(
+            text="Ответ: " + _fmt(response.get("tokens"),
+                                  bool(response.get("estimated")))
+        )
+        # Контекст всегда оценивается локально
+        self.token_context_label.config(
+            text="Контекст: " + _fmt(context.get("tokens"), True)
+        )
+
+        total = int(session.get("total_with_estimates", 0) or 0)
+        estimated_any = int(session.get("estimated_total_tokens", 0) or 0) > 0
+        if not session.get("prices_set"):
+            cost_text = "—"
+        else:
+            cost = float(session.get("cost_usd") or 0.0) + float(
+                session.get("estimated_cost_usd") or 0.0
+            )
+            cost_text = f"{'≈' if estimated_any else ''}${cost:.6f}"
+        self.token_session_label.config(
+            text=f"Сессия: {'≈' if estimated_any else ''}{total} токенов · {cost_text}"
+        )
+        self.token_counter_label.config(
+            text=f"счётчик: {stats.get('counter', '')}"
+        )
+
+    def _token_context_text(self) -> str:
+        """Возвращает строку с оценкой контекста для статус-бара."""
+        try:
+            stats = self.agent.get_token_stats()
+        except Exception:
+            return "ctx: —"
+        context = stats.get("context") or {}
+        tokens = context.get("tokens")
+        if tokens is None:
+            return "ctx: —"
+        return f"ctx: ≈{tokens}"
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         """Блокирует/разблокирует органы управления на время запроса.
@@ -531,6 +929,9 @@ class ChatApplication:
             self.model_combo.configure(state="readonly")
         else:
             self.model_combo.configure(state="disabled")
+
+        # Подсказка не должна висеть поверх заблокированного поля
+        self._refresh_input_placeholder()
 
     # ------------------------------------------------------------------
     # Обработчики параметров
@@ -595,6 +996,7 @@ class ChatApplication:
         try:
             self.agent.update_config(system_prompt=new_prompt)
             self._refresh_chat()
+            self._update_token_stats()
             self._set_status("Системный промпт применён, история очищена.")
         except utils.AgentConfigError as exc:
             self._set_status(f"Ошибка: {exc}")
@@ -619,6 +1021,7 @@ class ChatApplication:
             return
         self.agent.clear_history()
         self._refresh_chat()
+        self._update_token_stats()
         self._set_status("История очищена.")
         self._set_info("")
 
@@ -704,6 +1107,8 @@ class ChatApplication:
 
         # Перерисовываем чат из истории агента — единственный источник правды
         self._refresh_chat()
+        # Обновляем статистику токенов (контекст мог измениться/откатиться)
+        self._update_token_stats()
 
         if result.get("error"):
             self._handle_error(result)
@@ -716,11 +1121,16 @@ class ChatApplication:
         finish_reason = result.get("finish_reason")
 
         token_str = utils.format_tokens(tokens)
+        if isinstance(tokens, dict) and tokens.get("estimated"):
+            token_str = f"≈{token_str}"
         time_str = f"{response_time:.2f} с" if response_time is not None else "—"
         reason_str = finish_reason or "—"
+        context_str = self._token_context_text()
 
         self._set_status("Готов.")
-        self._set_info(f"{model} · токены {token_str} · {time_str} · {reason_str}")
+        self._set_info(
+            f"{model} · {token_str} · {context_str} · {time_str} · {reason_str}"
+        )
 
     def _handle_error(self, result: Dict[str, Any]) -> None:
         """Показывает ошибку: статус-бар + диалог с кнопкой «Повторить».
@@ -753,5 +1163,6 @@ class ChatApplication:
         и параметров в хранилище), затем закрытие окна. Метод агента
         close() идемпотентен, повторный вызов из main.py безопасен.
         """
+        self._cancel_autosize()
         self.agent.close()
         self.root.destroy()
