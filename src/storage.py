@@ -33,6 +33,7 @@ SCHEMA_VERSION = "1"
 _KEY_PARAMS = "params"
 _KEY_SCHEMA = "schema_version"
 _KEY_STATS = "stats"
+_KEY_SUMMARY = "summary"
 
 
 class ContextStore:
@@ -69,12 +70,12 @@ class ContextStore:
         return self.db_path.exists()
 
     def load_state(self) -> Optional[Dict[str, Any]]:
-        """Загружает сохранённый диалог, параметры и статистику токенов.
+        """Загружает диалог, параметры, статистику и конспект (summary).
 
         Returns:
-            Словарь {"messages": [...], "params": {...}, "stats": {...}}
-            либо None, если: файла нет, хранилище отключено, схема не
-            совпадает или диалог пуст.
+            Словарь {"messages": [...], "params": {...}, "stats": {...},
+            "summary": {...}|None} либо None, если: файла нет, хранилище
+            отключено, схема не совпадает или диалог пуст.
 
         Raises:
             Не выбрасывает: ошибки БД логируются, возвращается None.
@@ -121,6 +122,18 @@ class ContextStore:
                             "Не удалось разобрать статистику токенов из БД."
                         )
 
+                summary: Optional[Dict[str, Any]] = None
+                summary_raw = self._read_meta(conn, _KEY_SUMMARY)
+                if summary_raw:
+                    try:
+                        parsed_summary = json.loads(summary_raw)
+                        if isinstance(parsed_summary, dict):
+                            summary = parsed_summary
+                    except (ValueError, TypeError):
+                        self._log.warning(
+                            "Не удалось разобрать конспект диалога из БД."
+                        )
+
                 messages = [
                     {"role": role, "content": content} for role, content in rows
                 ]
@@ -128,13 +141,15 @@ class ContextStore:
                     "messages": messages,
                     "params": params,
                     "stats": stats,
+                    "summary": summary,
                 }
         except sqlite3.Error as exc:
             self._log.error("Ошибка загрузки контекста из БД: %s", exc)
             return None
 
     def save_state(self, messages: List[Message], params: Dict[str, Any],
-                   stats: Optional[Dict[str, Any]] = None) -> bool:
+                   stats: Optional[Dict[str, Any]] = None,
+                   summary: Optional[Dict[str, Any]] = None) -> bool:
         """Полностью перезаписывает диалог и параметры в одной транзакции.
 
         Полная перезапись таблицы messages (≤ 50–60 строк) надёжнее
@@ -145,6 +160,8 @@ class ContextStore:
             params: словарь параметров агента для сохранения.
             stats: накопленная статистика токенов; None — не изменять
                 уже сохранённое значение (обратная совместимость).
+            summary: конспект диалога; None — не изменять сохранённый,
+                пустой словарь {} — явно стереть конспект.
 
         Returns:
             True при успехе, False при ошибке БД (ошибка залогирована).
@@ -169,6 +186,10 @@ class ContextStore:
                 if stats is not None:
                     self._write_meta(
                         conn, _KEY_STATS, json.dumps(stats, ensure_ascii=False)
+                    )
+                if summary is not None:
+                    self._write_meta(
+                        conn, _KEY_SUMMARY, json.dumps(summary, ensure_ascii=False)
                     )
             return True
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
@@ -199,7 +220,7 @@ class ContextStore:
             return False
 
     def clear(self) -> bool:
-        """Удаляет диалог, параметры и статистику из БД (схема остаётся).
+        """Удаляет диалог, параметры, статистику и конспект (схема остаётся).
 
         Returns:
             True при успехе, False при ошибке БД или отсутствии файла.
@@ -211,8 +232,8 @@ class ContextStore:
                 self._ensure_schema(conn)
                 conn.execute("DELETE FROM messages")
                 conn.execute(
-                    "DELETE FROM meta WHERE key IN (?, ?)",
-                    (_KEY_PARAMS, _KEY_STATS),
+                    "DELETE FROM meta WHERE key IN (?, ?, ?)",
+                    (_KEY_PARAMS, _KEY_STATS, _KEY_SUMMARY),
                 )
             return True
         except sqlite3.Error as exc:

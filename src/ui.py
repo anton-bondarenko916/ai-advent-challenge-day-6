@@ -118,6 +118,10 @@ class ChatApplication:
         self._busy = False          # идёт ли запрос к API
         self._last_retry_text: Optional[str] = None  # текст для «Повторить»
         self._autosize_job: Optional[str] = None     # отложенная подгонка высоты
+        # Окно «Контекст» и его фоновый воркер сжатия истории
+        self._context_window: Optional[tk.Toplevel] = None
+        self._context_busy = False
+        self._summary_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
 
         self._configure_window()
         self._build_widgets()
@@ -406,6 +410,12 @@ class ChatApplication:
         )
         self.apply_prompt_btn.pack(side="left")
 
+        # Кнопка окна управления контекстом (просмотр/обновление конспекта)
+        self.context_btn = self._make_button(
+            row2, "Контекст…", self._open_context_dialog, small=True
+        )
+        self.context_btn.pack(side="left", padx=(8, 0))
+
         # --- Ряд 3: статистика токенов (запрос / ответ / контекст / сессия) ---
         row3 = tk.Frame(bar, bg=COLORS["params_bg"])
         row3.pack(fill="x", padx=10, pady=(0, 8))
@@ -438,6 +448,13 @@ class ChatApplication:
             font=FONTS["default"], fg=COLORS["text"],
         )
         self.token_session_label.pack(side="left", padx=(0, 12))
+
+        # Конспект (summary) — отдельная метка справа, рядом со счётчиком
+        self.token_summary_label = tk.Label(
+            row3, text="Конспект: —", bg=COLORS["params_bg"],
+            font=FONTS["small"], fg=COLORS["muted"],
+        )
+        self.token_summary_label.pack(side="right", padx=(0, 12))
 
         self.token_counter_label = tk.Label(
             row3, text="", bg=COLORS["params_bg"],
@@ -893,8 +910,21 @@ class ChatApplication:
             text=f"счётчик: {stats.get('counter', '')}"
         )
 
+        # Конспект (summary): сколько сообщений сжато и сколько это токенов
+        summary = stats.get("summary") or {}
+        if summary.get("active"):
+            covered = int(summary.get("covered", 0) or 0)
+            summary_tokens = int(summary.get("tokens", 0) or 0)
+            self.token_summary_label.config(
+                text=f"Конспект: ≈{summary_tokens} токенов · покрыто {covered} сообщ."
+            )
+        elif summary.get("enabled"):
+            self.token_summary_label.config(text="Конспект: — (ещё не сжат)")
+        else:
+            self.token_summary_label.config(text="Конспект: выключен")
+
     def _token_context_text(self) -> str:
-        """Возвращает строку с оценкой контекста для статус-бара."""
+        """Возвращает строку о контексте для статус-бара (с учётом конспекта)."""
         try:
             stats = self.agent.get_token_stats()
         except Exception:
@@ -903,7 +933,202 @@ class ChatApplication:
         tokens = context.get("tokens")
         if tokens is None:
             return "ctx: —"
+        if context.get("summary_active"):
+            covered = int(context.get("summary_covered", 0) or 0)
+            return f"ctx: ≈{tokens} ({covered} сообщ. в конспекте)"
         return f"ctx: ≈{tokens}"
+
+    # ------------------------------------------------------------------
+    # Окно «Контекст»: просмотр, обновление и очистка конспекта
+    # ------------------------------------------------------------------
+
+    def _open_context_dialog(self) -> None:
+        """Открывает окно с текстом конспекта и управлением им."""
+        window = self._context_window
+        if window is not None and window.winfo_exists():
+            self._refresh_context_dialog()
+            window.lift()
+            window.focus_set()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._context_window = window
+        window.title("Контекст диалога")
+        window.geometry("660x470")
+        window.minsize(480, 320)
+        window.configure(bg=COLORS["bg"])
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self._close_context_dialog)
+
+        tk.Label(
+            window, text="Конспект предыдущей части диалога",
+            bg=COLORS["bg"], font=FONTS["header"], fg=COLORS["text"],
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+
+        text_wrap = tk.Frame(window, bg=COLORS["bg"])
+        text_wrap.pack(fill="both", expand=True, padx=10)
+
+        self.context_text = tk.Text(
+            text_wrap,
+            wrap="word",
+            height=14,
+            bg=COLORS["input_bg"],
+            fg=COLORS["text"],
+            font=FONTS["default"],
+            relief="solid",
+            bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+            cursor="arrow",
+        )
+        scrollbar = ttk.Scrollbar(
+            text_wrap, orient="vertical", command=self.context_text.yview
+        )
+        self.context_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.context_text.pack(side="left", fill="both", expand=True)
+
+        self.context_info_label = tk.Label(
+            window, text="", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"], justify="left", anchor="w",
+        )
+        self.context_info_label.pack(fill="x", padx=10, pady=(6, 4))
+
+        buttons = tk.Frame(window, bg=COLORS["bg"])
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.context_refresh_btn = self._make_button(
+            buttons, "Обновить", self._on_context_refresh
+        )
+        self.context_refresh_btn.pack(side="left")
+
+        self.context_clear_btn = self._make_button(
+            buttons, "Очистить", self._on_context_clear
+        )
+        self.context_clear_btn.pack(side="left", padx=(8, 0))
+
+        self._make_button(buttons, "Закрыть", self._close_context_dialog).pack(
+            side="right"
+        )
+
+        self._refresh_context_dialog()
+
+    def _refresh_context_dialog(self) -> None:
+        """Перерисовывает окно «Контекст» по текущему состоянию агента."""
+        window = self._context_window
+        if window is None or not window.winfo_exists():
+            return
+        try:
+            summary = self.agent.get_summary()
+        except Exception as exc:
+            summary = {"active": False, "text": "", "error": str(exc)}
+
+        text = summary.get("text") or ""
+        self.context_text.configure(state="normal")
+        self.context_text.delete("1.0", "end")
+        if text:
+            self.context_text.insert("1.0", text)
+        else:
+            self.context_text.insert(
+                "1.0",
+                "Конспекта пока нет.\n\n"
+                "Конспект создаётся автоматически, когда история выходит за "
+                "окно последних сообщений (см. SUMMARY_KEEP_LAST_N / "
+                "SUMMARY_EVERY_N в .env). Кнопка «Обновить» сожмёт историю "
+                "принудительно.",
+            )
+        self.context_text.configure(state="disabled")
+
+        info = (
+            f"Покрыто сообщений: {summary.get('covered', 0)} · "
+            f"токены конспекта: ≈{summary.get('tokens', 0)} · "
+            f"обновлён: {summary.get('updated_at') or '—'} · "
+            f"модель: {summary.get('model') or '—'} · "
+            f"сжатие: {'включено' if summary.get('enabled') else 'выключено'}"
+        )
+        if summary.get("error"):
+            info += f"\nОшибка сжатия: {summary['error']}"
+        self.context_info_label.config(text=info)
+
+        state = "normal" if (text and summary.get("enabled")) else "disabled"
+        self.context_clear_btn.configure(state=state)
+        if not self._context_busy:
+            self.context_refresh_btn.configure(state="normal")
+
+    def _on_context_refresh(self) -> None:
+        """Запускает принудительное сжатие истории в фоновом потоке."""
+        if self._context_busy:
+            return
+        if self._busy:
+            self._set_status("Дождитесь ответа на текущий запрос.")
+            return
+
+        self._context_busy = True
+        self.context_refresh_btn.configure(state="disabled")
+        self._set_status("Сжимаю историю…")
+
+        def worker() -> None:
+            try:
+                result = self.agent.summarize_now(force=True)
+            except Exception as exc:  # агент не должен бросать, но страхуемся
+                result = {"updated": False, "covered": 0,
+                          "error": f"Непредвиденная ошибка: {exc}"}
+            self._summary_queue.put(result)
+
+        threading.Thread(
+            target=worker, daemon=True, name="summary-refresh"
+        ).start()
+        self.root.after(100, self._poll_summary_queue)
+
+    def _poll_summary_queue(self) -> None:
+        """Опрашивает очередь результата сжатия (вызывается через root.after)."""
+        try:
+            while True:
+                result = self._summary_queue.get_nowait()
+                self._on_summary_result(result)
+        except queue.Empty:
+            pass
+        finally:
+            if self._context_busy:
+                self.root.after(100, self._poll_summary_queue)
+
+    def _on_summary_result(self, result: Dict[str, Any]) -> None:
+        """Обрабатывает результат принудительного сжатия в главном потоке."""
+        self._context_busy = False
+        self._update_token_stats()
+        self._refresh_context_dialog()
+        if result.get("error"):
+            self._set_status(f"Сжатие не удалось: {result['error']}")
+        elif result.get("updated"):
+            self._set_status(
+                f"Конспект обновлён: покрыто {result.get('covered', 0)} сообщений."
+            )
+        else:
+            self._set_status("Сжимать нечего: история ещё короткая.")
+
+    def _on_context_clear(self) -> None:
+        """Очищает конспект (история диалога сохраняется)."""
+        parent = self._context_window or self.root
+        if not messagebox.askyesno(
+            "Очистить конспект",
+            "Удалить конспект диалога?\n\nСама история сообщений сохранится.",
+            parent=parent,
+        ):
+            return
+        self.agent.clear_summary()
+        self._refresh_context_dialog()
+        self._update_token_stats()
+        self._set_status("Конспект очищен.")
+
+    def _close_context_dialog(self) -> None:
+        """Закрывает окно «Контекст»."""
+        window = self._context_window
+        self._context_window = None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         """Блокирует/разблокирует органы управления на время запроса.
@@ -1164,5 +1389,6 @@ class ChatApplication:
         close() идемпотентен, повторный вызов из main.py безопасен.
         """
         self._cancel_autosize()
+        self._context_window = None
         self.agent.close()
         self.root.destroy()

@@ -51,6 +51,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.agent import DeepSeekAgent  # noqa: E402
 from src.config import get_config, get_prices  # noqa: E402
 from src.storage import ContextStore  # noqa: E402
+from src.summarizer import SUMMARY_MARKER  # noqa: E402
 from src.tokens import create_counter  # noqa: E402
 
 # --- Данные «памяти» диалога -------------------------------------------------
@@ -81,12 +82,16 @@ class Scenario:
     """Описание одного сценария диалога.
 
     Attributes:
-        key: короткий идентификатор (short/long/over_limit).
+        key: короткий идентификатор (short/long/over_limit/long_with_summary).
         title: человекочитаемое название.
         turns: число ходов (запросов пользователя).
         words_per_turn: примерная длина «длинных» сообщений в словах.
         window_messages: искусственное окно в сообщениях (None — из конфигурации).
         window_tokens: искусственное окно в токенах (None — не ограничивать).
+        reply_words: длина синтетического ответа имитатора.
+        summary: включить сжатие контекста (конспект старой части диалога).
+        summary_keep_last: сколько последних сообщений идут «как есть».
+        summary_every_n: размер блока сжатия.
     """
 
     key: str
@@ -96,6 +101,9 @@ class Scenario:
     window_messages: Optional[int] = None
     window_tokens: Optional[int] = None
     reply_words: int = 30
+    summary: bool = False
+    summary_keep_last: int = 10
+    summary_every_n: int = 10
 
 
 @dataclass
@@ -112,6 +120,7 @@ class Options:
     system_prompt: Optional[str] = None
     model_limit: int = 0
     api_key: str = ""
+    no_summary: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +190,13 @@ class SimulatedModel:
         self.reply_words = reply_words
 
     def __call__(self) -> Dict[str, Any]:
-        """Возвращает ответ в формате ``_handle_response``."""
-        messages = self.agent.history  # копия, включая system
+        """Возвращает ответ в формате ``_handle_response``.
+
+        Имитатор видит ровно то, что агент отправляет в API (system-промпт,
+        конспект и непокрытую часть истории), — поэтому «помнит» он только
+        за счёт того, что реально попало в запрос.
+        """
+        messages = self.agent._build_request()["messages"]
         last_user = ""
         for message in reversed(messages):
             if message.get("role") == "user":
@@ -219,6 +233,48 @@ class SimulatedModel:
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
                 # Имитация: значения синтетические
+                "estimated": True,
+                "cache_hit_tokens": None,
+                "cache_miss_tokens": None,
+            },
+            "finish_reason": "stop",
+        }
+
+    def service(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Имитация служебного запроса сжатия (по маркеру SUMMARY_MARKER).
+
+        Возвращает синтетический конспект: он сохраняет факт из первого хода,
+        если тот присутствует в переданном фрагменте или в предыдущем
+        конспекте, — так офлайн-прогон показывает, что модель «помнит»
+        благодаря сжатию, а не полной истории.
+        """
+        joined = "\n".join(
+            str(m.get("content") or "") for m in (request.get("messages") or [])
+        )
+        if SUMMARY_MARKER not in joined:
+            # Страховка: служебный запрос обязан содержать маркер сжатия
+            print("  [!] служебный запрос без SUMMARY_MARKER")
+        parts: List[str] = []
+        if FACT_NAME.lower() in joined.lower() or FACT_COLOR.lower() in joined.lower():
+            parts.append(
+                f"Факты: пользователя зовут {FACT_NAME}, любимый цвет — "
+                f"{FACT_COLOR} (сохранено из начала диалога)."
+            )
+        else:
+            parts.append("Факты: существенные факты предыдущего диалога.")
+        parts.append("Решения: продолжать диалог по темам пользователя.")
+        parts.append("Открытые вопросы: нет.")
+        content = " ".join(parts)
+
+        prompt_tokens = self.counter.count_messages(request.get("messages") or [])
+        completion_tokens = self.counter.count_text(content)
+        return {
+            "content": content,
+            "model": self.agent.model,
+            "tokens": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
                 "estimated": True,
                 "cache_hit_tokens": None,
                 "cache_miss_tokens": None,
@@ -282,6 +338,20 @@ def _make_agent(scenario: Scenario, options: Options, config: Dict[str, Any],
     # В sim-режиме реальных запросов нет, но OpenAI-клиент требует непустой
     # ключ на этапе конструирования — подставляем фиктивный.
     api_key = options.api_key or ("simulation-key" if options.mode == "sim" else "")
+
+    # Сжатие контекста включаем только для сценария со summary
+    summary_settings = None
+    if scenario.summary and not getattr(options, "no_summary", False):
+        summary_settings = {
+            "enabled": True,
+            "keep_last": int(scenario.summary_keep_last),
+            "every_n": int(scenario.summary_every_n),
+            "max_tokens": 300,
+            "temperature": 0.2,
+            "model": "",
+            "prompt": "",
+        }
+
     return DeepSeekAgent(
         api_key=api_key,
         model=options.model or str(config["DEFAULT_MODEL"]),
@@ -292,6 +362,7 @@ def _make_agent(scenario: Scenario, options: Options, config: Dict[str, Any],
         storage=storage,
         token_counter=counter,
         prices=prices,
+        summary_settings=summary_settings,
     )
 
 
@@ -308,7 +379,8 @@ def run_scenario(scenario: Scenario, options: Options, config: Dict[str, Any],
     simulated: Optional[SimulatedModel] = None
     if options.mode == "sim":
         simulated = SimulatedModel(agent, counter, reply_words=scenario.reply_words)
-        agent._call_api = simulated  # подмена сетевого вызова
+        agent._call_api = simulated           # обычный ответ диалога
+        agent._call_service_api = simulated.service  # служебный запрос сжатия
 
     turns: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -380,6 +452,18 @@ def run_scenario(scenario: Scenario, options: Options, config: Dict[str, Any],
         "window_tokens": scenario.window_tokens,
         "window_tokens_hits": window_hits,
         "token_window_trimmed": trimmed_total,
+        # Сжатие контекста (summary)
+        "summary_enabled": bool(stats["summary"].get("enabled")),
+        "summary_active": bool(stats["summary"].get("active")),
+        "summary_covered": int(stats["summary"].get("covered", 0) or 0),
+        "summary_tokens": int(stats["summary"].get("tokens", 0) or 0),
+        "summary_requests": int(stats["session"].get("summary_requests", 0) or 0),
+        "summary_service_tokens": int(
+            stats["session"].get("summary_prompt_tokens", 0) or 0
+        ) + int(stats["session"].get("summary_completion_tokens", 0) or 0)
+        + int(stats["session"].get("summary_estimated_tokens", 0) or 0),
+        "summary_cost_usd": stats["session"].get("summary_cost_usd"),
+        "summary_error": stats["summary"].get("error"),
         "errors": errors,
     }
     agent.close()
@@ -406,11 +490,13 @@ def _fmt(value: Any, suffix: str = "") -> str:
 
 
 def _fmt_cost(summary: Dict[str, Any]) -> str:
-    """Стоимость сессии или «—», если цены не заданы."""
+    """Стоимость сессии (диалог + служебные запросы сжатия) или «—»."""
     if not summary.get("prices_set"):
         return "—"
-    cost = float(summary.get("session_cost_usd") or 0.0) + float(
-        summary.get("session_cost_estimated_usd") or 0.0
+    cost = (
+        float(summary.get("session_cost_usd") or 0.0)
+        + float(summary.get("session_cost_estimated_usd") or 0.0)
+        + float(summary.get("summary_cost_usd") or 0.0)
     )
     prefix = "≈" if summary.get("estimated_any") else ""
     return f"{prefix}${cost:.6f}"
@@ -435,6 +521,20 @@ def print_scenario_report(result: Dict[str, Any], options: Options) -> None:
           f"ответ: {_fmt(summary['last_completion_tokens'])} токенов")
     print(f"  Контекст: ≈{summary['final_context_tokens']} токенов "
           f"(максимум за диалог: ≈{summary['max_context_tokens']})")
+    if summary.get("summary_enabled"):
+        if summary.get("summary_active"):
+            cost_note = ""
+            if summary.get("summary_cost_usd") is not None:
+                cost_note = f", сжатие ≈${float(summary['summary_cost_usd']):.6f}"
+            print(f"  Конспект: ≈{summary['summary_tokens']} токенов, "
+                  f"покрыто {summary['summary_covered']} сообщ., "
+                  f"служебных запросов: {summary['summary_requests']} "
+                  f"(≈{summary['summary_service_tokens']} токенов{cost_note})")
+        else:
+            print("  Конспект: ещё не создан "
+                  f"(служебных запросов: {summary['summary_requests']})")
+        if summary.get("summary_error"):
+            print(f"  Ошибка сжатия: {summary['summary_error']}")
     print(f"  Сессия: {'≈' if summary['estimated_any'] else ''}"
           f"{summary['session_total_tokens']} токенов | стоимость: "
           f"{_fmt_cost(summary)}")
@@ -462,8 +562,9 @@ def print_scenario_report(result: Dict[str, Any], options: Options) -> None:
 def print_comparison(results: List[Dict[str, Any]]) -> None:
     """Печатает сравнительную таблицу по всем сценариям."""
     print("\n=== Сравнение ===")
-    header = (f"{'Сценарий':<12}{'Ходов':>6}{'Контекст(макс)':>16}"
-              f"{'Сессия':>10}{'Стоимость':>14}{'Помнит':>8}{'Вытеснено':>11}")
+    header = (f"{'Сценарий':<17}{'Ходов':>6}{'Контекст(макс)':>16}"
+              f"{'Сессия':>10}{'Стоимость':>14}{'Помнит':>8}"
+              f"{'Сжатий':>8}{'Вытеснено':>11}")
     print(header)
     print("-" * len(header))
     for result in results:
@@ -471,12 +572,13 @@ def print_comparison(results: List[Dict[str, Any]]) -> None:
         remembered = summary["remembered"]
         remembered_text = "—" if remembered is None else ("да" if remembered else "нет")
         print(
-            f"{result['key']:<12}"
+            f"{result['key']:<17}"
             f"{summary['turns_done']:>6}"
             f"{('≈' + str(summary['max_context_tokens'])):>16}"
             f"{('≈' if summary['estimated_any'] else '') + str(summary['session_total_tokens']):>10}"
             f"{_fmt_cost(summary):>14}"
             f"{remembered_text:>8}"
+            f"{summary.get('summary_requests', 0):>8}"
             f"{summary['messages_dropped']:>11}"
         )
 
@@ -486,9 +588,14 @@ def print_comparison(results: List[Dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 
 def build_scenarios(args: argparse.Namespace) -> List[Scenario]:
-    """Собирает три сценария с учётом параметров командной строки."""
+    """Собирает сценарии с учётом параметров командной строки.
+
+    Четвёртый сценарий (``long_with_summary``) показывает управление
+    контекстом: старые сообщения сжимаются в конспект, поэтому контекст
+    перестаёт расти, а факт из начала диалога сохраняется.
+    """
     long_turns = args.turns
-    return [
+    scenarios = [
         Scenario(key="short", title="короткий диалог",
                  turns=3, words_per_turn=10, reply_words=20),
         Scenario(key="long", title="длинный диалог (в пределах окна)",
@@ -498,6 +605,16 @@ def build_scenarios(args: argparse.Namespace) -> List[Scenario]:
                  window_messages=args.window_messages,
                  window_tokens=args.window_tokens, reply_words=40),
     ]
+    if not getattr(args, "no_summary", False):
+        scenarios.append(
+            Scenario(key="long_with_summary",
+                     title="длинный диалог со сжатием контекста",
+                     turns=long_turns, words_per_turn=args.words,
+                     reply_words=40, summary=True,
+                     summary_keep_last=getattr(args, "summary_keep_last", 10),
+                     summary_every_n=getattr(args, "summary_every_n", 10))
+        )
+    return scenarios
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -518,6 +635,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="искусственное окно в сообщениях для over_limit")
     parser.add_argument("--window-tokens", type=int, default=400,
                         help="искусственное окно в токенах для over_limit")
+    parser.add_argument("--no-summary", action="store_true",
+                        help="не запускать сценарий со сжатием контекста")
+    parser.add_argument("--summary-keep-last", type=int, default=10,
+                        help="сколько последних сообщений не сжимать")
+    parser.add_argument("--summary-every-n", type=int, default=10,
+                        help="размер блока сжатия (сообщений)")
     parser.add_argument("--pause", type=float, default=0.0,
                         help="пауза между запросами, секунды")
     parser.add_argument("--model", default=None, help="имя модели")
@@ -605,6 +728,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         model=args.model,
         model_limit=args.model_limit,
         api_key=str(config.get("DEEPSEEK_API_KEY") or ""),
+        no_summary=bool(args.no_summary),
     )
 
     # Выбор режима

@@ -30,6 +30,7 @@ from unittest import mock
 from src.agent import DeepSeekAgent
 from src.tokens import HeuristicCounter
 from src.ui import PLACEHOLDER
+from tests import gui_helpers
 
 try:  # pragma: no cover — зависит от окружения
     import tkinter as tk
@@ -52,20 +53,14 @@ class InputFieldRegressionTest(unittest.TestCase):
     _ChatApplication = None
 
     # ------------------------------------------------------------------
-    # Одно окно на весь класс (иначе Tk не доставляет клавиатурные события)
+    # Общее окно на весь процесс (иначе Tk не доставляет клавиатурные события)
     # ------------------------------------------------------------------
 
     @classmethod
     def setUpClass(cls) -> None:
-        if tk is None:
-            raise unittest.SkipTest("tkinter недоступен")
-        try:
-            cls.root = tk.Tk()
-        except Exception as exc:  # нет дисплея / TclError
-            raise unittest.SkipTest(f"графическая среда недоступна: {exc}")
-        # Окно должно быть отображено (mapped), но уводим его за пределы экрана
-        cls.root.geometry("640x480+-3000+-3000")
-        cls.root.update()
+        cls.root = gui_helpers.get_root()
+        if cls.root is None:
+            raise unittest.SkipTest("графическая среда недоступна (tkinter/Tk)")
 
         from src.ui import ChatApplication
 
@@ -73,22 +68,16 @@ class InputFieldRegressionTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        if getattr(cls, "root", None) is not None:
-            try:
-                cls.root.destroy()
-            except Exception:
-                pass
+        # Общий root живёт до конца процесса (см. tests/gui_helpers.py):
+        # при уничтожении окна Tk перестаёт доставлять клавиатурные события.
+        pass
 
     def setUp(self) -> None:
-        # Пересоздаём виджеты приложения на том же окне
+        # Пересоздаём виджеты приложения на общем окне
         previous = getattr(self, "app", None)
         if previous is not None:
             previous._cancel_autosize()
-        for child in self.root.winfo_children():
-            try:
-                child.destroy()
-            except Exception:
-                pass
+        gui_helpers.reset_children(self.root)
         self.agent = DeepSeekAgent(
             api_key="", mock_mode=True, token_counter=HeuristicCounter()
         )

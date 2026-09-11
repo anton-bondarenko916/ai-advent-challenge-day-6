@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .utils import AVAILABLE_MODELS
+from .utils import AVAILABLE_MODELS, get_logger
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -76,14 +76,28 @@ DEFAULTS: Dict[str, Any] = {
     # Цены за 1M токенов в USD (0.0 — цена не задана, стоимость не считается)
     "PRICE_INPUT_PER_1M": 0.0,
     "PRICE_OUTPUT_PER_1M": 0.0,
+    # Управление контекстом: сжатие старой части диалога в конспект (summary)
+    "SUMMARY_ENABLED": True,
+    "SUMMARY_KEEP_LAST_N": 10,   # сколько последних сообщений идут «как есть»
+    "SUMMARY_EVERY_N": 10,       # размер блока сжатия (K сообщений)
+    "SUMMARY_MAX_TOKENS": 400,   # лимит длины конспекта
+    "SUMMARY_TEMPERATURE": 0.2,  # температура служебного запроса
+    "SUMMARY_MODEL": "",         # "" — использовать модель диалога
+    "SUMMARY_PROMPT": "",        # "" — встроенная инструкция сжатия
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
-_BOOL_KEYS = ("MOCK_MODE", "STORAGE_ENABLED", "TOKENIZER_ENABLED")
+_BOOL_KEYS = ("MOCK_MODE", "STORAGE_ENABLED", "TOKENIZER_ENABLED", "SUMMARY_ENABLED")
 
 # Переменные, значения которых нужно приводить к числу
-_INT_KEYS = ("UI_WIDTH", "UI_HEIGHT", "DEFAULT_MAX_TOKENS", "MAX_HISTORY_MESSAGES")
-_FLOAT_KEYS = ("DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M")
+_INT_KEYS = (
+    "UI_WIDTH", "UI_HEIGHT", "DEFAULT_MAX_TOKENS", "MAX_HISTORY_MESSAGES",
+    "SUMMARY_KEEP_LAST_N", "SUMMARY_EVERY_N", "SUMMARY_MAX_TOKENS",
+)
+_FLOAT_KEYS = (
+    "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
+    "SUMMARY_TEMPERATURE",
+)
 
 # Суффиксы переменных окружения с ценами по конкретной модели:
 # PRICE_<MODEL>_INPUT_PER_1M / PRICE_<MODEL>_OUTPUT_PER_1M
@@ -234,3 +248,60 @@ def get_prices(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             prices["models"][model] = entry
 
     return prices
+
+
+def get_summary_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки сжатия контекста (summary).
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "keep_last", "every_n", "max_tokens",
+        "temperature", "model", "prompt"}.
+    """
+    cfg = config if config is not None else get_config()
+    logger = get_logger("deepseek-chat.config")
+
+    def _int(key: str, default: int, low: int, high: int) -> int:
+        raw = cfg.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Некорректное значение %s=%r — беру %d.", key, raw, default)
+            return default
+        if not (low <= value <= high):
+            logger.warning(
+                "%s=%d вне диапазона [%d, %d] — беру %d.",
+                key, value, low, high, default,
+            )
+            return default
+        return value
+
+    def _float(key: str, default: float, low: float, high: float) -> float:
+        raw = cfg.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("Некорректное значение %s=%r — беру %.2f.", key, raw, default)
+            return default
+        if not (low <= value <= high):
+            logger.warning(
+                "%s=%.2f вне диапазона [%.2f, %.2f] — беру %.2f.",
+                key, value, low, high, default,
+            )
+            return default
+        return value
+
+    return {
+        "enabled": bool(cfg.get("SUMMARY_ENABLED", True)),
+        "keep_last": _int("SUMMARY_KEEP_LAST_N", 10, 1, 1000),
+        "every_n": _int("SUMMARY_EVERY_N", 10, 1, 200),
+        "max_tokens": _int("SUMMARY_MAX_TOKENS", 400, 50, 4000),
+        "temperature": _float("SUMMARY_TEMPERATURE", 0.2, 0.0, 2.0),
+        "model": str(cfg.get("SUMMARY_MODEL") or "").strip(),
+        "prompt": str(cfg.get("SUMMARY_PROMPT") or "").strip(),
+    }
