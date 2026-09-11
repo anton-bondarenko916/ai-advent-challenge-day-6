@@ -19,10 +19,13 @@
   локальную оценку — для контекста истории и (при отсутствии usage)
   для запроса/ответа; накапливает статистику сессии и считает стоимость
   по ценам из конфигурации;
-- управляет контекстом: последние N сообщений уходят в модель «как есть»,
-  всё старшее заменяется конспектом (summary), который обновляется
-  инкрементально каждые K сообщений, хранится отдельно и подставляется
-  в запрос отдельным system-сообщением.
+- управляет контекстом: стратегия (``sliding_window`` | ``sticky_facts``)
+  решает, что уходит в API; режим ``branching`` позволяет вести несколько
+  независимых веток диалога от одной точки (checkpoint/развилка);
+- поддерживает блок фактов (key → value): факты обновляются после каждого хода
+  и отправляются отдельным system-сообщением вместе с последними N сообщениями;
+- сохраняет совместимость со старым режимом сжатия в конспект (summary):
+  он работает только если настройки summary переданы явно, а стратегия не задана.
 """
 
 from __future__ import annotations
@@ -36,7 +39,18 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from . import utils
+from .branches import BranchManager
+from .facts import FactsStore
 from .storage import ContextStore
+from .strategies import (
+    AVAILABLE_STRATEGIES,
+    BRANCHING,
+    SLIDING_WINDOW,
+    STICKY_FACTS,
+    ContextStrategy,
+    create_strategy,
+    normalize_name,
+)
 from .summarizer import (
     ContextSummarizer,
     get_default_settings as get_default_summary_settings,
@@ -91,6 +105,9 @@ class DeepSeekAgent:
         prices: Optional[Dict[str, Any]] = None,
         summary_settings: Optional[Dict[str, Any]] = None,
         summarizer: Optional[ContextSummarizer] = None,
+        strategy: Optional[str] = None,
+        strategy_settings: Optional[Dict[str, Any]] = None,
+        branch_manager: Optional[BranchManager] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -117,6 +134,13 @@ class DeepSeekAgent:
             summary_settings: настройки сжатия контекста (см.
                 config.get_summary_settings); None — сжатие выключено.
             summarizer: готовый суммаризатор; None — создать из настроек.
+            strategy: имя стратегии управления контекстом (``sliding_window``,
+                ``sticky_facts``, ``branching``); None вместе с
+                ``strategy_settings`` означает режим обратной совместимости
+                (стратегии не используются, работает summary).
+            strategy_settings: настройки стратегий (см.
+                config.get_strategy_settings): окно, факты, ветки.
+            branch_manager: готовый менеджер веток (для тестов); None — создать.
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -159,6 +183,33 @@ class DeepSeekAgent:
         if self._summarizer is None:
             self._summarizer = self._create_summarizer()
 
+        # Стратегии управления контекстом, факты и ветки диалога.
+        # Стратегия включается только если передана явно (или переданы её
+        # настройки): без них агент работает в режиме обратной совместимости
+        # (summary + ограничение «сырой» истории), как раньше.
+        self._strategy_settings: Dict[str, Any] = dict(strategy_settings or {})
+        self._strategy_name: Optional[str] = None   # значение переключателя
+        self._sub_strategy_name: str = SLIDING_WINDOW  # подстратегия ветки
+        self._strategy: Optional[ContextStrategy] = None
+        self._facts_store = FactsStore(
+            max_items=self._setting_int("facts_max_items", 50),
+            max_tokens=self._setting_int("facts_max_tokens", 300),
+            counter=self._counter,
+        )
+        #: Плоские факты диалога ({категория: {ключ: значение}})
+        self._facts: Dict[str, Dict[str, str]] = self._facts_store.data
+        self._facts_error: Optional[str] = None
+        self._facts_updated_at: Optional[str] = None
+        self._active_branch_id: int = 1
+        self._resolve_strategy_mode(strategy, strategy_settings)
+
+        self._branch_manager: BranchManager = branch_manager or BranchManager(
+            # В mock-режиме хранилище полностью игнорируется (как и раньше)
+            store=None if self._mock_mode else self._storage,
+            max_branches=self._setting_int("branch_max", 20),
+            default_strategy=self._sub_strategy_name,
+        )
+
         # Клиент создаётся только вне mock-режима
         self._client: Optional[OpenAI] = None
         if not self._mock_mode:
@@ -174,6 +225,10 @@ class DeepSeekAgent:
         self._init_history()
 
         # Восстановление контекста из хранилища (только вне mock-режима)
+        # Сначала ветки: они определяют активную ветку и её стратегию.
+        # В mock-режиме менеджер создан без хранилища, поэтому обращений к БД нет.
+        self._branch_manager.load()
+        self._active_branch_id = self._branch_manager.active_id()
         if not self._mock_mode:
             self._load_context()
 
@@ -238,15 +293,23 @@ class DeepSeekAgent:
                 self._append_message(
                     {"role": "assistant", "content": payload["content"]}
                 )
-                # При включённом сжатии «сырая» история не урезается:
-                # единственный способ «забыть» старое — конспект.
-                if not self._summary_active():
+                # В режиме стратегий «сырая» история не урезается: sliding
+                # window отбрасывает сообщения только в самом запросе.
+                if self._trimming_active():
                     self._trim_history()
+                # Стратегия обновляет свои артефакты после хода
+                # (для sticky_facts — служебный запрос обновления фактов).
+                facts_info = self._after_turn(
+                    user_input.strip(), payload["content"]
+                )
                 # Учитываем токены обмена (точные из API или оценку)
                 token_info = self._update_token_stats(
                     payload, request_messages,
                     summarized_this_turn=summarized,
                 )
+                if facts_info is not None:
+                    token_info["facts_updated"] = bool(facts_info.get("updated"))
+                    token_info["strategy"] = self._strategy_name
                 # Сохраняем контекст после каждого успешного обмена
                 self._persist()
 
@@ -275,19 +338,25 @@ class DeepSeekAgent:
                 )
 
     def clear_history(self) -> None:
-        """Очищает историю диалога, оставляя только системный промпт.
+        """Очищает историю диалога активной ветки.
 
         Сохранённый на диске контекст также очищается (остаётся только
         системный промпт и параметры агента). Накопленная статистика
         токенов сессии при этом сбрасывается — и в памяти, и на диске.
+        Артефакты активной ветки (конспект и факты) очищаются вместе с
+        историей: они описывают удалённый диалог. Удаление самой ветки —
+        отдельная операция (:meth:`delete_branch`).
         """
         with self._lock:
             self._init_history()
             self._session_stats = self._default_session_stats()
             self._last_exchange = self._default_last_exchange()
-            # Конспект относится к удалённой истории — очищаем и его
+            # Конспект и факты относятся к удалённой истории — очищаем
             self._summary = None
             self._last_summary_error = None
+            self._facts_store.clear()
+            self._facts_error = None
+            self._facts_updated_at = None
             # Перезаписываем хранилище согласованным состоянием
             self._persist()
 
@@ -341,6 +410,9 @@ class DeepSeekAgent:
                     (self._summary_settings or {}).get("model") or ""
                 ):
                     self._summarizer.model = self.model
+                # Стратегия получает модель как зависимость (служебные запросы)
+                if self._strategy is not None:
+                    self._strategy = self._make_strategy()
             if "system_prompt" in kwargs:
                 # Смена системного промпта сбрасывает историю диалога
                 self.system_prompt = system_prompt
@@ -362,9 +434,9 @@ class DeepSeekAgent:
                 )
             if "max_history_messages" in kwargs:
                 self._max_history = new_max_history
-                # При включённом сжатии «сырая» история не урезается:
+                # В режиме стратегий «сырая» история не урезается:
                 # ограничение действует только на то, что уходит в API
-                if not self._summary_active():
+                if self._trimming_active():
                     self._trim_history()
 
             # Персист: смена системного промпта перезаписывает диалог
@@ -411,6 +483,70 @@ class DeepSeekAgent:
         utils.validate_temperature(self.temperature)
         utils.validate_max_tokens(self.max_tokens)
 
+    def _setting_int(self, key: str, default: int) -> int:
+        """Читает целочисленную настройку стратегий с мягким fallback."""
+        try:
+            return int(self._strategy_settings.get(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _resolve_strategy_mode(self, strategy: Optional[str],
+                               strategy_settings: Optional[Dict[str, Any]]) -> None:
+        """Определяет, работает ли агент через стратегии контекста.
+
+        Режим включается только при явном выборе стратегии или передаче её
+        настроек — иначе сохраняется прежнее поведение (summary).
+
+        Raises:
+            AgentConfigError: если имя стратегии неизвестно.
+        """
+        if strategy is None and strategy_settings is None:
+            self._strategy_name = None
+            self._strategy = None
+            return
+        settings = self._strategy_settings
+        raw = strategy if strategy is not None else settings.get("name")
+        name = normalize_name(raw or SLIDING_WINDOW)
+        sub_raw = settings.get("branch_strategy") or SLIDING_WINDOW
+        if name != BRANCHING:
+            sub_raw = name
+        sub = normalize_name(sub_raw)
+        if sub == BRANCHING:  # защита от вложенного режима веток
+            sub = SLIDING_WINDOW
+        self._strategy_name = name
+        self._sub_strategy_name = sub
+        self._strategy = self._make_strategy()
+
+    def _make_strategy(self) -> ContextStrategy:
+        """Создаёт объект стратегии для подстратегии активной ветки."""
+        deps = {"counter": self._counter, "model": self.model}
+        return create_strategy(self._sub_strategy_name,
+                               self._strategy_settings, deps)
+
+    def _strategy_mode(self) -> bool:
+        """True, если контекст собирает стратегия (а не legacy-режим)."""
+        return self._strategy is not None
+
+    def _uses_facts(self) -> bool:
+        """True, если активная стратегия использует блок фактов."""
+        return self._strategy_mode() and self._sub_strategy_name == STICKY_FACTS
+
+    def _artifacts(self) -> Dict[str, Any]:
+        """Артефакты диалога для стратегии (факты, конспект, счётчик)."""
+        return {
+            "facts": self._facts_store,
+            "summary": self._summary,
+            "counter": self._counter,
+        }
+
+    def _trimming_active(self) -> bool:
+        """True, если «сырая» история ограничивается по MAX_HISTORY_MESSAGES.
+
+        В режиме стратегий история в памяти не урезается: sliding window
+        отбрасывает сообщения только в запросе, а sticky facts — тем более.
+        """
+        return not self._strategy_mode() and not self._summary_active()
+
     def _build_context_messages(self) -> List[Message]:
         """Собирает сообщения, которые реально уйдут в API.
 
@@ -424,6 +560,16 @@ class DeepSeekAgent:
         system = self._message_history[0] if self._message_history else None
         dialog = self._message_history[1:]
         messages: List[Message] = [system] if system else []
+
+        # Режим стратегий: что уходит в API, решает стратегия
+        # (sliding_window: system + последние N; sticky_facts: system +
+        # блок фактов + последние N).
+        if self._strategy is not None:
+            built = self._strategy.build_context(
+                str((system or {}).get("content") or ""), dialog,
+                self._artifacts(),
+            )
+            return self._limit_context(built)
 
         start = 0
         summary_text = ""
@@ -455,6 +601,33 @@ class DeepSeekAgent:
 
         messages.extend(tail)
         return messages
+
+    def _limit_context(self, messages: List[Message]) -> List[Message]:
+        """Аварийно ограничивает отправляемый контекст (MAX_HISTORY_MESSAGES).
+
+        Системные сообщения (промпт и блок фактов) никогда не удаляются —
+        ограничение касается только сообщений диалога.
+
+        Args:
+            messages: собранный стратегией контекст.
+
+        Returns:
+            Контекст с не более чем ``_max_history`` сообщениями диалога.
+        """
+        positions = [index for index, message in enumerate(messages)
+                     if message.get("role") != "system"]
+        if len(positions) <= self._max_history:
+            return messages
+        drop = len(positions) - self._max_history
+        keep_from = positions[drop]
+        logger.warning(
+            "Контекст превышает MAX_HISTORY_MESSAGES=%d: в API уйдут "
+            "только последние %d сообщений диалога.",
+            self._max_history, self._max_history,
+        )
+        result = [m for m in messages[:keep_from] if m.get("role") == "system"]
+        result.extend(messages[keep_from:])
+        return result
 
     def _build_request(self) -> Dict[str, Any]:
         """Формирует структуру запроса к API.
@@ -613,17 +786,24 @@ class DeepSeekAgent:
 
     def _current_params(self) -> Dict[str, Any]:
         """Текущие параметры агента для сохранения в хранилище."""
-        return {
+        params = {
             "model": self.model,
             "system_prompt": self.system_prompt,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        # Выбор в переключателе стратегий тоже сохраняется (восстанавливается
+        # при следующем запуске приложения).
+        if self._strategy is not None:
+            params["strategy"] = self._strategy_name
+            params["branch_strategy"] = self._sub_strategy_name
+        return params
 
     def _persist(self) -> None:
-        """Сохраняет историю, параметры, статистику и конспект.
+        """Сохраняет историю, параметры, статистику и артефакты.
 
-        Ошибки хранилища не пробрасываются: агент продолжает работу в памяти.
+        Сообщения и факты пишутся в активную ветку; ошибки хранилища не
+        пробрасываются — агент продолжает работу в памяти.
         """
         if not self._persistence_active() or self._storage is None:
             return
@@ -634,6 +814,9 @@ class DeepSeekAgent:
                 stats=dict(self._session_stats),
                 # {} — явно стереть конспект, None — не трогать (см. storage)
                 summary=dict(self._summary) if self._summary else {},
+                branch_id=self._active_branch_id,
+                # {} — явно стереть факты, None — не трогать
+                facts=self._facts_store.as_dict(),
             )
         except Exception as exc:
             logger.error("Не удалось сохранить контекст: %s", exc)
@@ -707,7 +890,8 @@ class DeepSeekAgent:
                     {"role": role, "content": str(message.get("content", ""))}
                 )
                 restored += 1
-        self._trim_history()
+        if self._trimming_active():
+            self._trim_history()
 
         # 4. Восстанавливаем накопленную статистику токенов
         self._restore_session_stats(state.get("stats"))
@@ -715,10 +899,34 @@ class DeepSeekAgent:
         # 5. Восстанавливаем конспект диалога (если он сохранён)
         self._restore_summary(state.get("summary"))
 
+        # 6. Восстанавливаем факты и подстратегию активной ветки
+        self._restore_facts(state.get("facts"))
+        active = state.get("active_branch")
+        if active is not None:
+            try:
+                self._active_branch_id = int(active)
+            except (TypeError, ValueError):
+                pass
+        self._restore_branch_strategy()
+
+        # 7. Восстанавливаем выбор переключателя стратегий (режим веток)
+        if self._strategy is not None:
+            saved = str(params.get("strategy") or "").strip()
+            if saved:
+                try:
+                    canonical = normalize_name(saved)
+                except AgentConfigError:
+                    canonical = None
+                if canonical == BRANCHING:
+                    self._strategy_name = BRANCHING
+                elif canonical is not None:
+                    self._strategy_name = self._sub_strategy_name
+
         if restored:
             logger.info(
-                "Контекст восстановлен: %d сообщений, модель=%s.",
+                "Контекст восстановлен: %d сообщений, модель=%s, ветка=%s.",
                 restored, self.model,
+                self._branch_manager.get_active().get("name"),
             )
 
     # ------------------------------------------------------------------
@@ -748,6 +956,12 @@ class DeepSeekAgent:
             "summary_completion_tokens": 0,
             "summary_estimated_tokens": 0,
             "summary_cost_usd": 0.0,
+            # Служебные запросы обновления фактов (sticky facts)
+            "facts_requests": 0,
+            "facts_prompt_tokens": 0,
+            "facts_completion_tokens": 0,
+            "facts_estimated_tokens": 0,
+            "facts_cost_usd": 0.0,
         }
 
     @staticmethod
@@ -997,6 +1211,12 @@ class DeepSeekAgent:
                 round(float(session.get("summary_cost_usd", 0.0)), 6)
                 if session["prices_set"] else None
             )
+            session["facts_cost_usd"] = (
+                round(float(session.get("facts_cost_usd", 0.0)), 6)
+                if session["prices_set"] else None
+            )
+            facts_items = self._facts_store.items()
+            facts_text = self._facts_store.to_text()
             return {
                 "request": {
                     "tokens": self._last_exchange.get("request_tokens"),
@@ -1026,6 +1246,33 @@ class DeepSeekAgent:
                     "model": (self._summary or {}).get("model"),
                     "error": self._last_summary_error,
                 },
+                "strategy": {
+                    "name": self._strategy_name,
+                    "mode": self._strategy_name or "legacy_summary",
+                    "sub_strategy": self._sub_strategy_name
+                    if self._strategy_mode() else None,
+                    "branching": self._strategy_name == BRANCHING,
+                    "window": self._strategy._window() if self._strategy else None,
+                    "available": list(AVAILABLE_STRATEGIES),
+                    "error": self._facts_error,
+                },
+                "facts": {
+                    "active": self._uses_facts(),
+                    "enabled": bool(
+                        self._strategy_settings.get("facts_enabled", True)
+                    ),
+                    "count": self._facts_store.count(),
+                    "tokens": self._facts_store.token_count(self._counter),
+                    "updated_at": self._facts_updated_at,
+                    "error": self._facts_error,
+                    "text": facts_text,
+                    "items": [
+                        {"category": category, "key": key, "value": value,
+                         "updated_at": stamp}
+                        for category, key, value, stamp in facts_items
+                    ],
+                },
+                "branch": self._branch_manager.describe(),
                 "session": session,
                 "counter": self._counter.name,
             }
@@ -1051,7 +1298,14 @@ class DeepSeekAgent:
         )
 
     def _summary_active(self) -> bool:
-        """True, если сжатие контекста включено и доступно (не mock)."""
+        """True, если сжатие контекста включено и доступно (не mock).
+
+        В режиме стратегий суммаризация не используется: она осталась только
+        для обратной совместимости (когда настройки summary переданы явно,
+        а стратегия не выбрана).
+        """
+        if self._strategy is not None:
+            return False
         return bool((self._summary_settings or {}).get("enabled")) \
             and not self._mock_mode
 
@@ -1313,6 +1567,512 @@ class DeepSeekAgent:
         """Копия настроек сжатия контекста (только для чтения)."""
         with self._lock:
             return dict(self._summary_settings or {})
+
+    @property
+    def strategy_settings(self) -> Dict[str, Any]:
+        """Копия настроек стратегий управления контекстом (только для чтения)."""
+        with self._lock:
+            return dict(self._strategy_settings or {})
+
+    # ------------------------------------------------------------------
+    # Стратегии управления контекстом
+    # ------------------------------------------------------------------
+
+    def available_strategies(self) -> List[str]:
+        """Список стратегий для переключателя (sliding_window, sticky_facts,
+        branching)."""
+        return list(AVAILABLE_STRATEGIES)
+
+    def get_strategy(self) -> Dict[str, Any]:
+        """Текущее состояние стратегии для UI и тестов.
+
+        Returns:
+            Словарь {"name", "mode", "sub_strategy", "branching", "window",
+            "facts", "facts_count", "facts_tokens", "branch", "available",
+            "error"}.
+        """
+        with self._lock:
+            return {
+                "name": self._strategy_name,
+                "mode": self._strategy_name or "legacy_summary",
+                "sub_strategy": (self._sub_strategy_name
+                                 if self._strategy_mode() else None),
+                "branching": self._strategy_name == BRANCHING,
+                "window": self._strategy._window() if self._strategy else None,
+                "facts": self._uses_facts(),
+                "facts_count": self._facts_store.count(),
+                "facts_tokens": self._facts_store.token_count(self._counter),
+                "branch": self._branch_manager.describe(),
+                "available": list(AVAILABLE_STRATEGIES),
+                "error": self._facts_error,
+            }
+
+    def set_strategy(self, name: str) -> Dict[str, Any]:
+        """Переключает стратегию управления контекстом.
+
+        Выбор ``sliding_window``/``sticky_facts`` меняет подстратегию активной
+        ветки и запоминается для неё; выбор ``branching`` включает режим веток
+        и оставляет подстратегию ветки как есть. При переходе на стратегию с
+        фактами выполняется начальное извлечение фактов по текущему диалогу.
+
+        Args:
+            name: имя стратегии.
+
+        Returns:
+            Новое состояние стратегии (см. :meth:`get_strategy`).
+
+        Raises:
+            AgentConfigError: если имя стратегии неизвестно.
+        """
+        with self._lock:
+            canonical = normalize_name(name)
+            self._strategy_name = canonical
+            if canonical != BRANCHING:
+                self._sub_strategy_name = canonical
+            self._strategy_settings["name"] = canonical
+            self._strategy_settings["branch_strategy"] = self._sub_strategy_name
+            self._strategy = self._make_strategy()
+            self._persist_branch_strategy()
+            if self._uses_facts() and self._dialog_messages():
+                # Начальное извлечение: иначе блок фактов будет пустым
+                # до следующего хода диалога.
+                self.update_facts_now(force=True)
+            self._persist()
+            logger.info(
+                "Стратегия контекста: %s (подстратегия ветки: %s).",
+                canonical, self._sub_strategy_name,
+            )
+            return self.get_strategy()
+
+    def _persist_branch_strategy(self) -> None:
+        """Запоминает подстратегию контекста у активной ветки."""
+        branch = self._branch_manager.get(self._active_branch_id)
+        if branch is None:
+            return
+        branch["strategy"] = self._sub_strategy_name
+        if not self._branch_manager.persistence or self._storage is None:
+            return
+        try:
+            self._storage.save_branch(
+                name=str(branch.get("name") or "ветка"),
+                parent_id=branch.get("parent_id"),
+                forked_at=int(branch.get("forked_at") or 0),
+                strategy=self._sub_strategy_name,
+                branch_id=self._active_branch_id,
+            )
+        except Exception as exc:
+            logger.warning("Не удалось сохранить стратегию ветки: %s", exc)
+
+    def _after_turn(self, user_text: str,
+                    assistant_text: str) -> Optional[Dict[str, Any]]:
+        """Даёт стратегии обновить свои артефакты после хода.
+
+        Returns:
+            Результат стратегии либо None, если стратегии нет.
+        """
+        if self._strategy is None:
+            return None
+        call_service = None if self._mock_mode else self._call_service_api
+        try:
+            info = self._strategy.after_turn(
+                user_text, assistant_text, self._dialog_messages(),
+                self._artifacts(), call_service,
+            )
+        except Exception as exc:  # стратегия не должна ломать ход
+            logger.warning(
+                "Ошибка обновления артефактов стратегии %s: %s",
+                self._strategy_name, exc,
+            )
+            self._facts_error = str(exc)
+            return {"updated": False, "error": str(exc), "tokens": None}
+
+        error = info.get("error")
+        self._facts_error = str(error) if error else None
+        if info.get("updated"):
+            self._facts_updated_at = datetime.now().isoformat(timespec="seconds")
+        self._account_facts(info)
+        return info
+
+    def _account_facts(self, info: Optional[Dict[str, Any]]) -> None:
+        """Учитывает служебный запрос фактов отдельными счётчиками."""
+        if not info:
+            return
+        tokens = info.get("tokens")
+        if not isinstance(tokens, dict):
+            return
+        try:
+            prompt = int(tokens.get("prompt_tokens") or 0)
+            completion = int(tokens.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            return
+        estimated = (
+            bool(tokens.get("estimated", True))
+            or tokens.get("prompt_tokens") is None
+            or tokens.get("completion_tokens") is None
+        )
+        if estimated:
+            self._session_stats["facts_estimated_tokens"] += prompt + completion
+        else:
+            self._session_stats["facts_prompt_tokens"] += prompt
+            self._session_stats["facts_completion_tokens"] += completion
+        cost = self._compute_cost(
+            prompt, completion, model=tokens.get("model") or self.model
+        )
+        if cost is not None:
+            self._session_stats["facts_cost_usd"] = round(
+                float(self._session_stats.get("facts_cost_usd", 0.0)) + cost, 6
+            )
+        self._session_stats["facts_requests"] += 1
+
+    def _restore_facts(self, raw: Optional[Dict[str, Any]]) -> None:
+        """Восстанавливает факты из хранилища (устойчиво к мусору)."""
+        if raw is None:
+            return
+        self._facts_store = self._new_facts_store(raw)
+        self._facts = self._facts_store.data
+        stamps = [
+            stamp
+            for per_category in self._facts_store.updated_at.values()
+            for stamp in per_category.values()
+        ]
+        self._facts_updated_at = max(stamps) if stamps else None
+
+    def _restore_branch_strategy(self) -> None:
+        """Применяет подстратегию контекста, сохранённую у активной ветки."""
+        branch = self._branch_manager.get(self._active_branch_id)
+        if branch is None:
+            return
+        raw = str(branch.get("strategy") or "").strip()
+        if not raw:
+            return
+        try:
+            sub = normalize_name(raw)
+        except AgentConfigError:
+            logger.warning("Неизвестная стратегия ветки %r — игнорирую.", raw)
+            return
+        if sub == BRANCHING:
+            sub = SLIDING_WINDOW
+        self._sub_strategy_name = sub
+        if self._strategy is not None:
+            if self._strategy_name != BRANCHING:
+                self._strategy_name = sub
+            self._strategy = self._make_strategy()
+
+    # ------------------------------------------------------------------
+    # Блок фактов (sticky facts)
+    # ------------------------------------------------------------------
+
+    def get_facts(self) -> Dict[str, Any]:
+        """Возвращает факты диалога и их состояние.
+
+        Returns:
+            Словарь {"facts", "items", "text", "count", "tokens",
+            "updated_at", "active", "enabled", "error"}.
+        """
+        with self._lock:
+            return {
+                "facts": {cat: dict(values)
+                          for cat, values in self._facts_store.data.items()},
+                "items": [
+                    {"category": category, "key": key, "value": value,
+                     "updated_at": stamp}
+                    for category, key, value, stamp in self._facts_store.items()
+                ],
+                "text": self._facts_store.to_text(),
+                "count": self._facts_store.count(),
+                "tokens": self._facts_store.token_count(self._counter),
+                "updated_at": self._facts_updated_at,
+                "active": self._uses_facts(),
+                "enabled": bool(self._strategy_settings.get("facts_enabled", True)),
+                "error": self._facts_error,
+            }
+
+    def remember(self, key: str, value: str,
+                 category: str = "decisions") -> Dict[str, Any]:
+        """Запоминает факт вручную."""
+        with self._lock:
+            ok = self._facts_store.remember(key, value, category)
+            if ok:
+                self._apply_facts_limits()
+                self._facts_updated_at = datetime.now().isoformat(timespec="seconds")
+                self._facts_error = None
+                self._persist()
+            result = self.get_facts()
+            result["ok"] = ok
+            return result
+
+    def forget(self, key: str) -> Dict[str, Any]:
+        """Удаляет факт по ключу."""
+        with self._lock:
+            ok = self._facts_store.forget(key)
+            if ok:
+                self._facts_updated_at = datetime.now().isoformat(timespec="seconds")
+                self._persist()
+            result = self.get_facts()
+            result["ok"] = ok
+            return result
+
+    def clear_facts(self) -> Dict[str, Any]:
+        """Полностью очищает блок фактов (история не трогается)."""
+        with self._lock:
+            self._facts_store.clear()
+            self._facts_error = None
+            self._facts_updated_at = None
+            self._persist()
+            return self.get_facts()
+
+    def update_facts_now(self, force: bool = True) -> Dict[str, Any]:
+        """Принудительно обновляет факты по текущему диалогу.
+
+        Используется кнопкой «Обновить факты» в окне «Контекст» и при переходе
+        на стратегию ``sticky_facts``.
+
+        Args:
+            force: True — извлечь факты из всего текущего диалога (иначе —
+                только из последнего обмена, если он есть).
+
+        Returns:
+            Словарь {"updated", "error", "count"}.
+        """
+        with self._lock:
+            if not self._uses_facts():
+                return {
+                    "updated": False,
+                    "count": self._facts_store.count(),
+                    "error": "Факты не используются в этой стратегии.",
+                }
+            dialog = self._dialog_messages()
+            if not dialog:
+                return {
+                    "updated": False,
+                    "count": self._facts_store.count(),
+                    "error": "Диалог пуст — извлекать факты не из чего.",
+                }
+
+            if force:
+                digest = "\n".join(
+                    f"{'Пользователь' if m.get('role') == 'user' else 'Ассистент'}: "
+                    f"{m.get('content', '')}"
+                    for m in dialog[-40:]
+                )
+                user_text = ("Извлеки факты из текущего диалога:\n" + digest)
+                assistant_text = "(начальное извлечение фактов)"
+            else:
+                last_user = ""
+                last_assistant = ""
+                for message in reversed(dialog):
+                    if not last_assistant and message.get("role") == "assistant":
+                        last_assistant = str(message.get("content") or "")
+                    elif not last_user and message.get("role") == "user":
+                        last_user = str(message.get("content") or "")
+                    if last_user and last_assistant:
+                        break
+                user_text = last_user
+                assistant_text = last_assistant
+
+            call_service = None if self._mock_mode else self._call_service_api
+            try:
+                info = self._strategy.after_turn(
+                    user_text, assistant_text, dialog,
+                    self._artifacts(), call_service,
+                ) if self._strategy is not None else {}
+            except Exception as exc:
+                self._facts_error = str(exc)
+                return {"updated": False, "count": self._facts_store.count(),
+                        "error": str(exc)}
+
+            error = info.get("error")
+            self._facts_error = str(error) if error else None
+            if info.get("updated"):
+                self._facts_updated_at = datetime.now().isoformat(timespec="seconds")
+            self._account_facts(info)
+            self._persist()
+            return {
+                "updated": bool(info.get("updated")),
+                "count": self._facts_store.count(),
+                "error": self._facts_error,
+            }
+
+    def _apply_facts_limits(self) -> int:
+        """Применяет лимиты фактов (число пар и токены)."""
+        return self._facts_store.limit(
+            counter=self._counter,
+            max_items=self._setting_int("facts_max_items", 50),
+            max_tokens=self._setting_int("facts_max_tokens", 300),
+        )
+
+    def _new_facts_store(self, raw: Any) -> FactsStore:
+        """Создаёт хранилище фактов из сериализованных данных."""
+        if isinstance(raw, FactsStore):
+            clone = FactsStore(
+                max_items=self._setting_int("facts_max_items", 50),
+                max_tokens=self._setting_int("facts_max_tokens", 300),
+                counter=self._counter,
+            )
+            clone.from_dict(raw.as_dict())
+            return clone
+        payload = raw if isinstance(raw, dict) else {}
+        if "data" in payload or "updated_at" in payload:
+            data = payload.get("data")
+            updated_at = payload.get("updated_at")
+        else:
+            data = payload
+            updated_at = None
+        return FactsStore(
+            data=data if isinstance(data, dict) else {},
+            updated_at=updated_at if isinstance(updated_at, dict) else None,
+            max_items=self._setting_int("facts_max_items", 50),
+            max_tokens=self._setting_int("facts_max_tokens", 300),
+            counter=self._counter,
+        )
+
+    # ------------------------------------------------------------------
+    # Ветки диалога (branching)
+    # ------------------------------------------------------------------
+
+    def list_branches(self) -> List[Dict[str, Any]]:
+        """Список веток (для панели «Ветки»)."""
+        with self._lock:
+            return self._branch_manager.list_branches()
+
+    def get_active_branch(self) -> Dict[str, Any]:
+        """Описание активной ветки."""
+        with self._lock:
+            return self._branch_manager.describe()
+
+    def checkpoint(self, name: Optional[str] = None) -> Dict[str, Any]:
+        """Создаёт checkpoint — ветку от конца текущего диалога."""
+        return self.create_branch(from_index=None, name=name)
+
+    def create_branch(self, from_index: Optional[int] = None,
+                      name: Optional[str] = None,
+                      strategy: Optional[str] = None) -> Dict[str, Any]:
+        """Создаёт ветку от текущего места или от выбранного сообщения.
+
+        Args:
+            from_index: индекс сообщения диалога (без system), от которого
+                ответвляемся; None — checkpoint в конце диалога.
+            name: имя ветки (None — автоимя).
+            strategy: подстратегия ветки (None — как у текущей).
+
+        Returns:
+            Словарь {"branch", "strategy", "error"}; при ошибке валидации
+            возвращается заполненное поле "error".
+        """
+        with self._lock:
+            try:
+                self._persist()  # фиксируем текущую ветку до развилки
+                self._branch_manager.remember_messages(
+                    self._active_branch_id, self._message_history
+                )
+                self._branch_manager.remember_facts(
+                    self._active_branch_id, self._facts_store
+                )
+                result = self._branch_manager.create(
+                    self._message_history, self._artifacts(),
+                    from_index=from_index, name=name, strategy=strategy,
+                )
+            except AgentConfigError as exc:
+                return {"branch": None, "strategy": self._strategy_name,
+                        "error": str(exc)}
+
+            self._apply_branch_state(
+                result["branch"], result["messages"],
+                result["artifacts"].get("facts"),
+            )
+            self._persist()
+            return {
+                "branch": self._branch_manager.get_active(),
+                "strategy": self._strategy_name,
+                "error": None,
+            }
+
+    def switch_branch(self, branch_id: int) -> Dict[str, Any]:
+        """Переключается на другую ветку (сообщения и артефакты — свои).
+
+        Returns:
+            Словарь {"branch", "strategy", "error"}.
+        """
+        with self._lock:
+            target = self._branch_manager.get(branch_id)
+            if target is None:
+                return {"branch": None, "strategy": self._strategy_name,
+                        "error": f"Ветка id={branch_id} не найдена."}
+            try:
+                self._persist()
+                self._branch_manager.remember_messages(
+                    self._active_branch_id, self._message_history
+                )
+                self._branch_manager.remember_facts(
+                    self._active_branch_id, self._facts_store
+                )
+                self._branch_manager.switch(branch_id)
+            except AgentConfigError as exc:
+                return {"branch": None, "strategy": self._strategy_name,
+                        "error": str(exc)}
+
+            messages = self._branch_manager.load_messages(branch_id)
+            facts_raw = self._branch_manager.load_facts(branch_id)
+            self._apply_branch_state(target, messages, facts_raw)
+            self._persist()
+            return {
+                "branch": self._branch_manager.get_active(),
+                "strategy": self._strategy_name,
+                "error": None,
+            }
+
+    def rename_branch(self, branch_id: int, name: str) -> Dict[str, Any]:
+        """Переименовывает ветку."""
+        with self._lock:
+            try:
+                branch = self._branch_manager.rename(branch_id, name)
+            except AgentConfigError as exc:
+                return {"branch": None, "error": str(exc)}
+            return {"branch": branch, "error": None}
+
+    def delete_branch(self, branch_id: int,
+                      cascade: bool = False) -> Dict[str, Any]:
+        """Удаляет ветку (при ``cascade`` — вместе с дочерними)."""
+        with self._lock:
+            try:
+                result = self._branch_manager.delete(branch_id, cascade=cascade)
+            except AgentConfigError as exc:
+                return {"deleted": [], "branch": None, "error": str(exc)}
+            self._active_branch_id = self._branch_manager.active_id()
+            if int(branch_id) in list(result.get("deleted") or []):
+                messages = self._branch_manager.load_messages(self._active_branch_id)
+                facts_raw = self._branch_manager.load_facts(self._active_branch_id)
+                self._apply_branch_state(
+                    self._branch_manager.get_active(), messages, facts_raw
+                )
+            self._persist()
+            return {
+                "deleted": list(result.get("deleted") or []),
+                "branch": self._branch_manager.get_active(),
+                "error": None,
+            }
+
+    def _apply_branch_state(self, branch: Dict[str, Any],
+                            messages: Optional[List[Message]],
+                            facts: Any) -> None:
+        """Применяет состояние ветки к агенту (история, факты, стратегия)."""
+        self._active_branch_id = int(branch.get("id") or self._active_branch_id)
+        if messages:
+            self._message_history = [
+                {"role": str(m.get("role", "")),
+                 "content": str(m.get("content", ""))}
+                for m in messages
+            ]
+        else:
+            self._init_history()
+        self._facts_store = self._new_facts_store(facts)
+        self._facts = self._facts_store.data
+        self._facts_error = None
+        self._facts_updated_at = None
+        self._restore_branch_strategy()
+        # Сообщения ветки — источник истины для её артефактов
+        self._branch_manager.remember_messages(self._active_branch_id,
+                                               self._message_history)
 
     # ------------------------------------------------------------------
     # Служебные свойства (для UI и отладки)

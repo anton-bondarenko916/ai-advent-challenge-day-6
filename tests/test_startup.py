@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 
 import main as app_main
-from src.config import get_config, get_summary_settings
+from src.config import get_config, get_strategy_settings
 from src.utils import AgentConfigError
 
 _TESTS_TMP = Path(__file__).resolve().parent / "tmp_startup"
@@ -47,11 +47,17 @@ class CreateAgentTest(unittest.TestCase):
         try:
             self.assertEqual(agent.model, "deepseek-v4-flash")
             self.assertFalse(agent.is_mock)
-            # Настройки сжатия контекста применены из конфигурации
-            settings = agent.summary_settings
-            self.assertTrue(settings["enabled"])
-            self.assertEqual(settings["keep_last"], 10)
-            self.assertEqual(settings["every_n"], 10)
+            # Стратегия управления контекстом применена из конфигурации
+            strategy = agent.get_strategy()
+            self.assertEqual(strategy["name"], "sliding_window")
+            self.assertEqual(strategy["window"], 20)
+            self.assertIn("branching", strategy["available"])
+            # Лимиты фактов из конфигурации
+            settings = agent.strategy_settings
+            self.assertTrue(settings["facts_enabled"])
+            self.assertEqual(settings["facts_max_items"], 50)
+            self.assertEqual(settings["facts_max_tokens"], 300)
+            self.assertEqual(settings["branch_max"], 20)
         finally:
             agent.close()
 
@@ -62,17 +68,21 @@ class CreateAgentTest(unittest.TestCase):
         finally:
             agent.close()
 
-    def test_create_agent_applies_custom_summary_settings(self) -> None:
+    def test_create_agent_applies_custom_strategy_settings(self) -> None:
         agent = app_main.create_agent(_config(
-            SUMMARY_KEEP_LAST_N=4, SUMMARY_EVERY_N=3, SUMMARY_MAX_TOKENS=120,
-            SUMMARY_ENABLED=False,
+            STRATEGY="sticky_facts", WINDOW_KEEP_LAST_N=4,
+            FACTS_ENABLED=False, FACTS_MAX_ITEMS=7, FACTS_MAX_TOKENS=120,
+            BRANCH_MAX=3,
         ))
         try:
-            settings = agent.summary_settings
-            self.assertFalse(settings["enabled"])
-            self.assertEqual(settings["keep_last"], 4)
-            self.assertEqual(settings["every_n"], 3)
-            self.assertEqual(settings["max_tokens"], 120)
+            strategy = agent.get_strategy()
+            self.assertEqual(strategy["name"], "sticky_facts")
+            self.assertEqual(strategy["window"], 4)
+            settings = agent.strategy_settings
+            self.assertFalse(settings["facts_enabled"])
+            self.assertEqual(settings["facts_max_items"], 7)
+            self.assertEqual(settings["facts_max_tokens"], 120)
+            self.assertEqual(settings["branch_max"], 3)
         finally:
             agent.close()
 
@@ -94,19 +104,32 @@ class CreateAgentTest(unittest.TestCase):
         with self.assertRaises(AgentConfigError):
             app_main.create_agent(_config(DEFAULT_MODEL="no-such-model"))
 
-    def test_summary_settings_validation_clamps(self) -> None:
+    def test_invalid_strategy_falls_back_to_default(self) -> None:
+        """Неизвестная стратегия в конфиге не роняет запуск."""
+        settings = get_strategy_settings({"STRATEGY": "нет-такой"})
+        self.assertEqual(settings["name"], "sliding_window")
+
+    def test_strategy_settings_validation_clamps(self) -> None:
         """Некорректные значения заменяются значениями по умолчанию."""
-        settings = get_summary_settings({
-            "SUMMARY_ENABLED": True,
-            "SUMMARY_KEEP_LAST_N": "abc",
-            "SUMMARY_EVERY_N": 9999,
-            "SUMMARY_MAX_TOKENS": 10,
-            "SUMMARY_TEMPERATURE": 5.0,
+        settings = get_strategy_settings({
+            "STRATEGY": "sticky_facts",
+            "WINDOW_KEEP_LAST_N": "abc",
+            "FACTS_MAX_TOKENS": 1,
+            "FACTS_MAX_ITEMS": 99999,
+            "FACTS_TEMPERATURE": 5.0,
+            "BRANCH_MAX": 0,
         })
-        self.assertEqual(settings["keep_last"], 10)
-        self.assertEqual(settings["every_n"], 10)
-        self.assertEqual(settings["max_tokens"], 400)
-        self.assertEqual(settings["temperature"], 0.2)
+        self.assertEqual(settings["name"], "sticky_facts")
+        self.assertEqual(settings["window"], 20)
+        self.assertEqual(settings["facts_max_tokens"], 300)
+        self.assertEqual(settings["facts_max_items"], 50)
+        self.assertEqual(settings["facts_temperature"], 0.0)
+        self.assertEqual(settings["branch_max"], 20)
+
+    def test_branching_strategy_keeps_default_sub_strategy(self) -> None:
+        settings = get_strategy_settings({"STRATEGY": "branching"})
+        self.assertEqual(settings["name"], "branching")
+        self.assertEqual(settings["branch_strategy"], "sliding_window")
 
 
 if __name__ == "__main__":

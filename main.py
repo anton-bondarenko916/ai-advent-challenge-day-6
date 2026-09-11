@@ -21,7 +21,7 @@ from src.agent import DeepSeekAgent
 from src.config import (
     PROJECT_ROOT,
     get_prices,
-    get_summary_settings,
+    get_strategy_settings,
     load_config,
     validate_api_key,
 )
@@ -55,12 +55,15 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         config: словарь конфигурации (результат load_config).
 
     Returns:
-        Готовый DeepSeekAgent (хранилище, счётчик токенов, цены, настройки
-        сжатия контекста — из конфигурации).
+        Готовый DeepSeekAgent (хранилище, счётчик токенов, цены, стратегия
+        управления контекстом — из конфигурации).
 
     Raises:
         AgentConfigError: если параметры агента некорректны.
     """
+    # Стратегия управления контекстом: sliding_window | sticky_facts | branching
+    strategy_settings = get_strategy_settings(config)
+
     # Хранилище контекста (SQLite). В mock-режиме агент сам его игнорирует.
     storage = None
     if config.get("STORAGE_ENABLED", True):
@@ -68,7 +71,11 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         db_path = Path(raw_path)
         if not db_path.is_absolute():
             db_path = PROJECT_ROOT / db_path
-        storage = ContextStore(db_path=db_path, enabled=True)
+        storage = ContextStore(
+            db_path=db_path,
+            enabled=True,
+            default_strategy=str(strategy_settings["branch_strategy"]),
+        )
 
     # Счётчик токенов и цены: tiktoken при наличии, иначе встроенная эвристика
     token_counter = create_counter(
@@ -89,7 +96,10 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         storage=storage,
         token_counter=token_counter,
         prices=prices,
-        summary_settings=get_summary_settings(config),
+        # В приложении используется переключатель стратегий; суммаризация
+        # (summary) не входит в него и оставлена для обратной совместимости.
+        strategy=strategy_settings["name"],
+        strategy_settings=strategy_settings,
     )
 
 

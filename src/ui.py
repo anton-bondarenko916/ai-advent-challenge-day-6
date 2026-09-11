@@ -17,7 +17,7 @@ import threading
 from typing import Any, Dict, Optional
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 from . import utils
 from .agent import DeepSeekAgent
@@ -118,10 +118,22 @@ class ChatApplication:
         self._busy = False          # идёт ли запрос к API
         self._last_retry_text: Optional[str] = None  # текст для «Повторить»
         self._autosize_job: Optional[str] = None     # отложенная подгонка высоты
-        # Окно «Контекст» и его фоновый воркер сжатия истории
+        # Окно «Контекст» и его фоновый воркер обновления фактов
         self._context_window: Optional[tk.Toplevel] = None
         self._context_busy = False
+        self._context_pending_mode: Optional[str] = None
         self._summary_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+
+        # Окно «Ветки» и общий механизм фоновых операций (ветки/факты)
+        self._branches_window: Optional[tk.Toplevel] = None
+        self._branches_busy = False
+        self._action_queue: "queue.Queue[Any]" = queue.Queue()
+        self._action_busy = False
+
+        # Индекс сообщения диалога (без system) под правой кнопкой мыши:
+        # используется кнопкой «Создать от выбранного сообщения».
+        self._chat_selected_index: Optional[int] = None
+        self._chat_message_count = 0
 
         self._configure_window()
         self._build_widgets()
@@ -134,6 +146,7 @@ class ChatApplication:
         self._set_initial_status()
         # Показываем статистику токенов (в т.ч. восстановленную сессию)
         self._update_token_stats()
+        self._set_info(self._token_context_text())
 
     def _set_initial_status(self) -> None:
         """Показывает стартовый статус в статус-баре.
@@ -215,9 +228,15 @@ class ChatApplication:
 
         self._configure_text_tags()
 
-        # ---- 3. Панель параметров (150 px: модель/темп/токены, промпт, статистика) ----
+        # Контекстное меню области чата: создание ветки от выбранного сообщения
+        self.chat_menu = tk.Menu(self.root, tearoff=0)
+        self.chat_menu.add_command(
+            label="Создать ветку отсюда…", command=self._on_create_branch_from_chat
+        )
+
+        # ---- 3. Панель параметров (186 px: модель/темп/токены, промпт, стратегия, статистика) ----
         self.params_bar = tk.Frame(
-            root, bg=COLORS["params_bg"], height=150
+            root, bg=COLORS["params_bg"], height=186
         )
         self.params_bar.pack(fill="x")
         self.params_bar.pack_propagate(False)
@@ -410,11 +429,42 @@ class ChatApplication:
         )
         self.apply_prompt_btn.pack(side="left")
 
-        # Кнопка окна управления контекстом (просмотр/обновление конспекта)
+        # Кнопка окна управления контекстом (стратегия, ветка, блок фактов)
         self.context_btn = self._make_button(
             row2, "Контекст…", self._open_context_dialog, small=True
         )
         self.context_btn.pack(side="left", padx=(8, 0))
+
+        # Кнопка окна веток диалога
+        self.branches_btn = self._make_button(
+            row2, "Ветки…", self._open_branches_dialog, small=True
+        )
+        self.branches_btn.pack(side="left", padx=(8, 0))
+
+        # --- Ряд 2б: стратегия управления контекстом ---
+        row_strategy = tk.Frame(bar, bg=COLORS["params_bg"])
+        row_strategy.pack(fill="x", padx=10, pady=(0, 2))
+
+        tk.Label(
+            row_strategy, text="Стратегия:", bg=COLORS["params_bg"],
+            font=FONTS["default"],
+        ).pack(side="left")
+
+        self.strategy_var = tk.StringVar(value="")
+        self.strategy_combo = ttk.Combobox(
+            row_strategy,
+            textvariable=self.strategy_var,
+            values=self._available_strategies(),
+            state="readonly",
+            width=18,
+        )
+        self.strategy_combo.pack(side="left", padx=(4, 12))
+
+        self.strategy_info_label = tk.Label(
+            row_strategy, text="", bg=COLORS["params_bg"],
+            font=FONTS["small"], fg=COLORS["muted"], anchor="w",
+        )
+        self.strategy_info_label.pack(side="left")
 
         # --- Ряд 3: статистика токенов (запрос / ответ / контекст / сессия) ---
         row3 = tk.Frame(bar, bg=COLORS["params_bg"])
@@ -449,9 +499,9 @@ class ChatApplication:
         )
         self.token_session_label.pack(side="left", padx=(0, 12))
 
-        # Конспект (summary) — отдельная метка справа, рядом со счётчиком
+        # Факты/окно — отдельная метка справа, рядом со счётчиком
         self.token_summary_label = tk.Label(
-            row3, text="Конспект: —", bg=COLORS["params_bg"],
+            row3, text="Факты: —", bg=COLORS["params_bg"],
             font=FONTS["small"], fg=COLORS["muted"],
         )
         self.token_summary_label.pack(side="right", padx=(0, 12))
@@ -537,6 +587,12 @@ class ChatApplication:
         self.model_combo.bind(
             "<<ComboboxSelected>>", self._on_model_change
         )
+        # Стратегия управления контекстом
+        self.strategy_combo.bind(
+            "<<ComboboxSelected>>", self._on_strategy_change
+        )
+        # Правая кнопка мыши в области чата — «Создать ветку отсюда…»
+        self.chat.bind("<Button-3>", self._show_chat_menu)
         # Закрытие окна
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -792,29 +848,50 @@ class ChatApplication:
     def _refresh_chat(self) -> None:
         """Перерисовывает область чата из истории агента (источник истины).
 
-        Системный промпт в чате не показывается.
+        Системный промпт в чате не показывается. Каждое сообщение получает
+        тег ``msg_<индекс>``, где индекс считается без учёта system
+        (первый показанный пузырь — ``msg_0``): по этому тегу правая кнопка
+        мыши определяет, от какого сообщения создавать ветку.
         """
         self.chat.configure(state="normal")
+        dialog_index = 0
         try:
             self.chat.delete("1.0", "end")
             for message in self.agent.history:
                 role = message.get("role")
                 if role in ("user", "assistant"):
-                    self._insert_message(role, message.get("content", ""))
+                    self._insert_message(
+                        role, message.get("content", ""), index=dialog_index
+                    )
+                    dialog_index += 1
         finally:
             self.chat.configure(state="disabled")
+        self._chat_message_count = dialog_index
+        if (self._chat_selected_index is not None
+                and self._chat_selected_index >= dialog_index):
+            self._chat_selected_index = None
         self._scroll_to_end()
 
-    def _insert_message(self, role: str, content: str) -> None:
+    def _insert_message(self, role: str, content: str,
+                        index: Optional[int] = None) -> None:
         """Вставляет одно сообщение (пузырь) в область чата.
 
         Args:
             role: "user" или "assistant".
             content: текст сообщения.
+            index: индекс сообщения в диалоге без учёта system; если задан,
+                к сообщению добавляется тег ``msg_<index>`` (для веток).
         """
         base_tag = "user" if role == "user" else "assistant"
         name = "Вы" if role == "user" else "Ассистент"
         timestamp = utils.format_time()
+        message_tag = f"msg_{index}" if index is not None else None
+
+        def tags(*extra: str) -> tuple:
+            """Дополняет набор тегов тегом сообщения (если он есть)."""
+            if message_tag is None:
+                return extra
+            return extra + (message_tag,)
 
         header = f"[{timestamp}] {name}:"
         # Очень длинные сообщения рисуем частично — иначе перерисовка
@@ -823,20 +900,20 @@ class ChatApplication:
         display_text = content[:_CHAT_DISPLAY_MAX_CHARS] if truncated else content
         paragraphs = display_text.split("\n") or [""]
 
-        self.chat.insert("end", "\n")  # отступ между сообщениями
+        self.chat.insert("end", "\n", tags())  # отступ между сообщениями
 
         # Заголовок: время и роль
-        self.chat.insert("end", header + "\n", (base_tag, f"{base_tag}_hdr"))
+        self.chat.insert("end", header + "\n", tags(base_tag, f"{base_tag}_hdr"))
         # Тело сообщения
         for paragraph in paragraphs:
-            self.chat.insert("end", paragraph + "\n", (base_tag,))
+            self.chat.insert("end", paragraph + "\n", tags(base_tag))
         if truncated:
             self.chat.insert(
                 "end",
                 f"… сообщение показано частично "
                 f"({len(content)} символов, лимит отображения "
                 f"{_CHAT_DISPLAY_MAX_CHARS})\n",
-                (base_tag,),
+                tags(base_tag),
             )
 
     def _scroll_to_end(self) -> None:
@@ -910,40 +987,153 @@ class ChatApplication:
             text=f"счётчик: {stats.get('counter', '')}"
         )
 
-        # Конспект (summary): сколько сообщений сжато и сколько это токенов
-        summary = stats.get("summary") or {}
-        if summary.get("active"):
-            covered = int(summary.get("covered", 0) or 0)
-            summary_tokens = int(summary.get("tokens", 0) or 0)
+        # Стратегия с фактами: «Факты: N · ≈X токенов», скользящее окно:
+        # «Окно: N сообщений». Ключи stats["facts"] / stats["strategy"].
+        strategy = stats.get("strategy") or {}
+        facts = stats.get("facts") or {}
+        if facts.get("active"):
+            facts_count = int(facts.get("count") or 0)
+            facts_tokens = int(facts.get("tokens") or 0)
             self.token_summary_label.config(
-                text=f"Конспект: ≈{summary_tokens} токенов · покрыто {covered} сообщ."
+                text=f"Факты: {facts_count} · ≈{facts_tokens} токенов"
             )
-        elif summary.get("enabled"):
-            self.token_summary_label.config(text="Конспект: — (ещё не сжат)")
         else:
-            self.token_summary_label.config(text="Конспект: выключен")
+            window = strategy.get("window")
+            if window is None:
+                self.token_summary_label.config(text="Окно: —")
+            else:
+                self.token_summary_label.config(
+                    text=f"Окно: {int(window)} сообщений"
+                )
+
+        # Метка стратегии и выпадающий список всегда синхронны с агентом
+        self._update_strategy_controls()
 
     def _token_context_text(self) -> str:
-        """Возвращает строку о контексте для статус-бара (с учётом конспекта)."""
+        """Строка о контексте для статус-бара.
+
+        Формат: ``Ветка: main · Стратегия: sliding_window ·
+        ctx: ≈120 (8 сообщ. отправлено)``.
+        """
         try:
             stats = self.agent.get_token_stats()
         except Exception:
             return "ctx: —"
         context = stats.get("context") or {}
+        branch = stats.get("branch") or {}
+        strategy = stats.get("strategy") or {}
         tokens = context.get("tokens")
+        sent = int(context.get("messages_sent") or 0)
         if tokens is None:
-            return "ctx: —"
-        if context.get("summary_active"):
-            covered = int(context.get("summary_covered", 0) or 0)
-            return f"ctx: ≈{tokens} ({covered} сообщ. в конспекте)"
-        return f"ctx: ≈{tokens}"
+            ctx = "ctx: —"
+        else:
+            ctx = f"ctx: ≈{tokens} ({sent} сообщ. отправлено)"
+        branch_name = branch.get("name") or "—"
+        strategy_name = strategy.get("name") or "—"
+        return (
+            f"Ветка: {branch_name} · Стратегия: {strategy_name} · {ctx}"
+        )
+
+    # ------------------------------------------------------------------
+    # Стратегии управления контекстом
+    # ------------------------------------------------------------------
+
+    def _available_strategies(self) -> list:
+        """Список стратегий агента (с безопасным запасным значением)."""
+        try:
+            names = list(self.agent.available_strategies())
+        except Exception:
+            names = []
+        return names or ["sliding_window", "sticky_facts", "branching"]
+
+    def _facts_limit(self) -> int:
+        """Максимум фактов из настроек стратегии (для подписи)."""
+        try:
+            settings = self.agent.strategy_settings
+            return int(settings.get("facts_max_items", 50) or 50)
+        except Exception:
+            return 50
+
+    def _strategy_info_text(self, info: Dict[str, Any]) -> str:
+        """Подпись текущего окна/лимитов рядом с выпадающим списком."""
+        name = info.get("name")
+        window = info.get("window")
+        facts_count = int(info.get("facts_count") or 0)
+        if name == "branching":
+            window_text = "окно: —" if window is None else f"окно: {window}"
+            return f"Ветки · {window_text}"
+        if name == "sticky_facts":
+            window_text = "Окно: —" if window is None else f"Окно: {window}"
+            return f"{window_text} · фактов: {facts_count}/{self._facts_limit()}"
+        if name == "sliding_window":
+            if window is None:
+                return "Окно: —"
+            return f"Окно: {window} сообщ."
+        return ""
+
+    def _update_strategy_controls(self) -> None:
+        """Синхронизирует список стратегий и подпись с состоянием агента."""
+        try:
+            info = self.agent.get_strategy()
+        except Exception:
+            return
+        # Legacy-режим (агент без стратегии) показываем как скользящее окно:
+        # пустой выпадающий список выглядел бы как сломанный UI.
+        name = info.get("name") or (self._available_strategies() or [""])[0]
+        display_info = dict(info)
+        display_info["name"] = name
+        try:
+            self.strategy_combo.configure(values=self._available_strategies())
+            if name and self.strategy_var.get() != name:
+                self.strategy_var.set(name)
+            self.strategy_info_label.config(
+                text=self._strategy_info_text(display_info)
+            )
+        except tk.TclError:
+            return
+
+    def _on_strategy_change(self, _event=None) -> None:
+        """Применяет выбранную стратегию управления контекстом сразу."""
+        try:
+            name = (self.strategy_var.get() or "").strip()
+        except tk.TclError:
+            return
+        if not name:
+            return
+        if self._busy:
+            self._set_status("Дождитесь ответа на текущий запрос.")
+            self._update_strategy_controls()
+            return
+        try:
+            info = self.agent.set_strategy(name)
+        except utils.AgentConfigError as exc:
+            self._set_status(f"Ошибка: {exc}")
+            self._update_strategy_controls()
+            return
+        except Exception as exc:  # страховка: агент не должен бросать
+            self._set_status(f"Ошибка: {exc}")
+            self._update_strategy_controls()
+            return
+
+        self._update_strategy_controls()
+        self._update_token_stats()
+        self._refresh_context_dialog()
+        self._refresh_branches_dialog()
+        self._set_status(f"Стратегия: {info.get('name') or name}")
+        self._set_info(self._token_context_text())
 
     # ------------------------------------------------------------------
     # Окно «Контекст»: просмотр, обновление и очистка конспекта
     # ------------------------------------------------------------------
 
     def _open_context_dialog(self) -> None:
-        """Открывает окно с текстом конспекта и управлением им."""
+        """Открывает окно «Контекст».
+
+        Окно работает в двух режимах:
+        - legacy-суммаризация (стратегия не задана): текст конспекта;
+        - стратегии контекста: стратегия/окно/ветка и блок фактов.
+        Режим определяется в :meth:`_context_mode`.
+        """
         window = self._context_window
         if window is not None and window.winfo_exists():
             self._refresh_context_dialog()
@@ -953,25 +1143,71 @@ class ChatApplication:
 
         window = tk.Toplevel(self.root)
         self._context_window = window
-        window.title("Контекст диалога")
-        window.geometry("660x470")
-        window.minsize(480, 320)
+        window.title("Контекст и стратегия")
+        window.geometry("720x540")
+        window.minsize(520, 380)
         window.configure(bg=COLORS["bg"])
         window.transient(self.root)
         window.protocol("WM_DELETE_WINDOW", self._close_context_dialog)
 
-        tk.Label(
-            window, text="Конспект предыдущей части диалога",
+        self.context_title_label = tk.Label(
+            window, text="Стратегия управления контекстом",
             bg=COLORS["bg"], font=FONTS["header"], fg=COLORS["text"],
-        ).pack(anchor="w", padx=10, pady=(10, 4))
+        )
+        self.context_title_label.pack(anchor="w", padx=10, pady=(10, 4))
 
-        text_wrap = tk.Frame(window, bg=COLORS["bg"])
-        text_wrap.pack(fill="both", expand=True, padx=10)
+        self.context_info_label = tk.Label(
+            window, text="", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"], justify="left", anchor="w",
+        )
+        self.context_info_label.pack(fill="x", padx=10, pady=(0, 6))
+
+        # Блок фактов (виден только в режиме стратегии с фактами)
+        self._context_facts_heading = tk.Label(
+            window, text="Факты диалога", bg=COLORS["bg"],
+            font=FONTS["header"], fg=COLORS["text"],
+        )
+        self._context_facts_heading.pack(anchor="w", padx=10)
+
+        self._context_tree_wrap = tk.Frame(window, bg=COLORS["bg"])
+        self._context_tree_wrap.pack(fill="both", expand=True, padx=10,
+                                     pady=(2, 0))
+
+        self.context_facts_tree = ttk.Treeview(
+            self._context_tree_wrap,
+            columns=("category", "key", "value"),
+            show="headings",
+            height=8,
+            selectmode="browse",
+        )
+        for column, title, width in (
+            ("category", "Категория", 130),
+            ("key", "Ключ", 150),
+            ("value", "Значение", 380),
+        ):
+            self.context_facts_tree.heading(column, text=title)
+            self.context_facts_tree.column(column, width=width, anchor="w")
+        tree_scroll = ttk.Scrollbar(
+            self._context_tree_wrap, orient="vertical",
+            command=self.context_facts_tree.yview,
+        )
+        self.context_facts_tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        self.context_facts_tree.pack(side="left", fill="both", expand=True)
+
+        self._context_text_heading = tk.Label(
+            window, text="Факты в том виде, в каком они уходят в запрос",
+            bg=COLORS["bg"], font=FONTS["small"], fg=COLORS["muted"],
+        )
+        self._context_text_heading.pack(anchor="w", padx=10, pady=(8, 2))
+
+        self._context_text_wrap = tk.Frame(window, bg=COLORS["bg"])
+        self._context_text_wrap.pack(fill="both", expand=True, padx=10)
 
         self.context_text = tk.Text(
-            text_wrap,
+            self._context_text_wrap,
             wrap="word",
-            height=14,
+            height=6,
             bg=COLORS["input_bg"],
             fg=COLORS["text"],
             font=FONTS["default"],
@@ -982,28 +1218,23 @@ class ChatApplication:
             cursor="arrow",
         )
         scrollbar = ttk.Scrollbar(
-            text_wrap, orient="vertical", command=self.context_text.yview
+            self._context_text_wrap, orient="vertical",
+            command=self.context_text.yview,
         )
         self.context_text.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.context_text.pack(side="left", fill="both", expand=True)
 
-        self.context_info_label = tk.Label(
-            window, text="", bg=COLORS["bg"], font=FONTS["small"],
-            fg=COLORS["muted"], justify="left", anchor="w",
-        )
-        self.context_info_label.pack(fill="x", padx=10, pady=(6, 4))
-
         buttons = tk.Frame(window, bg=COLORS["bg"])
-        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        buttons.pack(fill="x", padx=10, pady=(8, 10))
 
         self.context_refresh_btn = self._make_button(
-            buttons, "Обновить", self._on_context_refresh
+            buttons, "Обновить факты", self._on_context_refresh
         )
         self.context_refresh_btn.pack(side="left")
 
         self.context_clear_btn = self._make_button(
-            buttons, "Очистить", self._on_context_clear
+            buttons, "Очистить факты", self._on_context_clear
         )
         self.context_clear_btn.pack(side="left", padx=(8, 0))
 
@@ -1013,17 +1244,74 @@ class ChatApplication:
 
         self._refresh_context_dialog()
 
+    def _context_mode(self) -> str:
+        """Режим окна «Контекст»: ``legacy``, ``facts`` или ``strategy``."""
+        try:
+            strategy = self.agent.get_strategy()
+        except Exception:
+            return "legacy"
+        if not strategy.get("name"):
+            # Стратегия не задана — работает прежняя суммаризация конспекта
+            return "legacy"
+        return "facts" if strategy.get("facts") else "strategy"
+
+    def _pack_context_facts(self, show: bool) -> None:
+        """Показывает/скрывает блок фактов, сохраняя порядок виджетов."""
+        for widget in (self._context_facts_heading, self._context_tree_wrap):
+            try:
+                widget.pack_forget()
+            except tk.TclError:
+                pass
+        if not show:
+            return
+        try:
+            self._context_facts_heading.pack(
+                anchor="w", padx=10, before=self._context_text_heading
+            )
+            self._context_tree_wrap.pack(
+                fill="both", expand=True, padx=10, pady=(2, 0),
+                before=self._context_text_heading,
+            )
+        except tk.TclError:
+            pass
+
     def _refresh_context_dialog(self) -> None:
-        """Перерисовывает окно «Контекст» по текущему состоянию агента."""
+        """Перерисовывает окно «Контекст» по текущему состоянию агента.
+
+        В legacy-режиме (стратегия не задана) окно ведёт себя как раньше:
+        показывает текст конспекта. В режиме стратегий — стратегию, размер
+        окна, активную ветку и блок фактов (для стратегии без фактов —
+        понятную надпись).
+        """
         window = self._context_window
         if window is None or not window.winfo_exists():
             return
+
+        mode = self._context_mode()
+        if mode == "legacy":
+            self._refresh_context_summary()
+        else:
+            self._refresh_context_facts(mode)
+
+    def _refresh_context_summary(self) -> None:
+        """Legacy-режим: текст конспекта и состояние сжатия."""
         try:
             summary = self.agent.get_summary()
         except Exception as exc:
-            summary = {"active": False, "text": "", "error": str(exc)}
+            summary = {"active": False, "text": "", "enabled": False,
+                       "error": str(exc)}
 
-        text = summary.get("text") or ""
+        text = str(summary.get("text") or "")
+        self._pack_context_facts(False)
+        try:
+            self.context_title_label.config(
+                text="Конспект предыдущей части диалога"
+            )
+            self._context_text_heading.config(text="Текст конспекта")
+            self.context_text.configure(height=14)
+        except tk.TclError:
+            pass
+
         self.context_text.configure(state="normal")
         self.context_text.delete("1.0", "end")
         if text:
@@ -1050,38 +1338,176 @@ class ChatApplication:
             info += f"\nОшибка сжатия: {summary['error']}"
         self.context_info_label.config(text=info)
 
-        state = "normal" if (text and summary.get("enabled")) else "disabled"
-        self.context_clear_btn.configure(state=state)
-        if not self._context_busy:
-            self.context_refresh_btn.configure(state="normal")
+        try:
+            self.context_refresh_btn.config(
+                text="Обновить",
+                state="disabled" if self._context_busy else "normal",
+            )
+            self.context_clear_btn.config(
+                text="Очистить",
+                state="normal" if (text and summary.get("enabled"))
+                else "disabled",
+            )
+        except tk.TclError:
+            pass
+
+    def _refresh_context_facts(self, mode: str) -> None:
+        """Режим стратегий: стратегия, окно, ветка и блок фактов."""
+        try:
+            strategy = self.agent.get_strategy()
+        except Exception as exc:
+            strategy = {"error": str(exc)}
+        try:
+            facts = self.agent.get_facts()
+        except Exception as exc:
+            facts = {"items": [], "text": "", "count": 0, "tokens": 0,
+                     "active": False, "enabled": False, "error": str(exc),
+                     "updated_at": None}
+
+        facts_active = mode == "facts"
+        count = int(facts.get("count") or 0)
+        tokens = int(facts.get("tokens") or 0)
+        branch = strategy.get("branch") or {}
+        name = strategy.get("name") or "—"
+        sub_strategy = strategy.get("sub_strategy")
+        window_size = strategy.get("window")
+
+        lines = []
+        if sub_strategy and sub_strategy != name:
+            lines.append(f"Стратегия: {name} · подстратегия ветки: {sub_strategy}")
+        else:
+            lines.append(f"Стратегия: {name}")
+        if window_size is not None:
+            lines.append(f"Окно последних сообщений: {window_size}")
+        lines.append(
+            f"Ветка: {branch.get('name') or '—'} (id={branch.get('id', '—')}) · "
+            f"сообщений: {branch.get('messages', 0)} · "
+            f"веток: {branch.get('branches_count', 0)}"
+        )
+        if facts_active:
+            lines.append(
+                f"Фактов: {count} · ≈{tokens} токенов · "
+                f"обновлено: {facts.get('updated_at') or '—'} · "
+                f"{'включены' if facts.get('enabled') else 'выключены'}"
+            )
+        else:
+            lines.append("Факты не используются в этой стратегии.")
+        error = strategy.get("error") or facts.get("error")
+        if error:
+            lines.append(f"Ошибка: {error}")
+        self.context_info_label.config(text="\n".join(lines))
+
+        self._pack_context_facts(facts_active)
+        try:
+            self.context_title_label.config(
+                text="Стратегия управления контекстом"
+            )
+        except tk.TclError:
+            pass
+
+        # Таблица фактов: категория / ключ / значение
+        try:
+            self.context_facts_tree.delete(
+                *self.context_facts_tree.get_children()
+            )
+            for item in facts.get("items") or []:
+                self.context_facts_tree.insert(
+                    "", "end",
+                    values=(item.get("category", ""), item.get("key", ""),
+                            item.get("value", "")),
+                )
+        except tk.TclError:
+            pass
+
+        # Текстовый блок фактов (как они попадают в запрос)
+        text = str(facts.get("text") or "").strip()
+        try:
+            self._context_text_heading.config(
+                text="Факты в том виде, в каком они уходят в запрос"
+            )
+            self.context_text.configure(height=6)
+        except tk.TclError:
+            pass
+        self.context_text.configure(state="normal")
+        self.context_text.delete("1.0", "end")
+        if not facts_active:
+            self.context_text.insert(
+                "1.0",
+                "Факты не используются в этой стратегии.\n\n"
+                "Блок фактов доступен для стратегий «sticky_facts» и "
+                "«branching» (с подстратегией sticky_facts). Переключите "
+                "стратегию в выпадающем списке на панели параметров.",
+            )
+        elif text:
+            self.context_text.insert("1.0", text)
+        else:
+            self.context_text.insert(
+                "1.0",
+                "Фактов пока нет.\n\n"
+                "Нажмите «Обновить факты», чтобы извлечь их из текущего "
+                "диалога.",
+            )
+        self.context_text.configure(state="disabled")
+
+        # Кнопки: обновлять/очищать имеет смысл только при активных фактах
+        try:
+            self.context_refresh_btn.config(
+                text="Обновить факты",
+                state="normal" if (facts_active and not self._context_busy)
+                else "disabled",
+            )
+            self.context_clear_btn.config(
+                text="Очистить факты",
+                state="normal" if (facts_active and count > 0
+                                   and not self._context_busy)
+                else "disabled",
+            )
+        except tk.TclError:
+            pass
 
     def _on_context_refresh(self) -> None:
-        """Запускает принудительное сжатие истории в фоновом потоке."""
+        """Обновляет контекст в фоновом потоке (UI не «зависает»).
+
+        В legacy-режиме принудительно сжимает историю в конспект
+        (``summarize_now``), в режиме стратегий — обновляет факты
+        (``update_facts_now``).
+        """
         if self._context_busy:
             return
         if self._busy:
             self._set_status("Дождитесь ответа на текущий запрос.")
             return
 
+        mode = self._context_mode()
+        self._context_pending_mode = mode
         self._context_busy = True
-        self.context_refresh_btn.configure(state="disabled")
-        self._set_status("Сжимаю историю…")
+        try:
+            self.context_refresh_btn.configure(state="disabled")
+        except tk.TclError:
+            pass
+        self._set_status(
+            "Сжимаю историю…" if mode == "legacy" else "Обновляю факты…"
+        )
+        self._refresh_context_dialog()
 
         def worker() -> None:
             try:
-                result = self.agent.summarize_now(force=True)
+                if mode == "legacy":
+                    result = self.agent.summarize_now(force=True)
+                else:
+                    result = self.agent.update_facts_now(force=True)
             except Exception as exc:  # агент не должен бросать, но страхуемся
-                result = {"updated": False, "covered": 0,
+                result = {"updated": False, "count": 0,
                           "error": f"Непредвиденная ошибка: {exc}"}
             self._summary_queue.put(result)
 
         threading.Thread(
-            target=worker, daemon=True, name="summary-refresh"
+            target=worker, daemon=True, name="context-refresh"
         ).start()
         self.root.after(100, self._poll_summary_queue)
 
     def _poll_summary_queue(self) -> None:
-        """Опрашивает очередь результата сжатия (вызывается через root.after)."""
+        """Опрашивает очередь результата обновления контекста (root.after)."""
         try:
             while True:
                 result = self._summary_queue.get_nowait()
@@ -1093,32 +1519,60 @@ class ChatApplication:
                 self.root.after(100, self._poll_summary_queue)
 
     def _on_summary_result(self, result: Dict[str, Any]) -> None:
-        """Обрабатывает результат принудительного сжатия в главном потоке."""
+        """Обрабатывает результат обновления контекста в главном потоке."""
+        mode = getattr(self, "_context_pending_mode", "facts")
         self._context_busy = False
+        self._context_pending_mode = None
         self._update_token_stats()
         self._refresh_context_dialog()
-        if result.get("error"):
-            self._set_status(f"Сжатие не удалось: {result['error']}")
+        self._refresh_branches_dialog()
+        error = result.get("error")
+        if mode == "legacy":
+            if error:
+                self._set_status(f"Сжатие не удалось: {error}")
+            elif result.get("updated"):
+                self._set_status(
+                    f"Конспект обновлён: покрыто "
+                    f"{result.get('covered', 0)} сообщений."
+                )
+            else:
+                self._set_status("Сжимать нечего: история ещё короткая.")
+            return
+        if error:
+            self._set_status(f"Факты: {error}")
         elif result.get("updated"):
             self._set_status(
-                f"Конспект обновлён: покрыто {result.get('covered', 0)} сообщений."
+                f"Факты обновлены: {int(result.get('count') or 0)}."
             )
         else:
-            self._set_status("Сжимать нечего: история ещё короткая.")
+            self._set_status("Факты не изменились.")
 
     def _on_context_clear(self) -> None:
-        """Очищает конспект (история диалога сохраняется)."""
+        """Очищает конспект (legacy) или блок фактов (стратегии)."""
         parent = self._context_window or self.root
-        if not messagebox.askyesno(
-            "Очистить конспект",
-            "Удалить конспект диалога?\n\nСама история сообщений сохранится.",
-            parent=parent,
-        ):
+        legacy = self._context_mode() == "legacy"
+        if legacy:
+            title = "Очистить конспект"
+            question = (
+                "Удалить конспект диалога?\n\n"
+                "Сама история сообщений сохранится."
+            )
+        else:
+            title = "Очистить факты"
+            question = (
+                "Удалить все факты диалога?\n\n"
+                "Сама история сообщений сохранится."
+            )
+        if not messagebox.askyesno(title, question, parent=parent):
             return
-        self.agent.clear_summary()
+        if legacy:
+            self.agent.clear_summary()
+        else:
+            self.agent.clear_facts()
         self._refresh_context_dialog()
         self._update_token_stats()
-        self._set_status("Конспект очищен.")
+        self._refresh_branches_dialog()
+        self._set_status("Конспект очищен." if legacy else "Факты очищены.")
 
     def _close_context_dialog(self) -> None:
         """Закрывает окно «Контекст»."""
@@ -1129,6 +1583,496 @@ class ChatApplication:
                 window.destroy()
             except tk.TclError:
                 pass
+
+    # ------------------------------------------------------------------
+    # Ветки: контекстное меню чата и создание ветки от сообщения
+    # ------------------------------------------------------------------
+
+    def _message_index_at(self, index: str) -> Optional[int]:
+        """Индекс сообщения диалога по позиции в области чата.
+
+        Args:
+            index: индекс Tk (например, "5.3"), полученный через
+                ``self.chat.index("@x,y")``.
+
+        Returns:
+            Индекс сообщения без учёта system или None, если под позицией
+            сообщения нет.
+        """
+        if not index:
+            return None
+        try:
+            names = self.chat.tag_names(index)
+        except tk.TclError:
+            return None
+        for tag in names:
+            if isinstance(tag, str) and tag.startswith("msg_"):
+                try:
+                    return int(tag[4:])
+                except ValueError:
+                    continue
+        return None
+
+    def _selected_chat_index(self) -> Optional[int]:
+        """Индекс выбранного в чате сообщения (None — сообщение не выбрано)."""
+        index = self._chat_selected_index
+        if index is None:
+            return None
+        if index < 0 or index >= self._chat_message_count:
+            return None
+        return index
+
+    def _show_chat_menu(self, event) -> None:
+        """Показывает контекстное меню чата по правой кнопке мыши."""
+        try:
+            index = self.chat.index("@%d,%d" % (event.x, event.y))
+        except tk.TclError:
+            index = None
+        message_index = self._message_index_at(index)
+        self._chat_selected_index = message_index
+        try:
+            self.chat_menu.entryconfigure(
+                0, state=("normal" if message_index is not None
+                          else "disabled")
+            )
+        except tk.TclError:
+            pass
+        try:
+            self.chat_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.chat_menu.grab_release()
+            except tk.TclError:
+                pass
+
+    def _on_create_branch_from_chat(self) -> None:
+        """Создаёт ветку от сообщения, выбранного правой кнопкой в чате."""
+        index = self._selected_chat_index()
+        if index is None:
+            self._set_status(
+                "Ветку можно создать только от сообщения: щёлкните по нему "
+                "правой кнопкой мыши."
+            )
+            return
+        self._create_branch(from_index=index)
+
+    # ------------------------------------------------------------------
+    # Окно «Ветки» диалога
+    # ------------------------------------------------------------------
+
+    def _open_branches_dialog(self) -> None:
+        """Открывает окно со списком веток диалога."""
+        window = self._branches_window
+        if window is not None and window.winfo_exists():
+            self._refresh_branches_dialog()
+            window.lift()
+            window.focus_set()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._branches_window = window
+        window.title("Ветки диалога")
+        window.geometry("780x430")
+        window.minsize(560, 320)
+        window.configure(bg=COLORS["bg"])
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self._close_branches_dialog)
+
+        tk.Label(
+            window, text="Ветки диалога", bg=COLORS["bg"],
+            font=FONTS["header"], fg=COLORS["text"],
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+
+        self.branches_info_label = tk.Label(
+            window, text="", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"], justify="left", anchor="w",
+        )
+        self.branches_info_label.pack(fill="x", padx=10, pady=(0, 6))
+
+        tree_wrap = tk.Frame(window, bg=COLORS["bg"])
+        tree_wrap.pack(fill="both", expand=True, padx=10)
+
+        self.branches_tree = ttk.Treeview(
+            tree_wrap,
+            columns=("name", "strategy", "messages", "facts",
+                     "created", "parent"),
+            show="headings",
+            selectmode="browse",
+        )
+        for column, title, width, anchor in (
+            ("name", "Имя", 190, "w"),
+            ("strategy", "Стратегия", 120, "w"),
+            ("messages", "Сообщений", 90, "center"),
+            ("facts", "Фактов", 70, "center"),
+            ("created", "Создана", 150, "w"),
+            ("parent", "Родитель", 120, "w"),
+        ):
+            self.branches_tree.heading(column, text=title)
+            self.branches_tree.column(column, width=width, anchor=anchor)
+        # Активная ветка выделяется фоном
+        self.branches_tree.tag_configure("active", background=COLORS["user_bg"])
+        tree_scroll = ttk.Scrollbar(
+            tree_wrap, orient="vertical", command=self.branches_tree.yview
+        )
+        self.branches_tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        self.branches_tree.pack(side="left", fill="both", expand=True)
+        self.branches_tree.bind(
+            "<Double-1>", lambda _event: self._on_branches_switch()
+        )
+        self.branches_tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event: self._update_branches_buttons_state(),
+        )
+
+        buttons_top = tk.Frame(window, bg=COLORS["bg"])
+        buttons_top.pack(fill="x", padx=10, pady=(8, 4))
+
+        self.branches_create_btn = self._make_button(
+            buttons_top, "Создать от конца", self._on_branches_checkpoint,
+            small=True,
+        )
+        self.branches_create_btn.pack(side="left")
+
+        self.branches_create_msg_btn = self._make_button(
+            buttons_top, "Создать от выбранного сообщения",
+            self._on_branches_create_from_message, small=True,
+        )
+        self.branches_create_msg_btn.pack(side="left", padx=(8, 0))
+
+        buttons_bottom = tk.Frame(window, bg=COLORS["bg"])
+        buttons_bottom.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.branches_switch_btn = self._make_button(
+            buttons_bottom, "Переключиться", self._on_branches_switch, small=True
+        )
+        self.branches_switch_btn.pack(side="left")
+
+        self.branches_rename_btn = self._make_button(
+            buttons_bottom, "Переименовать", self._on_branches_rename, small=True
+        )
+        self.branches_rename_btn.pack(side="left", padx=(8, 0))
+
+        self.branches_delete_btn = self._make_button(
+            buttons_bottom, "Удалить", self._on_branches_delete, small=True
+        )
+        self.branches_delete_btn.pack(side="left", padx=(8, 0))
+
+        self._make_button(
+            buttons_bottom, "Закрыть", self._close_branches_dialog, small=True
+        ).pack(side="right")
+
+        self._refresh_branches_dialog()
+
+    def _selected_branch_id(self) -> Optional[int]:
+        """Идентификатор выбранной в таблице ветки (None — нет выбора)."""
+        window = self._branches_window
+        if window is None:
+            return None
+        try:
+            selection = self.branches_tree.selection()
+        except (tk.TclError, AttributeError):
+            return None
+        if not selection:
+            return None
+        try:
+            return int(selection[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _branch_name(self, branch_id: int) -> str:
+        """Имя ветки по её идентификатору (для диалогов подтверждения)."""
+        try:
+            for branch in self.agent.list_branches():
+                if int(branch.get("id") or 0) == int(branch_id):
+                    return str(branch.get("name") or f"ветка-{branch_id}")
+        except Exception:
+            pass
+        return f"ветка-{branch_id}"
+
+    def _refresh_branches_dialog(self) -> None:
+        """Перерисовывает таблицу веток и состояние кнопок."""
+        window = self._branches_window
+        if window is None or not window.winfo_exists():
+            return
+        try:
+            branches = list(self.agent.list_branches())
+        except Exception:
+            branches = []
+
+        names = {}
+        for branch in branches:
+            try:
+                names[int(branch.get("id") or 0)] = str(
+                    branch.get("name") or ""
+                )
+            except (TypeError, ValueError):
+                continue
+
+        selected = self._selected_branch_id()
+        tree = self.branches_tree
+        try:
+            tree.delete(*tree.get_children())
+        except tk.TclError:
+            return
+
+        active_id: Optional[int] = None
+        for branch in branches:
+            try:
+                branch_id = int(branch.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            is_active = bool(branch.get("active"))
+            if is_active:
+                active_id = branch_id
+            parent_id = branch.get("parent_id")
+            parent_name = "—"
+            if parent_id is not None:
+                try:
+                    parent_name = names.get(int(parent_id)) or f"id={parent_id}"
+                except (TypeError, ValueError):
+                    parent_name = str(parent_id)
+            try:
+                tree.insert(
+                    "", "end", iid=str(branch_id),
+                    values=(
+                        branch.get("name") or f"ветка-{branch_id}",
+                        branch.get("strategy") or "—",
+                        int(branch.get("messages") or 0),
+                        int(branch.get("facts_count") or 0),
+                        str(branch.get("created_at") or "—"),
+                        parent_name,
+                    ),
+                    tags=("active",) if is_active else (),
+                )
+            except tk.TclError:
+                continue
+
+        target = selected if selected is not None else active_id
+        if target is not None and tree.exists(str(target)):
+            try:
+                tree.selection_set(str(target))
+                tree.focus(str(target))
+                tree.see(str(target))
+            except tk.TclError:
+                pass
+
+        active = next(
+            (b for b in branches if b.get("active")), {}
+        ) or {}
+        try:
+            self.branches_info_label.config(
+                text=(
+                    f"Активная ветка: {active.get('name') or '—'} "
+                    f"(id={active.get('id', '—')}) · всего веток: "
+                    f"{len(branches)}"
+                )
+            )
+        except tk.TclError:
+            pass
+        self._update_branches_buttons_state()
+
+    def _update_branches_buttons_state(self) -> None:
+        """Включает/выключает кнопки окна веток."""
+        window = self._branches_window
+        if window is None or not window.winfo_exists():
+            return
+        busy = self._branches_busy
+        has_selection = self._selected_branch_id() is not None
+        states = {
+            "branches_create_btn": not busy,
+            "branches_create_msg_btn": not busy,
+            "branches_switch_btn": has_selection and not busy,
+            "branches_rename_btn": has_selection and not busy,
+            "branches_delete_btn": has_selection and not busy,
+        }
+        for attribute, enabled in states.items():
+            widget = getattr(self, attribute, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state="normal" if enabled else "disabled")
+            except tk.TclError:
+                continue
+
+    def _on_branches_checkpoint(self) -> None:
+        """Создаёт checkpoint — ветку от конца текущего диалога."""
+        self._create_branch(from_index=None)
+
+    def _on_branches_create_from_message(self) -> None:
+        """Создаёт ветку от выбранного в чате сообщения.
+
+        Если сообщение не выбрано, поведение совпадает с checkpoint.
+        """
+        index = self._selected_chat_index()
+        if index is None:
+            self._set_status(
+                "Сообщение не выбрано — создаю ветку от конца диалога."
+            )
+            self._create_branch(from_index=None)
+            return
+        self._create_branch(from_index=index)
+
+    def _create_branch(self, from_index: Optional[int] = None) -> None:
+        """Спрашивает имя и создаёт ветку в фоновом потоке."""
+        if self._busy or self._branches_busy or self._action_busy:
+            self._set_status("Дождитесь завершения текущей операции.")
+            return
+        parent = self._branches_window or self.root
+        if from_index is None:
+            title = "Новая ветка"
+            prompt = "Имя новой ветки (пусто — автоматически):"
+        else:
+            title = "Ветка от сообщения"
+            prompt = (
+                f"Имя ветки от сообщения №{from_index + 1} "
+                "(пусто — автоматически):"
+            )
+        name = simpledialog.askstring(title, prompt, parent=parent)
+        if name is None:  # отмена
+            return
+        name = name.strip() or None
+
+        if from_index is None:
+            def action() -> Dict[str, Any]:
+                return self.agent.checkpoint(name=name)
+        else:
+            def action() -> Dict[str, Any]:
+                return self.agent.create_branch(from_index=from_index, name=name)
+
+        self._branch_action(action)
+
+    def _on_branches_switch(self) -> None:
+        """Переключается на выбранную ветку."""
+        branch_id = self._selected_branch_id()
+        if branch_id is None:
+            self._set_status("Выберите ветку в списке.")
+            return
+        self._branch_action(lambda: self.agent.switch_branch(branch_id))
+
+    def _on_branches_rename(self) -> None:
+        """Переименовывает выбранную ветку."""
+        branch_id = self._selected_branch_id()
+        if branch_id is None:
+            self._set_status("Выберите ветку в списке.")
+            return
+        parent = self._branches_window or self.root
+        name = simpledialog.askstring(
+            "Переименовать ветку", "Новое имя ветки:",
+            initialvalue=self._branch_name(branch_id), parent=parent,
+        )
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            self._set_status("Имя ветки не может быть пустым.")
+            return
+        self._branch_action(lambda: self.agent.rename_branch(branch_id, name))
+
+    def _on_branches_delete(self) -> None:
+        """Удаляет выбранную ветку (с подтверждением)."""
+        branch_id = self._selected_branch_id()
+        if branch_id is None:
+            self._set_status("Выберите ветку в списке.")
+            return
+        parent = self._branches_window or self.root
+        name = self._branch_name(branch_id)
+        if not messagebox.askyesno(
+            "Удалить ветку",
+            f"Удалить ветку «{name}»?\n\nДочерние ветки останутся, но "
+            "потеряют родителя.",
+            parent=parent,
+        ):
+            return
+        self._branch_action(lambda: self.agent.delete_branch(branch_id))
+
+    def _branch_action(self, action) -> None:
+        """Выполняет операцию с ветками в фоновом потоке."""
+        if self._branches_busy or self._action_busy:
+            self._set_status("Дождитесь завершения операции с ветками.")
+            return
+        self._branches_busy = True
+        self._update_branches_buttons_state()
+        self._set_status("Операция с ветками…")
+        self._run_action(action, self._on_branch_result)
+
+    def _on_branch_result(self, result: Dict[str, Any]) -> None:
+        """Обрабатывает результат операции с ветками в главном потоке."""
+        self._branches_busy = False
+        self._refresh_branches_dialog()
+        self._refresh_chat()
+        self._update_token_stats()
+        self._refresh_context_dialog()
+        self._update_branches_buttons_state()
+
+        error = result.get("error") if isinstance(result, dict) else None
+        if error:
+            self._set_status(f"Ветки: {error}")
+            messagebox.showerror(
+                "Ветки", str(error), parent=self._branches_window or self.root
+            )
+            return
+        data = result if isinstance(result, dict) else {}
+        deleted = data.get("deleted") or []
+        branch = data.get("branch") or {}
+        if deleted:
+            self._set_status(f"Удалено веток: {len(deleted)}.")
+        elif isinstance(branch, dict) and branch.get("name"):
+            self._set_status(f"Активная ветка: {branch.get('name')}.")
+        else:
+            self._set_status("Готово.")
+        self._set_info(self._token_context_text())
+
+    def _close_branches_dialog(self) -> None:
+        """Закрывает окно «Ветки»."""
+        window = self._branches_window
+        self._branches_window = None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Фоновые операции UI (ветки и прочие вызовы API по кнопкам)
+    # ------------------------------------------------------------------
+
+    def _run_action(self, action, on_done) -> None:
+        """Выполняет ``action`` в фоновом потоке и отдаёт результат в UI.
+
+        Результат передаётся в главный поток через очередь и ``root.after``,
+        чтобы Tkinter не вызывался из рабочего потока.
+        """
+        if self._action_busy:
+            self._set_status("Дождитесь завершения операции.")
+            return
+        self._action_busy = True
+
+        def worker() -> None:
+            try:
+                result = action()
+            except Exception as exc:  # агент не должен бросать, но страхуемся
+                result = {"error": f"Непредвиденная ошибка: {exc}"}
+            self._action_queue.put((result, on_done))
+
+        threading.Thread(target=worker, daemon=True, name="ui-action").start()
+        self.root.after(80, self._poll_action_queue)
+
+    def _poll_action_queue(self) -> None:
+        """Опрашивает очередь фоновых операций (вызывается через root.after)."""
+        try:
+            while True:
+                result, on_done = self._action_queue.get_nowait()
+                self._action_busy = False
+                try:
+                    on_done(result)
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        finally:
+            if self._action_busy:
+                self.root.after(80, self._poll_action_queue)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         """Блокирует/разблокирует органы управления на время запроса.
@@ -1142,6 +2086,8 @@ class ChatApplication:
             self.clear_top_btn,
             self.clear_input_btn,
             self.apply_prompt_btn,
+            self.context_btn,
+            self.branches_btn,
             self.temp_scale,
             self.tokens_spin,
             self.prompt_entry,
@@ -1149,11 +2095,9 @@ class ChatApplication:
         ):
             widget.configure(state="normal" if enabled else "disabled")
 
-        # ttk.Combobox
-        if enabled:
-            self.model_combo.configure(state="readonly")
-        else:
-            self.model_combo.configure(state="disabled")
+        # ttk.Combobox: обычное состояние — "readonly", а не "normal"
+        for combo in (self.model_combo, self.strategy_combo):
+            combo.configure(state="readonly" if enabled else "disabled")
 
         # Подсказка не должна висеть поверх заблокированного поля
         self._refresh_input_placeholder()
@@ -1222,6 +2166,9 @@ class ChatApplication:
             self.agent.update_config(system_prompt=new_prompt)
             self._refresh_chat()
             self._update_token_stats()
+            self._update_strategy_controls()
+            self._refresh_branches_dialog()
+            self._refresh_context_dialog()
             self._set_status("Системный промпт применён, история очищена.")
         except utils.AgentConfigError as exc:
             self._set_status(f"Ошибка: {exc}")
@@ -1247,6 +2194,9 @@ class ChatApplication:
         self.agent.clear_history()
         self._refresh_chat()
         self._update_token_stats()
+        self._update_strategy_controls()
+        self._refresh_branches_dialog()
+        self._refresh_context_dialog()
         self._set_status("История очищена.")
         self._set_info("")
 
@@ -1389,6 +2339,7 @@ class ChatApplication:
         close() идемпотентен, повторный вызов из main.py безопасен.
         """
         self._cancel_autosize()
-        self._context_window = None
+        self._close_context_dialog()
+        self._close_branches_dialog()
         self.agent.close()
         self.root.destroy()

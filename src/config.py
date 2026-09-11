@@ -76,7 +76,9 @@ DEFAULTS: Dict[str, Any] = {
     # Цены за 1M токенов в USD (0.0 — цена не задана, стоимость не считается)
     "PRICE_INPUT_PER_1M": 0.0,
     "PRICE_OUTPUT_PER_1M": 0.0,
-    # Управление контекстом: сжатие старой части диалога в конспект (summary)
+    # Управление контекстом: сжатие старой части диалога в конспект (summary).
+    # Оставлено для обратной совместимости: в приложении не используется,
+    # в переключателе стратегий суммаризации нет.
     "SUMMARY_ENABLED": True,
     "SUMMARY_KEEP_LAST_N": 10,   # сколько последних сообщений идут «как есть»
     "SUMMARY_EVERY_N": 10,       # размер блока сжатия (K сообщений)
@@ -84,19 +86,35 @@ DEFAULTS: Dict[str, Any] = {
     "SUMMARY_TEMPERATURE": 0.2,  # температура служебного запроса
     "SUMMARY_MODEL": "",         # "" — использовать модель диалога
     "SUMMARY_PROMPT": "",        # "" — встроенная инструкция сжатия
+    # Управление контекстом: стратегии (sliding_window | sticky_facts | branching)
+    "STRATEGY": "sliding_window",   # стратегия по умолчанию
+    "WINDOW_KEEP_LAST_N": 20,       # размер окна последних сообщений
+    # Sticky Facts: блок «ключ → значение», обновляемый после каждого хода
+    "FACTS_ENABLED": True,          # обновлять факты LLM-запросом
+    "FACTS_MODEL": "",              # "" — использовать модель диалога
+    "FACTS_TEMPERATURE": 0.0,       # температура служебного запроса фактов
+    "FACTS_MAX_TOKENS": 300,        # лимит блока фактов в токенах
+    "FACTS_MAX_ITEMS": 50,          # максимум пар «ключ → значение»
+    "FACTS_PROMPT": "",             # "" — встроенная инструкция извлечения
+    # Ветки диалога (режим branching)
+    "BRANCH_MAX": 20,               # максимум веток в одном хранилище
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
-_BOOL_KEYS = ("MOCK_MODE", "STORAGE_ENABLED", "TOKENIZER_ENABLED", "SUMMARY_ENABLED")
+_BOOL_KEYS = (
+    "MOCK_MODE", "STORAGE_ENABLED", "TOKENIZER_ENABLED", "SUMMARY_ENABLED",
+    "FACTS_ENABLED",
+)
 
 # Переменные, значения которых нужно приводить к числу
 _INT_KEYS = (
     "UI_WIDTH", "UI_HEIGHT", "DEFAULT_MAX_TOKENS", "MAX_HISTORY_MESSAGES",
     "SUMMARY_KEEP_LAST_N", "SUMMARY_EVERY_N", "SUMMARY_MAX_TOKENS",
+    "WINDOW_KEEP_LAST_N", "FACTS_MAX_TOKENS", "FACTS_MAX_ITEMS", "BRANCH_MAX",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
-    "SUMMARY_TEMPERATURE",
+    "SUMMARY_TEMPERATURE", "FACTS_TEMPERATURE",
 )
 
 # Суффиксы переменных окружения с ценами по конкретной модели:
@@ -304,4 +322,88 @@ def get_summary_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, A
         "temperature": _float("SUMMARY_TEMPERATURE", 0.2, 0.0, 2.0),
         "model": str(cfg.get("SUMMARY_MODEL") or "").strip(),
         "prompt": str(cfg.get("SUMMARY_PROMPT") or "").strip(),
+    }
+
+
+def get_strategy_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки стратегий управления контекстом.
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+    Неизвестное имя стратегии заменяется на ``sliding_window``.
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"name", "window", "branch_strategy", "branch_max",
+        "facts_enabled", "facts_model", "facts_temperature",
+        "facts_max_tokens", "facts_max_items", "facts_prompt"}.
+    """
+    # Импорт внутри функции: config не должен зависеть от стратегий на старте
+    from .strategies import (
+        BRANCHING,
+        DEFAULT_WINDOW_KEEP_LAST_N,
+        SLIDING_WINDOW,
+        normalize_name,
+    )
+
+    cfg = config if config is not None else get_config()
+    logger = get_logger("deepseek-chat.config")
+
+    def _int(key: str, default: int, low: int, high: int) -> int:
+        raw = cfg.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Некорректное значение %s=%r — беру %d.", key, raw, default)
+            return default
+        if not (low <= value <= high):
+            logger.warning(
+                "%s=%d вне диапазона [%d, %d] — беру %d.",
+                key, value, low, high, default,
+            )
+            return default
+        return value
+
+    def _float(key: str, default: float, low: float, high: float) -> float:
+        raw = cfg.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("Некорректное значение %s=%r — беру %.2f.", key, raw, default)
+            return default
+        if not (low <= value <= high):
+            logger.warning(
+                "%s=%.2f вне диапазона [%.2f, %.2f] — беру %.2f.",
+                key, value, low, high, default,
+            )
+            return default
+        return value
+
+    raw_name = str(cfg.get("STRATEGY", SLIDING_WINDOW) or "").strip()
+    try:
+        name = normalize_name(raw_name)
+    except Exception:
+        logger.warning(
+            "Неизвестная стратегия STRATEGY=%r — беру %s.",
+            raw_name, SLIDING_WINDOW,
+        )
+        name = SLIDING_WINDOW
+
+    # Подстратегия для режима веток: у режима branching своей сборки контекста
+    # нет, поэтому запоминаем, какая стратегия действует внутри ветки.
+    branch_strategy = name if name != BRANCHING else SLIDING_WINDOW
+
+    return {
+        "name": name,
+        "window": _int("WINDOW_KEEP_LAST_N", DEFAULT_WINDOW_KEEP_LAST_N, 1, 1000),
+        "branch_strategy": branch_strategy,
+        "branch_max": _int("BRANCH_MAX", 20, 1, 500),
+        "facts_enabled": bool(cfg.get("FACTS_ENABLED", True)),
+        "facts_model": str(cfg.get("FACTS_MODEL") or "").strip(),
+        "facts_temperature": _float("FACTS_TEMPERATURE", 0.0, 0.0, 2.0),
+        "facts_max_tokens": _int("FACTS_MAX_TOKENS", 300, 20, 4000),
+        "facts_max_items": _int("FACTS_MAX_ITEMS", 50, 1, 500),
+        "facts_prompt": str(cfg.get("FACTS_PROMPT") or "").strip(),
     }
