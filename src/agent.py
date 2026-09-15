@@ -41,6 +41,22 @@ from openai import OpenAI
 from . import utils
 from .branches import BranchManager
 from .facts import FactsStore
+from .memory import (
+    LONG_HEADER,
+    LONG_TERM,
+    LAYERS,
+    LAYER_TITLES,
+    PINNED_HEADER,
+    SHORT_TERM,
+    WORKING,
+    WORKING_HEADER,
+    LongTermStore,
+    MemoryClassifier,
+    MemoryError,
+    MemoryManager,
+    WorkingMemory,
+    normalize_layer,
+)
 from .storage import ContextStore
 from .strategies import (
     AVAILABLE_STRATEGIES,
@@ -108,6 +124,9 @@ class DeepSeekAgent:
         strategy: Optional[str] = None,
         strategy_settings: Optional[Dict[str, Any]] = None,
         branch_manager: Optional[BranchManager] = None,
+        memory_settings: Optional[Dict[str, Any]] = None,
+        memory_manager: Optional[MemoryManager] = None,
+        long_memory: Optional[LongTermStore] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -141,6 +160,12 @@ class DeepSeekAgent:
             strategy_settings: настройки стратегий (см.
                 config.get_strategy_settings): окно, факты, ветки.
             branch_manager: готовый менеджер веток (для тестов); None — создать.
+            memory_settings: настройки модели памяти (см.
+                config.get_memory_settings); None — модель памяти выключена
+                (поведение ровно как раньше).
+            memory_manager: готовый менеджер памяти (для тестов); None — создать.
+            long_memory: готовое хранилище долговременной памяти (для тестов);
+                None — создать из настроек (не создаётся в mock-режиме).
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -202,6 +227,45 @@ class DeepSeekAgent:
         self._facts_updated_at: Optional[str] = None
         self._active_branch_id: int = 1
         self._resolve_strategy_mode(strategy, strategy_settings)
+
+        # Явная модель памяти (short_term | working | long_term).
+        # Включена только если настройки памяти переданы явно (или передан
+        # готовый менеджер/хранилище) — иначе поведение ровно как раньше.
+        self._memory_settings: Dict[str, Any] = dict(memory_settings or {})
+        self._memory_enabled: bool = bool(self._memory_settings.get("enabled", True))
+        if memory_settings is None and memory_manager is None and long_memory is None:
+            self._memory_enabled = False
+        self._memory_error: Optional[str] = None
+        self._memory_updated_at: Optional[str] = None
+
+        # Долговременная память: отдельный файл, создаётся лениво и НЕ
+        # создаётся в mock-режиме (там LongTermStore отключён).
+        long_path = str(self._memory_settings.get("long_path") or "").strip()
+        long_enabled = bool(self._memory_settings.get("long_enabled", True))
+        if long_memory is not None:
+            self._long_memory: LongTermStore = long_memory
+        elif (self._memory_enabled and long_enabled and long_path
+                and not self._mock_mode):
+            from pathlib import Path as _Path
+            from .config import PROJECT_ROOT as _PROJECT_ROOT
+            p = _Path(long_path)
+            if not p.is_absolute():
+                p = _PROJECT_ROOT / p
+            self._long_memory = LongTermStore(
+                p, enabled=True,
+                max_items=int(self._memory_settings.get("long_max_items", 200)),
+            )
+        else:
+            self._long_memory = LongTermStore(":memory:", enabled=False)
+
+        self._memory_manager: MemoryManager = memory_manager or MemoryManager(
+            settings=self._memory_settings,
+            long_store=self._long_memory,
+            counter=self._counter,
+            facts_store=self._facts_store,
+        )
+        # Публичная ссылка на рабочую память (для UI/тестов)
+        self._working_memory: WorkingMemory = self._memory_manager.working
 
         self._branch_manager: BranchManager = branch_manager or BranchManager(
             # В mock-режиме хранилище полностью игнорируется (как и раньше)
@@ -302,6 +366,11 @@ class DeepSeekAgent:
                 facts_info = self._after_turn(
                     user_input.strip(), payload["content"]
                 )
+                # Классификация памяти: один служебный LLM-запрос предлагает
+                # кандидатов в pending (в слои не пишет). Ошибка не ломает ход.
+                self._classify_memory_after_turn(
+                    user_input.strip(), payload["content"]
+                )
                 # Учитываем токены обмена (точные из API или оценку)
                 token_info = self._update_token_stats(
                     payload, request_messages,
@@ -344,8 +413,10 @@ class DeepSeekAgent:
         системный промпт и параметры агента). Накопленная статистика
         токенов сессии при этом сбрасывается — и в памяти, и на диске.
         Артефакты активной ветки (конспект и факты) очищаются вместе с
-        историей: они описывают удалённый диалог. Удаление самой ветки —
-        отдельная операция (:meth:`delete_branch`).
+        историей: они описывают удалённый диалог. Закрепления и рабочая
+        память активной ветки очищаются тоже. **Долговременная память не
+        трогается** — она живёт в отдельном файле (``data/long_memory.db``).
+        Удаление самой ветки — отдельная операция (:meth:`delete_branch`).
         """
         with self._lock:
             self._init_history()
@@ -357,6 +428,11 @@ class DeepSeekAgent:
             self._facts_store.clear()
             self._facts_error = None
             self._facts_updated_at = None
+            # Закрепления и рабочая память относятся к удалённой истории
+            self._memory_manager.pins.clear()
+            self._memory_manager.working.clear()
+            self._memory_error = None
+            self._memory_updated_at = None
             # Перезаписываем хранилище согласованным состоянием
             self._persist()
 
@@ -466,6 +542,8 @@ class DeepSeekAgent:
                 if self._storage.exists or has_dialog:
                     self._persist()
                 self._storage.close()
+            # Закрываем долговременную память (идемпотентно)
+            self._memory_manager.close()
             self._closed = True
 
     # ------------------------------------------------------------------
@@ -569,7 +647,7 @@ class DeepSeekAgent:
                 str((system or {}).get("content") or ""), dialog,
                 self._artifacts(),
             )
-            return self._limit_context(built)
+            return self._limit_context(self._insert_memory_blocks(built))
 
         start = 0
         summary_text = ""
@@ -600,7 +678,42 @@ class DeepSeekAgent:
             tail = tail[-self._max_history:]
 
         messages.extend(tail)
-        return messages
+        return self._insert_memory_blocks(messages)
+
+    def _memory_blocks(self) -> List[Message]:
+        """Три system-сообщения памяти в фиксированном порядке.
+
+        Порядок: долговременная → рабочая → закреплённые сообщения. Пустые
+        слои не добавляются. Без ``MEMORY_ENABLED`` возвращает пустой список
+        (контекст побайтово совпадает с текущим поведением).
+        """
+        if not self._memory_enabled:
+            return []
+        dialog = self._dialog_messages()
+        pinned_messages: List[Dict[str, Any]] = []
+        for pin in self._memory_manager.list_pinned():
+            index = int(pin["index"])
+            if 0 <= index < len(dialog):
+                message = dialog[index]
+                pinned_messages.append({
+                    "index": index,
+                    "role": message.get("role", "user"),
+                    "content": message.get("content", ""),
+                    "note": pin["note"],
+                })
+        return self._memory_manager.build_blocks(
+            self._counter, self._memory_settings,
+            facts=self._facts_store, facts_active=self._uses_facts(),
+            pinned_messages=pinned_messages,
+        )
+
+    def _insert_memory_blocks(self, messages: List[Message]) -> List[Message]:
+        """Вставляет блоки памяти сразу после системного промпта."""
+        blocks = self._memory_blocks()
+        if not blocks:
+            return messages
+        insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+        return list(messages[:insert_at]) + blocks + list(messages[insert_at:])
 
     def _limit_context(self, messages: List[Message]) -> List[Message]:
         """Аварийно ограничивает отправляемый контекст (MAX_HISTORY_MESSAGES).
@@ -817,6 +930,9 @@ class DeepSeekAgent:
                 branch_id=self._active_branch_id,
                 # {} — явно стереть факты, None — не трогать
                 facts=self._facts_store.as_dict(),
+                pinned=self._memory_manager.pins,
+                working=self._memory_manager.working.as_dict()
+                if self._memory_enabled else None,
             )
         except Exception as exc:
             logger.error("Не удалось сохранить контекст: %s", exc)
@@ -909,6 +1025,10 @@ class DeepSeekAgent:
                 pass
         self._restore_branch_strategy()
 
+        # 6б. Восстанавливаем рабочую память и закрепления активной ветки
+        self._restore_working_memory(state.get("working_memory"))
+        self._restore_pinned(state.get("pinned"), restored)
+
         # 7. Восстанавливаем выбор переключателя стратегий (режим веток)
         if self._strategy is not None:
             saved = str(params.get("strategy") or "").strip()
@@ -962,6 +1082,12 @@ class DeepSeekAgent:
             "facts_completion_tokens": 0,
             "facts_estimated_tokens": 0,
             "facts_cost_usd": 0.0,
+            # Служебные запросы классификации памяти (memory layers)
+            "memory_requests": 0,
+            "memory_prompt_tokens": 0,
+            "memory_completion_tokens": 0,
+            "memory_estimated_tokens": 0,
+            "memory_cost_usd": 0.0,
         }
 
     @staticmethod
@@ -1215,8 +1341,13 @@ class DeepSeekAgent:
                 round(float(session.get("facts_cost_usd", 0.0)), 6)
                 if session["prices_set"] else None
             )
+            session["memory_cost_usd"] = (
+                round(float(session.get("memory_cost_usd", 0.0)), 6)
+                if session["prices_set"] else None
+            )
             facts_items = self._facts_store.items()
             facts_text = self._facts_store.to_text()
+            memory = self._memory_stats_block(context_messages)
             return {
                 "request": {
                     "tokens": self._last_exchange.get("request_tokens"),
@@ -1234,6 +1365,7 @@ class DeepSeekAgent:
                     "summary_tokens": self.count_tokens(summary_text) if summary_text else 0,
                     "summary_covered": self._summary_covered(),
                     "summary_active": bool(summary_text),
+                    "memory_tokens": memory.get("total_tokens", 0),
                     "estimated": True,  # контекст всегда оценивается локально
                 },
                 "summary": {
@@ -1273,6 +1405,7 @@ class DeepSeekAgent:
                     ],
                 },
                 "branch": self._branch_manager.describe(),
+                "memory": memory,
                 "session": session,
                 "counter": self._counter.name,
             }
@@ -1282,6 +1415,62 @@ class DeepSeekAgent:
         """Копия накопленной статистики сессии (только для чтения)."""
         with self._lock:
             return dict(self._session_stats)
+
+    def _memory_stats_block(self, context_messages: List[Message]) -> Dict[str, Any]:
+        """Срез статистики памяти для ``get_token_stats`` (обратносовместимо)."""
+        if not self._memory_enabled:
+            return {
+                "enabled": False,
+                "short_term": {"messages": 0, "pinned": 0, "tokens": 0},
+                "working": {"items": 0, "tokens": 0},
+                "long_term": {"items": 0, "sections": [], "tokens": 0},
+                "pending": 0,
+                "total_tokens": 0,
+                "budget": 0,
+                "truncated": False,
+                "error": None,
+            }
+        report = self._memory_manager.report()
+        pending_count = len(report.get("pending", []))
+        budget = report.get("budget", {})
+        long_count = int(report[LONG_TERM].get("count", 0))
+        long_tokens = int(report[LONG_TERM].get("tokens", 0))
+        working_count = int(report[WORKING].get("count", 0))
+        working_tokens = int(report[WORKING].get("tokens", 0))
+        pinned_count = int(report[SHORT_TERM].get("pinned_count", 0))
+        short_messages = max(0, len(self._message_history) - 1)
+
+        # Суммарные токены реально ушедших в запрос блоков памяти
+        sent_tokens = 0
+        for message in context_messages:
+            content = message.get("content") or ""
+            if message.get("role") == "system" and (
+                content.startswith(LONG_HEADER)
+                or content.startswith(WORKING_HEADER)
+                or content.startswith(PINNED_HEADER)
+            ):
+                sent_tokens += self.count_tokens(content)
+
+        return {
+            "enabled": True,
+            "short_term": {
+                "messages": short_messages,
+                "pinned": pinned_count,
+                "tokens": sent_tokens if pinned_count else 0,
+            },
+            "working": {"items": working_count, "tokens": working_tokens},
+            "long_term": {
+                "items": long_count,
+                "sections": list(report[LONG_TERM].get("sections", [])),
+                "tokens": long_tokens,
+            },
+            "pending": pending_count,
+            "total_tokens": sent_tokens,
+            "budget": int(budget.get("max_tokens", 0)),
+            "truncated": bool((working_tokens + long_tokens)
+                              > int(budget.get("max_tokens", 0))),
+            "error": self._memory_error,
+        }
 
     # ------------------------------------------------------------------
     # Управление контекстом (сжатие в конспект)
@@ -1724,6 +1913,81 @@ class DeepSeekAgent:
             )
         self._session_stats["facts_requests"] += 1
 
+    def _classify_memory_after_turn(self, user_text: str,
+                                    assistant_text: str) -> None:
+        """Предлагает кандидатов памяти после успешного хода (LLM).
+
+        Выполняет один служебный запрос классификации (``MEMORY_MARKER``) и
+        кладёт кандидатов в ``pending`` — в слои они **не** попадают до
+        явного принятия. Ошибка классификации не ломает ход: WARNING,
+        ``_memory_error``, повтор на следующем ходу.
+        """
+        if not self._memory_enabled or self._mock_mode:
+            return
+        if not self._memory_settings.get("propose_llm", True):
+            return
+        if self._client is None:
+            return
+        context_hint = f"Пользователь: {user_text}\nАссистент: {assistant_text}"
+        try:
+            result = MemoryClassifier.classify_llm(
+                user_text, self._call_service_api, self._memory_settings,
+                context_hint=context_hint,
+            )
+        except Exception as exc:  # классификация не должна ломать ход
+            self._memory_error = str(exc)
+            logger.warning("Классификация памяти не удалась: %s", exc)
+            return
+        self._account_memory_classification(result.get("tokens"))
+        if result.get("error"):
+            self._memory_error = str(result["error"])
+            logger.warning("Классификация памяти: %s", result["error"])
+            return
+        items: List[Dict[str, Any]] = []
+        for layer in LAYERS:
+            for candidate in result.get(layer, []):
+                if not isinstance(candidate, dict):
+                    continue
+                item = dict(candidate)
+                item["layer"] = layer
+                items.append(item)
+        if items:
+            dialog = self._dialog_messages()
+            source_message = max(0, len(dialog) - 2)  # индекс user-сообщения
+            added = self._memory_manager.pending.add(
+                items, source_message=source_message
+            )
+            if added:
+                self._memory_updated_at = datetime.now().isoformat(timespec="seconds")
+
+    def _account_memory_classification(self, tokens: Optional[Dict[str, Any]]) -> None:
+        """Учитывает служебный запрос классификации отдельными счётчиками."""
+        if not isinstance(tokens, dict):
+            return
+        try:
+            prompt = int(tokens.get("prompt_tokens") or 0)
+            completion = int(tokens.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            return
+        estimated = (
+            bool(tokens.get("estimated", True))
+            or tokens.get("prompt_tokens") is None
+            or tokens.get("completion_tokens") is None
+        )
+        if estimated:
+            self._session_stats["memory_estimated_tokens"] += prompt + completion
+        else:
+            self._session_stats["memory_prompt_tokens"] += prompt
+            self._session_stats["memory_completion_tokens"] += completion
+        cost = self._compute_cost(
+            prompt, completion, model=tokens.get("model") or self.model
+        )
+        if cost is not None:
+            self._session_stats["memory_cost_usd"] = round(
+                float(self._session_stats.get("memory_cost_usd", 0.0)) + cost, 6
+            )
+        self._session_stats["memory_requests"] += 1
+
     def _restore_facts(self, raw: Optional[Dict[str, Any]]) -> None:
         """Восстанавливает факты из хранилища (устойчиво к мусору)."""
         if raw is None:
@@ -1736,6 +2000,35 @@ class DeepSeekAgent:
             for stamp in per_category.values()
         ]
         self._facts_updated_at = max(stamps) if stamps else None
+
+    def _restore_working_memory(self, raw: Optional[Dict[str, Any]]) -> None:
+        """Восстанавливает рабочую память активной ветки (устойчиво к мусору)."""
+        if not self._memory_enabled:
+            return
+        if raw is None:
+            return
+        self._memory_manager.working.from_dict(raw)
+
+    def _restore_pinned(self, pinned: Optional[List[Dict[str, Any]]],
+                        dialog_length: int) -> None:
+        """Восстанавливает закрепления (индексы вне диапазона игнорируются)."""
+        if not self._memory_enabled:
+            return
+        self._memory_manager.pins.clear()
+        for entry in (pinned or []):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                index = int(entry.get("index", -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < dialog_length:
+                self._memory_manager.pins[index] = entry.get("note")
+            else:
+                logger.warning(
+                    "Закрепление №%d вне диапазона диалога (%d) — игнорирую.",
+                    index, dialog_length,
+                )
 
     def _restore_branch_strategy(self) -> None:
         """Применяет подстратегию контекста, сохранённую у активной ветки."""
@@ -1960,6 +2253,10 @@ class DeepSeekAgent:
             возвращается заполненное поле "error".
         """
         with self._lock:
+            working_snapshot = (
+                self._memory_manager.working.as_dict()
+                if self._memory_enabled else None
+            )
             try:
                 self._persist()  # фиксируем текущую ветку до развилки
                 self._branch_manager.remember_messages(
@@ -1980,6 +2277,9 @@ class DeepSeekAgent:
                 result["branch"], result["messages"],
                 result["artifacts"].get("facts"),
             )
+            # Новая ветка копирует рабочую память префикса.
+            if working_snapshot is not None:
+                self._memory_manager.working.from_dict(working_snapshot)
             self._persist()
             return {
                 "branch": self._branch_manager.get_active(),
@@ -2055,7 +2355,7 @@ class DeepSeekAgent:
     def _apply_branch_state(self, branch: Dict[str, Any],
                             messages: Optional[List[Message]],
                             facts: Any) -> None:
-        """Применяет состояние ветки к агенту (история, факты, стратегия)."""
+        """Применяет состояние ветки к агенту (история, факты, стратегия, память)."""
         self._active_branch_id = int(branch.get("id") or self._active_branch_id)
         if messages:
             self._message_history = [
@@ -2070,9 +2370,286 @@ class DeepSeekAgent:
         self._facts_error = None
         self._facts_updated_at = None
         self._restore_branch_strategy()
+        # Рабочая память принадлежит ветке: загружаем её копию (или очищаем).
+        if self._memory_enabled and self._storage is not None:
+            try:
+                raw = self._storage.load_branch_working(self._active_branch_id)
+            except Exception as exc:
+                logger.warning("Не удалось прочитать рабочую память ветки: %s", exc)
+                raw = None
+            self._memory_manager.working.from_dict(raw or {})
+        else:
+            self._memory_manager.working.clear()
+        # Закрепления привязаны к индексам сообщений конкретной ветки —
+        # при переключении сбрасываем (источник истины — активная ветка).
+        self._memory_manager.pins.clear()
         # Сообщения ветки — источник истины для её артефактов
         self._branch_manager.remember_messages(self._active_branch_id,
                                                self._message_history)
+
+    # ------------------------------------------------------------------
+    # Модель памяти (short_term | working | long_term)
+    # ------------------------------------------------------------------
+
+    def get_memory_settings(self) -> Dict[str, Any]:
+        """Копия настроек модели памяти (см. ``config.get_memory_settings``)."""
+        with self._lock:
+            return dict(self._memory_settings)
+
+    def save_to_memory(self, layer: str, text: str, *, key: Optional[str] = None,
+                       section: Optional[str] = None, kind: Optional[str] = None,
+                       source: str = "manual",
+                       message_index: Optional[int] = None) -> Dict[str, Any]:
+        """Сохраняет ``text`` в выбранный слой через единый роутер.
+
+        Единственная точка записи в слои (кнопки, окно «Память…», команды,
+        подтверждение предложений). Ошибки не бросаются.
+
+        Returns:
+            ``{"ok", "layer", "key", "value", "section", "error"}``.
+        """
+        with self._lock:
+            result = self._memory_manager.route(
+                layer, text, key=key, section=section, kind=kind,
+                source=source, message_index=message_index,
+                branch_id=self._active_branch_id,
+            )
+            if result.get("ok"):
+                self._memory_error = None
+                self._memory_updated_at = datetime.now().isoformat(timespec="seconds")
+                self._persist()
+            return result
+
+    def pin_message(self, index: int, note: Optional[str] = None) -> Dict[str, Any]:
+        """Закрепляет сообщение (краткосрочная память)."""
+        with self._lock:
+            result = self._memory_manager.pin(int(index), note=note)
+            self._persist()
+            return result
+
+    def unpin_message(self, index: int) -> Dict[str, Any]:
+        """Открепляет сообщение."""
+        with self._lock:
+            result = self._memory_manager.unpin(int(index))
+            self._persist()
+            return result
+
+    def list_pinned(self) -> List[Dict[str, Any]]:
+        """Список закреплённых сообщений ``{index, note}``."""
+        with self._lock:
+            return self._memory_manager.list_pinned()
+
+    def get_working_memory(self) -> Dict[str, Any]:
+        """Рабочая память активной ветки (task + items)."""
+        with self._lock:
+            return self._memory_manager.working.as_dict()
+
+    def set_task_field(self, field: str, value: Any) -> Dict[str, Any]:
+        """Устанавливает поле задачи рабочей памяти."""
+        with self._lock:
+            result = self._memory_manager.working_set_field(field, value)
+            self._persist()
+            return result
+
+    def add_working_item(self, key: str, value: str,
+                         kind: str = "note") -> Dict[str, Any]:
+        """Добавляет элемент рабочей памяти (``decision``/``artifact``/``note``)."""
+        return self.save_to_memory(
+            WORKING, value, key=key, kind=kind, source="manual",
+        )
+
+    def clear_working_memory(self) -> Dict[str, Any]:
+        """Очищает рабочую память активной ветки."""
+        with self._lock:
+            result = self._memory_manager.working_clear()
+            self._persist()
+            return result
+
+    def forget_working_item(self, key: str) -> Dict[str, Any]:
+        """Удаляет элемент рабочей памяти по ключу."""
+        with self._lock:
+            result = self._memory_manager.working_forget(key)
+            self._persist()
+            return result
+
+    def start_new_task(self,
+                       carry_to_long: Optional[List[str]] = None) -> Dict[str, Any]:
+        """«Новая задача»: очищает рабочую память.
+
+        Args:
+            carry_to_long: ключи элементов (``decision``), которые переносятся
+                в ``long_term.decisions`` перед очисткой.
+
+        Returns:
+            ``{"ok", "carried", "error"}``.
+        """
+        with self._lock:
+            result = self._memory_manager.start_new_task(carry_to_long)
+            self._persist()
+            return result
+
+    def get_long_memory(self, section: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Записи долговременной памяти (``section`` None — все разделы)."""
+        with self._lock:
+            return self._memory_manager.long.list_items(section)
+
+    def remember_forever(self, section: str, key: str,
+                         value: str) -> Dict[str, Any]:
+        """Сохраняет запись в долговременную память."""
+        return self.save_to_memory(
+            LONG_TERM, value, key=key, section=section, source="manual",
+        )
+
+    def forget_forever(self, section: str, key: str) -> Dict[str, Any]:
+        """Удаляет запись из долговременной памяти."""
+        with self._lock:
+            result = self._memory_manager.long_forget(section, key)
+            return result
+
+    def clear_long_memory(self, section: Optional[str] = None) -> Dict[str, Any]:
+        """Очищает раздел (или всю долговременную память, если ``section`` None)."""
+        with self._lock:
+            if section is None:
+                return self._memory_manager.long_clear_all()
+            return self._memory_manager.long_clear_section(section)
+
+    def export_long_memory(self, path: Optional[str] = None) -> Dict[str, Any]:
+        """Экспортирует долговременную память в Markdown."""
+        with self._lock:
+            target = path or self._memory_settings.get("export_path")
+            if not target:
+                return {"ok": False, "error": "Не задан путь экспорта."}
+            from pathlib import Path as _Path
+            from .config import PROJECT_ROOT as _PROJECT_ROOT
+            p = _Path(str(target))
+            if not p.is_absolute():
+                p = _PROJECT_ROOT / p
+            return self._memory_manager.long_export(p)
+
+    def import_long_memory(self, path: Optional[str] = None) -> Dict[str, Any]:
+        """Импортирует записи из Markdown."""
+        with self._lock:
+            if not path:
+                return {"ok": False, "error": "Не задан путь импорта."}
+            from pathlib import Path as _Path
+            p = _Path(str(path))
+            return self._memory_manager.long_import(p)
+
+    def classify_message(self, index: int) -> Dict[str, Any]:
+        """Предложения по одному сообщению (локальные правила + LLM).
+
+        Используется для предзаполнения диалога сохранения. В слои ничего не
+        пишется.
+        """
+        with self._lock:
+            dialog = self._dialog_messages()
+            if not (0 <= int(index) < len(dialog)):
+                return {
+                    SHORT_TERM: [], WORKING: [], LONG_TERM: [],
+                    "error": f"Сообщение №{index} не найдено.",
+                }
+            text = str(dialog[int(index)].get("content") or "")
+            call_service = (
+                None if self._mock_mode or not self._memory_enabled
+                else self._call_service_api
+            )
+            result = MemoryClassifier.classify(
+                text, call_service, self._memory_settings,
+            )
+            return {
+                SHORT_TERM: result[SHORT_TERM],
+                WORKING: result[WORKING],
+                LONG_TERM: result[LONG_TERM],
+                "error": result.get("error"),
+            }
+
+    def get_pending_memory(self) -> List[Dict[str, Any]]:
+        """Список предложений классификации (pending)."""
+        with self._lock:
+            return self._memory_manager.pending_list()
+
+    def accept_pending(self, pending_id: int,
+                       layer: Optional[str] = None) -> Dict[str, Any]:
+        """Принимает предложение и пишет в выбранный слой."""
+        with self._lock:
+            result = self._memory_manager.pending_accept(int(pending_id), layer)
+            if result.get("ok"):
+                self._memory_error = None
+                self._persist()
+            return result
+
+    def reject_pending(self, pending_id: int) -> Dict[str, Any]:
+        """Отклоняет предложение (без записи в слой)."""
+        with self._lock:
+            return self._memory_manager.pending_reject(int(pending_id))
+
+    def clear_pending_memory(self) -> Dict[str, Any]:
+        """Отклоняет все предложения."""
+        with self._lock:
+            return self._memory_manager.pending_clear()
+
+    def get_memory_report(self) -> Dict[str, Any]:
+        """«Какие данные в каком слое»: отчёт + бюджет + pending."""
+        with self._lock:
+            report = self._memory_manager.report()
+            report["enabled"] = self._memory_enabled
+            report[SHORT_TERM]["messages"] = max(0, len(self._message_history) - 1)
+            report["error"] = self._memory_error
+            report["updated_at"] = self._memory_updated_at
+            return report
+
+    def preview_context(self) -> List[Dict[str, Any]]:
+        """Реальный список сообщений будущего запроса с пометкой слоя.
+
+        Returns:
+            Список ``{"layer", "role", "content", "tokens"}``; слой для
+            диагностики: ``system``, ``long_term``, ``working``, ``pinned``,
+            ``short_term``.
+        """
+        with self._lock:
+            result: List[Dict[str, Any]] = []
+            for message in self._build_context_messages():
+                role = message.get("role", "")
+                content = str(message.get("content") or "")
+                layer = "short_term"
+                if role == "system":
+                    layer = "system"
+                    if content.startswith(LONG_HEADER):
+                        layer = LONG_TERM
+                    elif content.startswith(WORKING_HEADER):
+                        layer = WORKING
+                    elif content.startswith(PINNED_HEADER):
+                        layer = "pinned"
+                result.append({
+                    "layer": layer,
+                    "role": role,
+                    "content": content,
+                    "tokens": self.count_tokens(content),
+                })
+            return result
+
+    def clear_memory(self, layer: str) -> Dict[str, Any]:
+        """Явная очистка слоя.
+
+        Для ``short_term`` — закрепления (сообщения очищает ``clear_history``),
+        для ``working`` — рабочая память, для ``long_term`` — вся
+        долговременная память.
+        """
+        with self._lock:
+            try:
+                canonical = normalize_layer(layer)
+            except MemoryError as exc:
+                return {"ok": False, "error": str(exc)}
+            if canonical == SHORT_TERM:
+                self._memory_manager.pins.clear()
+                self._persist()
+                return {"ok": True, "layer": canonical}
+            if canonical == WORKING:
+                self._memory_manager.working.clear()
+                self._persist()
+                return {"ok": True, "layer": canonical}
+            return {"ok": True, "layer": canonical,
+                    **self._memory_manager.long_clear_all()}
 
     # ------------------------------------------------------------------
     # Служебные свойства (для UI и отладки)

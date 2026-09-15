@@ -73,6 +73,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.agent import DeepSeekAgent  # noqa: E402
 from src.config import get_config, get_prices  # noqa: E402
 from src.facts import FACTS_MARKER  # noqa: E402
+from src.memory import MEMORY_MARKER  # noqa: E402
 from src.storage import ContextStore  # noqa: E402
 from src.strategies import (  # noqa: E402
     BRANCHING,
@@ -88,6 +89,20 @@ FACT_NAME = "Алекс"
 FACT_CITY = "Казани"
 FACT_COLOR = "синий"
 PROBE_MARKER = "ПРОВЕРКА ПАМЯТИ"
+
+# --- Данные сценария memory_layers -------------------------------------------
+#: Факт, который сохраняется ТОЛЬКО в закреплённом сообщении (pin)
+PIN_FACT = "Токио"
+#: Деталь, которая НЕ сохраняется в память (должна забыться окном)
+UNPINNED_FACT = "Казани"
+#: Задача рабочей памяти
+TASK_GOAL = "отчёт"
+TASK_DEADLINE = "20 мая"
+#: Маркеры проверочных вопросов сценария памяти
+MEMORY_PROBE_NAME = "ПРОВЕРКА_ИМЯ_ЦВЕТ"
+MEMORY_PROBE_TASK = "ПРОВЕРКА_ЗАДАЧА_ДЕДЛАЙН"
+MEMORY_PROBE_PIN = "ПРОВЕРКА_ЗАКРЕПЛЁННОГО"
+MEMORY_PROBE_UNPINNED = "ПРОВЕРКА_НЕЗАКРЕПЛЁННОГО"
 
 # --- Данные сценария ветвления ----------------------------------------------
 #: Маркер сообщения, которое есть только в ветке A
@@ -168,6 +183,7 @@ class Scenario:
     strategy_window: int = DEFAULT_STRATEGY_WINDOW
     branch_strategy: str = ""
     branch_mode: bool = False
+    memory: bool = False
 
 
 @dataclass
@@ -185,6 +201,7 @@ class Options:
     model_limit: int = 0
     api_key: str = ""
     no_summary: bool = False
+    no_memory: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +311,30 @@ class SimulatedModel:
             else:
                 content = ("Не помню ни имени, ни любимого цвета — в текущем "
                            "контексте этих данных нет.")
+        elif MEMORY_PROBE_NAME.lower() in last_user.lower():
+            sent = "\n".join(str(m.get("content") or "") for m in messages).lower()
+            if FACT_NAME.lower() in sent and FACT_COLOR.lower() in sent:
+                content = f"Тебя зовут {FACT_NAME}, любимый цвет — {FACT_COLOR}."
+            else:
+                content = "Не помню ни имени, ни цвета."
+        elif MEMORY_PROBE_TASK.lower() in last_user.lower():
+            sent = "\n".join(str(m.get("content") or "") for m in messages).lower()
+            if TASK_GOAL.lower() in sent and TASK_DEADLINE.lower() in sent:
+                content = f"Задача: {TASK_GOAL}, дедлайн — {TASK_DEADLINE}."
+            else:
+                content = "Не помню задачи и дедлайна."
+        elif MEMORY_PROBE_PIN.lower() in last_user.lower():
+            sent = "\n".join(str(m.get("content") or "") for m in messages).lower()
+            if PIN_FACT.lower() in sent:
+                content = f"Закреплённый факт: любимый город — {PIN_FACT}."
+            else:
+                content = "Не помню закреплённого факта."
+        elif MEMORY_PROBE_UNPINNED.lower() in last_user.lower():
+            sent = "\n".join(str(m.get("content") or "") for m in messages).lower()
+            if UNPINNED_FACT.lower() in sent:
+                content = f"Незакреплённая деталь: ты живёшь в {UNPINNED_FACT}."
+            else:
+                content = "Не помню незакреплённой детали."
         else:
             preview = " ".join(last_user.split()[:12])
             content = _pad_to_words(
@@ -339,7 +380,24 @@ class SimulatedModel:
         joined = "\n".join(
             str(m.get("content") or "") for m in (request.get("messages") or [])
         )
-        if FACTS_MARKER in joined:
+        if MEMORY_MARKER in joined:
+            # Классификация памяти: валидный JSON кандидатов («синий» → profile,
+            # «дедлайн 20 мая» → working).
+            content = json.dumps(
+                {
+                    "long_term": [
+                        {"section": "profile", "key": "любимый_цвет",
+                         "value": FACT_COLOR, "confidence": 0.9},
+                    ],
+                    "working": [
+                        {"key": "дедлайн", "value": TASK_DEADLINE,
+                         "kind": "note", "confidence": 0.9},
+                    ],
+                    "short_term": [],
+                },
+                ensure_ascii=False,
+            )
+        elif FACTS_MARKER in joined:
             content = json.dumps(
                 {
                     "goal": {"тема": "диалог с пользователем"},
@@ -507,7 +565,38 @@ def _make_agent(scenario: Scenario, options: Options, config: Dict[str, Any],
         summary_settings=summary_settings,
         strategy=scenario.strategy,
         strategy_settings=strategy_settings,
+        memory_settings=_memory_settings_for(scenario, options),
     )
+
+
+def _memory_settings_for(scenario: Scenario, options: Options) -> Optional[Dict[str, Any]]:
+    """Настройки модели памяти для сценария ``memory_layers``.
+
+    ``--no-memory`` (или ``scenario.memory=False``) возвращает None — модель
+    памяти выключена, поведение агента ровно как раньше.
+    """
+    if not scenario.memory or getattr(options, "no_memory", False):
+        return None
+    return {
+        "enabled": True,
+        "working_enabled": True,
+        "long_enabled": True,
+        # В sim-режиме долговременная память живёт в gitignored-файле; сценарий
+        # memory_layers удаляет его в конце прогона.
+        "long_path": "data/bench_long_memory.db",
+        "long_max_items": 200,
+        "max_tokens": 600,
+        "long_max_tokens": 300,
+        "working_max_tokens": 250,
+        "pin_max": 5,
+        "propose_llm": True,
+        "model": "",
+        "temperature": 0.0,
+        "prompt": "",
+        "min_confidence": 0.0,
+        "auto_apply": False,
+        "export_path": "data/memory_export.md",
+    }
 
 
 def _turn_metrics(stats: Dict[str, Any]) -> Dict[str, Any]:
@@ -790,6 +879,111 @@ def _run_branch_flow(agent: DeepSeekAgent, scenario: Scenario, options: Options,
     return output
 
 
+def _run_memory_flow(agent: DeepSeekAgent, scenario: Scenario, options: Options,
+                     turns: List[Dict[str, Any]], errors: List[str],
+                     state: Dict[str, int]) -> Dict[str, Any]:
+    """Сценарий ``memory_layers``: три слоя памяти и их влияние на ответы.
+
+    Порядок:
+    1. факт («имя/цвет») сохраняется в долговременную память;
+    2. задача («отчёт, дедлайн 20 мая») — в рабочую;
+    3. первое сообщение закрепляется (short_term pin);
+    4. 30 ходов с ``WINDOW_KEEP_LAST_N=10``;
+    5. четыре проверочных вопроса: имя/цвет (long), задача/дедлайн (working),
+       закреплённый факт (pin) и незакреплённая деталь (должна забыться).
+
+    Returns:
+        Отчёт ``{answers, remembered, memory, pending}``.
+    """
+    output: Dict[str, Any] = {
+        "answers": {},
+        "remembered": {
+            "name_color": False, "task": False, "pin": False, "unpinned": False,
+        },
+        "pending": 0,
+    }
+    number = 0
+    memory_on = bool((agent.get_memory_settings() or {}).get("enabled"))
+
+    # 1–2. Явное сохранение в долговременную и рабочую память (через роутер).
+    # При MEMORY_ENABLED=false (парный прогон) слои не заполняются — тогда
+    # все проверочные вопросы должны получить «не помню».
+    if memory_on:
+        agent.remember_forever("profile", "имя", FACT_NAME)
+        agent.remember_forever("profile", "любимый_цвет", FACT_COLOR)
+        agent.set_task_field("goal", TASK_GOAL)
+        agent.set_task_field("status", "в работе")
+        agent.add_working_item("дедлайн", TASK_DEADLINE, "note")
+
+    # 3. Первое сообщение (факт + закрепляемый факт) и незакреплённая деталь
+    number += 1
+    if not _do_turn(agent, (
+        f"Привет! Меня зовут {FACT_NAME}, мой любимый цвет — {FACT_COLOR}. "
+        f"Закреплённый факт: мой любимый город — {PIN_FACT}."
+    ), number, scenario, options, turns, errors, state):
+        return output
+    if memory_on:
+        agent.pin_message(0)
+    number += 1
+    if not _do_turn(agent, f"Незакреплённая деталь: я живу в {UNPINNED_FACT}.",
+                    number, scenario, options, turns, errors, state):
+        return output
+
+    # 4. 30 ходов-заполнителей (окно WINDOW_KEEP_LAST_N=10 вытесняет начало)
+    for index in range(3, 31):
+        number += 1
+        topic = _FILLER_TOPICS[index % len(_FILLER_TOPICS)]
+        question = _pad_to_words(
+            f"Вопрос №{index}: расскажи подробнее про {topic}.",
+            scenario.words_per_turn,
+        )
+        if not _do_turn(agent, question, number, scenario, options,
+                        turns, errors, state):
+            return output
+
+    # 5. Проверочные вопросы
+    probes = (
+        (MEMORY_PROBE_NAME,
+         f"{MEMORY_PROBE_NAME}: как меня зовут и какой мой любимый цвет?"),
+        (MEMORY_PROBE_TASK,
+         f"{MEMORY_PROBE_TASK}: какая сейчас задача и какой дедлайн?"),
+        (MEMORY_PROBE_PIN,
+         f"{MEMORY_PROBE_PIN}: какой мой любимый город (закреплённый факт)?"),
+        (MEMORY_PROBE_UNPINNED,
+         f"{MEMORY_PROBE_UNPINNED}: где я живу (незакреплённая деталь)?"),
+    )
+    for marker, question in probes:
+        number += 1
+        if not _do_turn(agent, question, number, scenario, options,
+                        turns, errors, state):
+            return output
+        output["answers"][marker] = turns[-1]["answer"] if turns else ""
+
+    lowered = {key: str(value).lower() for key, value in output["answers"].items()}
+    output["remembered"] = {
+        "name_color": FACT_NAME.lower() in lowered.get(MEMORY_PROBE_NAME, "")
+        and FACT_COLOR.lower() in lowered.get(MEMORY_PROBE_NAME, ""),
+        "task": TASK_GOAL.lower() in lowered.get(MEMORY_PROBE_TASK, "")
+        and TASK_DEADLINE.lower() in lowered.get(MEMORY_PROBE_TASK, ""),
+        "pin": PIN_FACT.lower() in lowered.get(MEMORY_PROBE_PIN, ""),
+        "unpinned": UNPINNED_FACT.lower() in lowered.get(MEMORY_PROBE_UNPINNED, ""),
+    }
+    report = agent.get_memory_report()
+    output.update({
+        "enabled": report.get("enabled"),
+        "short_term_pinned": int((report.get("short_term") or {}).get("pinned_count", 0)),
+        "working_items": int((report.get("working") or {}).get("count", 0)),
+        "working_tokens": int((report.get("working") or {}).get("tokens", 0)),
+        "long_items": int((report.get("long_term") or {}).get("count", 0)),
+        "long_tokens": int((report.get("long_term") or {}).get("tokens", 0)),
+        "total_tokens": int((report.get("long_term") or {}).get("tokens", 0))
+        + int((report.get("working") or {}).get("tokens", 0)),
+        "budget": int((report.get("budget") or {}).get("max_tokens", 0)),
+    })
+    output["pending"] = len(agent.get_pending_memory())
+    return output
+
+
 def run_scenario(scenario: Scenario, options: Options, config: Dict[str, Any],
                  counter: Any, prices: Dict[str, Any]) -> Dict[str, Any]:
     """Прогоняет один сценарий диалога и собирает метрики.
@@ -817,7 +1011,12 @@ def run_scenario(scenario: Scenario, options: Options, config: Dict[str, Any],
 
     dialog = build_dialog(scenario)
     branch_report: Optional[Dict[str, Any]] = None
-    if scenario.branch_mode:
+    memory_report: Optional[Dict[str, Any]] = None
+    if scenario.key == "memory_layers":
+        memory_report = _run_memory_flow(agent, scenario, options, turns,
+                                         errors, state)
+        planned = len(turns)
+    elif scenario.branch_mode:
         branch_report = _run_branch_flow(agent, scenario, options, turns,
                                          errors, state)
         planned = int(branch_report.get("turns_planned") or len(dialog))
@@ -844,6 +1043,10 @@ def run_scenario(scenario: Scenario, options: Options, config: Dict[str, Any],
             and branch_report["remembers_own"].get("b")
         )
         isolation_ok: Optional[bool] = bool(branch_report["isolation_ok"])
+    elif memory_report is not None:
+        probe_answer = str(memory_report["answers"].get(MEMORY_PROBE_NAME, "") or "")
+        remembered = None  # для memory_layers проверяем по слоям (см. memory-блок)
+        isolation_ok = None
     else:
         probe_answer = turns[-1]["answer"] if turns else ""
         remembered = check_remembered(probe_answer) if turns else None
@@ -901,6 +1104,9 @@ def run_scenario(scenario: Scenario, options: Options, config: Dict[str, Any],
         "branch": branch_block,
         "branch_mode": bool(scenario.branch_mode),
         "isolation_ok": isolation_ok,
+        # Модель памяти (memory_layers)
+        "memory": memory_report,
+        "memory_mode": bool(scenario.memory),
         # Сжатие контекста (summary)
         "summary_enabled": bool(stats["summary"].get("enabled")),
         "summary_active": bool(stats["summary"].get("active")),
@@ -916,6 +1122,13 @@ def run_scenario(scenario: Scenario, options: Options, config: Dict[str, Any],
         "errors": errors,
     }
     agent.close()
+    if scenario.memory:
+        # Убираем временный файл долговременной памяти симуляции
+        bench_db = PROJECT_ROOT / "data" / "bench_long_memory.db"
+        try:
+            bench_db.unlink()
+        except OSError:
+            pass
     return {
         "key": scenario.key,
         "title": scenario.title,
@@ -1053,6 +1266,22 @@ def print_scenario_report(result: Dict[str, Any], options: Options) -> None:
             print(f"    ответ ветки {answer_key.upper()}: {preview}")
         for problem in branch.get("isolation_errors") or []:
             print(f"    [!] {problem}")
+    memory = summary.get("memory")
+    if memory:
+        print("  Модель памяти (по слоям):")
+        print(f"    Долговременная: {memory['long_items']} зап. · "
+              f"≈{memory['long_tokens']} ток. · имя/цвет: "
+              f"{'ДА' if memory['remembered']['name_color'] else 'НЕТ'}")
+        print(f"    Рабочая: {memory['working_items']} элем. · "
+              f"≈{memory['working_tokens']} ток. · задача/дедлайн: "
+              f"{'ДА' if memory['remembered']['task'] else 'НЕТ'}")
+        print(f"    Краткосрочная (pin): {memory['short_term_pinned']} закр. · "
+              f"закреплённый факт: {'ДА' if memory['remembered']['pin'] else 'НЕТ'}")
+        print(f"    Незакреплённая деталь: "
+              f"{'ДА' if memory['remembered']['unpinned'] else 'НЕТ'} "
+              f"(должна быть 'НЕТ' — вытеснена окном)")
+        print(f"    Бюджет памяти: ≈{memory['budget']} ток. · "
+              f"предложений (pending): {memory.get('pending', 0)}")
     print(f"  Сессия: {'≈' if summary['estimated_any'] else ''}"
           f"{summary['session_total_tokens']} токенов | стоимость: "
           f"{_fmt_cost(summary)}")
@@ -1226,6 +1455,15 @@ def build_scenarios(args: argparse.Namespace) -> List[Scenario]:
                          branch_strategy=DEFAULT_BRANCH_SUB_STRATEGY,
                          strategy_window=strategy_window, branch_mode=True)
             )
+
+    # Сценарий модели памяти (memory_layers): включается по --memory/--no-memory
+    if getattr(args, "memory", False) or getattr(args, "no_memory", False):
+        scenarios.append(
+            Scenario(key="memory_layers",
+                     title="три слоя памяти (долг./рабочая/краткосрочная)",
+                     turns=30, words_per_turn=args.words, reply_words=20,
+                     strategy=SLIDING_WINDOW, strategy_window=10, memory=True)
+        )
     return scenarios
 
 
@@ -1261,6 +1499,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                              "пустая строка или none — ни один")
     parser.add_argument("--no-strategies", action="store_true",
                         help="не запускать сценарии стратегий (только legacy)")
+    parser.add_argument("--memory", action="store_true",
+                        help="запустить сценарий memory_layers (с моделью памяти)")
+    parser.add_argument("--no-memory", action="store_true",
+                        help="отключить модель памяти для memory_layers "
+                             "(парный прогон без памяти)")
     parser.add_argument("--strategy-turns", type=int, default=DEFAULT_STRATEGY_TURNS,
                         help="число ходов в сценариях window/facts "
                              f"(по умолчанию {DEFAULT_STRATEGY_TURNS})")
@@ -1396,6 +1639,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         model_limit=args.model_limit,
         api_key=str(config.get("DEEPSEEK_API_KEY") or ""),
         no_summary=bool(args.no_summary),
+        no_memory=bool(args.no_memory),
     )
 
     # Выбор режима
@@ -1447,6 +1691,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "model_limit": options.model_limit,
             # Какие сценарии стратегий участвовали в прогоне
             "strategies": selected_strategies(args),
+            "memory": bool(getattr(args, "memory", False)),
+            "no_memory": bool(getattr(args, "no_memory", False)),
             "scenarios": results,
         }
         path = Path(options.json_path)

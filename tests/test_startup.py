@@ -16,7 +16,12 @@ import uuid
 from pathlib import Path
 
 import main as app_main
-from src.config import get_config, get_strategy_settings
+from src.config import (
+    PROJECT_ROOT,
+    get_config,
+    get_memory_settings,
+    get_strategy_settings,
+)
 from src.utils import AgentConfigError
 
 _TESTS_TMP = Path(__file__).resolve().parent / "tmp_startup"
@@ -130,6 +135,99 @@ class CreateAgentTest(unittest.TestCase):
         settings = get_strategy_settings({"STRATEGY": "branching"})
         self.assertEqual(settings["name"], "branching")
         self.assertEqual(settings["branch_strategy"], "sliding_window")
+
+
+class MemorySettingsTest(unittest.TestCase):
+    """Модель памяти: настройки передаются агенту и валидируются."""
+
+    def tearDown(self) -> None:
+        shutil.rmtree(_TESTS_TMP, ignore_errors=True)
+
+    def test_create_agent_passes_memory_settings(self) -> None:
+        """create_agent() получает memory_settings из конфигурации."""
+        agent = app_main.create_agent(_config())
+        try:
+            settings = agent.get_memory_settings()
+            self.assertTrue(settings["enabled"])
+            self.assertTrue(settings["working_enabled"])
+            self.assertTrue(settings["long_enabled"])
+            self.assertEqual(settings["long_path"], "data/long_memory.db")
+            self.assertEqual(settings["pin_max"], 5)
+            self.assertEqual(settings["max_tokens"], 600)
+            self.assertTrue(agent.get_memory_report()["enabled"])
+        finally:
+            agent.close()
+
+    def test_long_path_resolved_relative_to_project_root(self) -> None:
+        """Путь БД долговременной памяти считается от PROJECT_ROOT."""
+        agent = app_main.create_agent(
+            _config(MEMORY_LONG_PATH="data/test_long_startup.db")
+        )
+        try:
+            self.assertEqual(
+                agent._long_memory.db_path,
+                PROJECT_ROOT / "data" / "test_long_startup.db",
+            )
+        finally:
+            agent.close()
+
+    def test_memory_enabled_false_disables_layers(self) -> None:
+        """MEMORY_ENABLED=false отключает модель памяти целиком."""
+        agent = app_main.create_agent(_config(MEMORY_ENABLED=False))
+        try:
+            self.assertFalse(agent.get_memory_settings()["enabled"])
+            self.assertEqual(agent._memory_blocks(), [])
+            report = agent.get_memory_report()
+            self.assertFalse(report["enabled"])
+        finally:
+            agent.close()
+
+    def test_memory_disabled_by_default_without_settings(self) -> None:
+        """Агент без memory_settings ведёт себя как раньше (память выключена)."""
+        from src.agent import DeepSeekAgent
+        agent = DeepSeekAgent(api_key="k", model="deepseek-v4-flash")
+        try:
+            self.assertEqual(agent._memory_blocks(), [])
+        finally:
+            agent.close()
+
+    def test_memory_settings_validation_clamps(self) -> None:
+        """Некорректные значения заменяются дефолтом, бюджеты согласованы."""
+        settings = get_memory_settings({
+            "MEMORY_PIN_MAX": 999,
+            "MEMORY_MAX_TOKENS": 50,
+            "MEMORY_MIN_CONFIDENCE": 5.0,
+            "MEMORY_LONG_MAX_TOKENS": 100000,
+            "MEMORY_WORKING_MAX_TOKENS": 100000,
+        })
+        self.assertEqual(settings["pin_max"], 5)
+        self.assertEqual(settings["max_tokens"], 600)
+        self.assertEqual(settings["min_confidence"], 0.6)
+        self.assertLessEqual(
+            settings["long_max_tokens"] + settings["working_max_tokens"],
+            settings["max_tokens"],
+        )
+
+    def test_empty_long_path_disables_long_layer(self) -> None:
+        """Явная пустая строка MEMORY_LONG_PATH выключает долговременный слой."""
+        settings = get_memory_settings({"MEMORY_LONG_PATH": ""})
+        self.assertEqual(settings["long_path"], "")
+        self.assertFalse(settings["long_enabled"])
+
+    def test_mock_mode_does_not_create_long_db(self) -> None:
+        """В mock-режиме долговременная БД не создаётся."""
+        _TESTS_TMP.mkdir(parents=True, exist_ok=True)
+        long_db = _TESTS_TMP / f"long_{uuid.uuid4().hex}.db"
+        agent = app_main.create_agent(_config(
+            MOCK_MODE=True, MEMORY_LONG_PATH=str(long_db),
+        ))
+        try:
+            agent.remember_forever("profile", "имя", "Алекс")
+            agent.send_message("привет")
+            self.assertFalse(long_db.exists())
+        finally:
+            agent.close()
+        self.assertFalse(long_db.exists())
 
 
 if __name__ == "__main__":

@@ -140,7 +140,7 @@ class MigrationTest(unittest.TestCase):
         self.assertEqual(store.get_active_branch(), ROOT_BRANCH_ID)
         store.close()
 
-        # Схема обновилась до версии 2, сообщения привязаны к ветке
+        # Схема обновилась до версии 3, сообщения привязаны к ветке
         conn = sqlite3.connect(str(self.db_path))
         try:
             version = conn.execute(
@@ -151,7 +151,7 @@ class MigrationTest(unittest.TestCase):
             seqs = [row[0] for row in conn.execute("SELECT seq FROM messages")]
         finally:
             conn.close()
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "3")
         self.assertEqual(branch_ids, [ROOT_BRANCH_ID])
         self.assertEqual(seqs, [0, 1, 2, 3, 4])
 

@@ -130,6 +130,10 @@ class ChatApplication:
         self._action_queue: "queue.Queue[Any]" = queue.Queue()
         self._action_busy = False
 
+        # Окно «Память…» и модальное окно сохранения в память
+        self._memory_window: Optional[tk.Toplevel] = None
+        self._save_dialog: Optional[tk.Toplevel] = None
+
         # Индекс сообщения диалога (без system) под правой кнопкой мыши:
         # используется кнопкой «Создать от выбранного сообщения».
         self._chat_selected_index: Optional[int] = None
@@ -228,10 +232,25 @@ class ChatApplication:
 
         self._configure_text_tags()
 
-        # Контекстное меню области чата: создание ветки от выбранного сообщения
+        # Контекстное меню области чата: создание ветки и сохранение в память
         self.chat_menu = tk.Menu(self.root, tearoff=0)
         self.chat_menu.add_command(
             label="Создать ветку отсюда…", command=self._on_create_branch_from_chat
+        )
+        self.chat_menu.add_command(
+            label="Сохранить в краткосрочную (закрепить/открепить)",
+            command=self._on_menu_save_short,
+        )
+        self.chat_menu.add_command(
+            label="Сохранить в рабочую память…", command=self._on_menu_save_working
+        )
+        self.chat_menu.add_command(
+            label="Сохранить в долговременную память…",
+            command=self._on_menu_save_long,
+        )
+        self.chat_menu.add_command(
+            label="Показать, что сохранено об этом сообщении",
+            command=self._on_menu_show_saved,
         )
 
         # ---- 3. Панель параметров (186 px: модель/темп/токены, промпт, стратегия, статистика) ----
@@ -441,6 +460,12 @@ class ChatApplication:
         )
         self.branches_btn.pack(side="left", padx=(8, 0))
 
+        # Кнопка окна «Память…» (три слоя + pending + предпросмотр запроса)
+        self.memory_btn = self._make_button(
+            row2, "Память…", self._open_memory_dialog, small=True
+        )
+        self.memory_btn.pack(side="left", padx=(8, 0))
+
         # --- Ряд 2б: стратегия управления контекстом ---
         row_strategy = tk.Frame(bar, bg=COLORS["params_bg"])
         row_strategy.pack(fill="x", padx=10, pady=(0, 2))
@@ -505,6 +530,13 @@ class ChatApplication:
             font=FONTS["small"], fg=COLORS["muted"],
         )
         self.token_summary_label.pack(side="right", padx=(0, 12))
+
+        # Память: крат./раб./долг. и бюджет
+        self.token_memory_label = tk.Label(
+            row3, text="Память: —", bg=COLORS["params_bg"],
+            font=FONTS["small"], fg=COLORS["muted"],
+        )
+        self.token_memory_label.pack(side="right", padx=(0, 12))
 
         self.token_counter_label = tk.Label(
             row3, text="", bg=COLORS["params_bg"],
@@ -880,17 +912,19 @@ class ChatApplication:
             role: "user" или "assistant".
             content: текст сообщения.
             index: индекс сообщения в диалоге без учёта system; если задан,
-                к сообщению добавляется тег ``msg_<index>`` (для веток).
+                к сообщению добавляется тег ``msg_<index>`` (для веток) и
+                строка кнопок памяти. Если None — индекс берётся из
+                ``self._chat_message_count`` (сообщение, вставляемое до
+                перерисовки чата).
         """
         base_tag = "user" if role == "user" else "assistant"
         name = "Вы" if role == "user" else "Ассистент"
         timestamp = utils.format_time()
-        message_tag = f"msg_{index}" if index is not None else None
+        effective_index = index if index is not None else self._chat_message_count
+        message_tag = f"msg_{effective_index}"
 
         def tags(*extra: str) -> tuple:
             """Дополняет набор тегов тегом сообщения (если он есть)."""
-            if message_tag is None:
-                return extra
             return extra + (message_tag,)
 
         header = f"[{timestamp}] {name}:"
@@ -915,6 +949,112 @@ class ChatApplication:
                 f"{_CHAT_DISPLAY_MAX_CHARS})\n",
                 tags(base_tag),
             )
+
+        # Строка кнопок памяти (не храним ссылки: чат перерисовывается целиком)
+        self._insert_memory_buttons(effective_index, role)
+
+    def _message_saved_state(self, index: int) -> Dict[str, bool]:
+        """Состояние «сохранено в слой» для сообщения (источник истины — агент).
+
+        Returns:
+            ``{"short": pinned, "working": bool, "long": bool}``.
+        """
+        state = {"short": False, "working": False, "long": False}
+        try:
+            pinned = {int(p["index"]) for p in self.agent.list_pinned()}
+            state["short"] = int(index) in pinned
+        except Exception:
+            pass
+        try:
+            working = self.agent.get_working_memory()
+            for item in (working.get("items") or {}).values():
+                if item.get("source_message") == int(index):
+                    state["working"] = True
+                    break
+        except Exception:
+            pass
+        try:
+            for item in self.agent.get_long_memory():
+                if item.get("source_message") == int(index):
+                    state["long"] = True
+                    break
+        except Exception:
+            pass
+        return state
+
+    def _insert_memory_buttons(self, index: int, role: str) -> None:
+        """Вставляет строку кнопок сохранения в память под сообщением.
+
+        Кнопки — встроенные окна (``window_create``). Вставка выполняется при
+        ``state="normal"`` (чат переключается вызывающим кодом), поэтому
+        клики по кнопкам работают и при заблокированном тексте.
+        """
+        state = self._message_saved_state(index)
+        row = tk.Frame(self.chat, bg=COLORS["bg"])
+
+        short_label = "📌 Открепить" if state["short"] else "💬 В диалог"
+        btn_short = tk.Button(
+            row, text=short_label, font=FONTS["small"], relief="flat",
+            takefocus=0, cursor="hand2", padx=4, pady=0,
+            bg=COLORS["bg"], fg=COLORS["button"], activebackground="#E8E8E8",
+            command=lambda i=index: self._on_save_short(i),
+        )
+        btn_short.pack(side="left", padx=(0, 4))
+
+        working_label = "✓ В рабочую" if state["working"] else "📋 В рабочую"
+        btn_working = tk.Button(
+            row, text=working_label, font=FONTS["small"], relief="flat",
+            takefocus=0, cursor="hand2", padx=4, pady=0,
+            bg=COLORS["bg"], fg=COLORS["button"], activebackground="#E8E8E8",
+            command=lambda i=index: self._on_save_working(i),
+        )
+        btn_working.pack(side="left", padx=(0, 4))
+
+        long_label = "✓ В долг." if state["long"] else "🗄 В долговременную"
+        btn_long = tk.Button(
+            row, text=long_label, font=FONTS["small"], relief="flat",
+            takefocus=0, cursor="hand2", padx=4, pady=0,
+            bg=COLORS["bg"], fg=COLORS["button"], activebackground="#E8E8E8",
+            command=lambda i=index: self._on_save_long(i),
+        )
+        btn_long.pack(side="left")
+
+        self.chat.window_create("end", window=row)
+        self.chat.insert("end", "\n", ("msg_buttons",))
+
+    def _dialog_message(self, index: int) -> Optional[Dict[str, Any]]:
+        """Сообщение диалога по индексу (без system)."""
+        history = self.agent.history[1:]
+        if 0 <= int(index) < len(history):
+            message = history[int(index)]
+            return {"role": message.get("role"), "content": message.get("content", "")}
+        return None
+
+    def _on_save_short(self, index: int) -> None:
+        """Кнопка «💬 В диалог»: закрепить/открепить (краткосрочная память)."""
+        try:
+            pinned = {int(p["index"]) for p in self.agent.list_pinned()}
+        except Exception:
+            pinned = set()
+        if int(index) in pinned:
+            result = self.agent.unpin_message(int(index))
+            status = "Откреплено." if result.get("ok") else result.get("error")
+        else:
+            result = self.agent.pin_message(int(index))
+            status = "Закреплено (краткосрочная память)." if result.get("ok") \
+                else result.get("error")
+        self._refresh_chat()
+        self._update_token_stats()
+        self._refresh_memory_dialog()
+        self._set_status(status)
+
+    def _on_save_working(self, index: int) -> None:
+        """Кнопка «📋 В рабочую»: окно сохранения в рабочую память."""
+        self._open_save_dialog(index, "working")
+
+    def _on_save_long(self, index: int) -> None:
+        """Кнопка «🗄 В долговременную»: окно сохранения в долговременную."""
+        self._open_save_dialog(index, "long_term")
 
     def _scroll_to_end(self) -> None:
         """Прокручивает область чата вниз."""
@@ -1009,11 +1149,32 @@ class ChatApplication:
         # Метка стратегии и выпадающий список всегда синхронны с агентом
         self._update_strategy_controls()
 
+        # Память: крат./раб./долг. и бюджет
+        memory = stats.get("memory") or {}
+        try:
+            if memory.get("enabled"):
+                short = memory.get("short_term") or {}
+                working = memory.get("working") or {}
+                long_term = memory.get("long_term") or {}
+                self.token_memory_label.config(
+                    text=(
+                        f"Память: крат. {int(short.get('pinned') or 0)} · "
+                        f"раб. {int(working.get('items') or 0)} · "
+                        f"долг. {int(long_term.get('items') or 0)} "
+                        f"(≈{int(memory.get('total_tokens') or 0)} ток., "
+                        f"бюджет ≈{int(memory.get('budget') or 0)})"
+                    )
+                )
+            else:
+                self.token_memory_label.config(text="Память: выкл.")
+        except tk.TclError:
+            pass
+
     def _token_context_text(self) -> str:
         """Строка о контексте для статус-бара.
 
         Формат: ``Ветка: main · Стратегия: sliding_window ·
-        ctx: ≈120 (8 сообщ. отправлено)``.
+        ctx: ≈120 (8 сообщ. отправлено)`` (плюс память при включении).
         """
         try:
             stats = self.agent.get_token_stats()
@@ -1022,6 +1183,7 @@ class ChatApplication:
         context = stats.get("context") or {}
         branch = stats.get("branch") or {}
         strategy = stats.get("strategy") or {}
+        memory = stats.get("memory") or {}
         tokens = context.get("tokens")
         sent = int(context.get("messages_sent") or 0)
         if tokens is None:
@@ -1030,9 +1192,18 @@ class ChatApplication:
             ctx = f"ctx: ≈{tokens} ({sent} сообщ. отправлено)"
         branch_name = branch.get("name") or "—"
         strategy_name = strategy.get("name") or "—"
-        return (
-            f"Ветка: {branch_name} · Стратегия: {strategy_name} · {ctx}"
-        )
+        parts = [f"Ветка: {branch_name}", f"Стратегия: {strategy_name}"]
+        if memory.get("enabled"):
+            short = memory.get("short_term") or {}
+            working = memory.get("working") or {}
+            long_term = memory.get("long_term") or {}
+            parts.append(
+                f"Память: {int(short.get('pinned') or 0)}/"
+                f"{int(working.get('items') or 0)}/"
+                f"{int(long_term.get('items') or 0)}"
+            )
+        parts.append(ctx)
+        return " · ".join(parts)
 
     # ------------------------------------------------------------------
     # Стратегии управления контекстом
@@ -1631,10 +1802,9 @@ class ChatApplication:
         message_index = self._message_index_at(index)
         self._chat_selected_index = message_index
         try:
-            self.chat_menu.entryconfigure(
-                0, state=("normal" if message_index is not None
-                          else "disabled")
-            )
+            enabled = "normal" if message_index is not None else "disabled"
+            for position in (0, 1, 2, 3, 4):
+                self.chat_menu.entryconfigure(position, state=enabled)
         except tk.TclError:
             pass
         try:
@@ -1655,6 +1825,50 @@ class ChatApplication:
             )
             return
         self._create_branch(from_index=index)
+
+    def _on_menu_save_short(self) -> None:
+        """Меню: закрепить/открепить выбранное сообщение."""
+        index = self._selected_chat_index()
+        if index is None:
+            self._set_status("Выберите сообщение правой кнопкой мыши.")
+            return
+        self._on_save_short(index)
+
+    def _on_menu_save_working(self) -> None:
+        """Меню: сохранить выбранное сообщение в рабочую память."""
+        index = self._selected_chat_index()
+        if index is None:
+            self._set_status("Выберите сообщение правой кнопкой мыши.")
+            return
+        self._on_save_working(index)
+
+    def _on_menu_save_long(self) -> None:
+        """Меню: сохранить выбранное сообщение в долговременную память."""
+        index = self._selected_chat_index()
+        if index is None:
+            self._set_status("Выберите сообщение правой кнопкой мыши.")
+            return
+        self._on_save_long(index)
+
+    def _on_menu_show_saved(self) -> None:
+        """Меню: показать, что сохранено об этом сообщении."""
+        index = self._selected_chat_index()
+        if index is None:
+            self._set_status("Выберите сообщение правой кнопкой мыши.")
+            return
+        state = self._message_saved_state(index)
+        lines = [f"Сообщение №{index + 1}:"]
+        lines.append(
+            "Краткосрочная: " + ("закреплено" if state["short"] else "нет")
+        )
+        lines.append(
+            "Рабочая: " + ("сохранено" if state["working"] else "нет")
+        )
+        lines.append(
+            "Долговременная: " + ("сохранено" if state["long"] else "нет")
+        )
+        messagebox.showinfo("Сохранено об этом сообщении", "\n".join(lines),
+                            parent=self.root)
 
     # ------------------------------------------------------------------
     # Окно «Ветки» диалога
@@ -2034,6 +2248,733 @@ class ChatApplication:
                 pass
 
     # ------------------------------------------------------------------
+    # Окно «Сохранить в память» (рабочая / долговременная)
+    # ------------------------------------------------------------------
+
+    def _open_save_dialog(self, index: int, layer: str) -> None:
+        """Открывает модальное окно сохранения сообщения в выбранный слой."""
+        message = self._dialog_message(index)
+        if message is None:
+            self._set_status("Сообщение не найдено.")
+            return
+        existing = self._save_dialog
+        if existing is not None:
+            try:
+                existing.destroy()
+            except tk.TclError:
+                pass
+
+        is_working = layer == "working"
+        dialog = tk.Toplevel(self.root)
+        self._save_dialog = dialog
+        dialog.title("В рабочую память" if is_working
+                     else "В долговременную память")
+        dialog.geometry("560x430")
+        dialog.minsize(460, 320)
+        dialog.configure(bg=COLORS["bg"])
+        dialog.transient(self.root)
+        dialog.protocol("WM_DELETE_WINDOW", self._close_save_dialog)
+
+        role_name = "Вы" if message.get("role") == "user" else "Ассистент"
+        quote = str(message.get("content") or "")[:200]
+
+        # Цитата-источник (read-only)
+        tk.Label(dialog, text=f"Сообщение №{index + 1} · {role_name}",
+                 bg=COLORS["bg"], font=FONTS["header"], fg=COLORS["text"],
+                 ).pack(anchor="w", padx=10, pady=(10, 2))
+        quote_text = tk.Text(dialog, wrap="word", height=4, bg=COLORS["input_bg"],
+                             fg=COLORS["text"], font=FONTS["small"],
+                             relief="solid", bd=1, state="disabled")
+        quote_text.pack(fill="x", padx=10)
+        quote_text.configure(state="normal")
+        quote_text.insert("1.0", quote)
+        quote_text.configure(state="disabled")
+
+        # Слой предвыбран и не может быть не выбран
+        tk.Label(dialog, text="Слой: " + ("Рабочая (задача)" if is_working
+                                           else "Долговременная (профиль, "
+                                                "решения, знания)"),
+                 bg=COLORS["bg"], font=FONTS["small"], fg=COLORS["muted"],
+                 ).pack(anchor="w", padx=10, pady=(6, 2))
+
+        # Поле значения (редактируемое)
+        tk.Label(dialog, text="Значение (можно сократить/уточнить):",
+                 bg=COLORS["bg"], font=FONTS["default"], fg=COLORS["text"],
+                 ).pack(anchor="w", padx=10)
+        value_text = tk.Text(dialog, wrap="word", height=5, bg=COLORS["input_bg"],
+                             fg=COLORS["text"], font=FONTS["default"],
+                             relief="solid", bd=1,
+                             highlightthickness=1,
+                             highlightbackground=COLORS["input_border"])
+        value_text.pack(fill="x", padx=10, pady=(2, 6))
+        value_text.insert("1.0", str(message.get("content") or ""))
+
+        # Поля ключа/вида/раздела
+        fields = tk.Frame(dialog, bg=COLORS["bg"])
+        fields.pack(fill="x", padx=10)
+        tk.Label(fields, text="Ключ:", bg=COLORS["bg"], font=FONTS["default"]
+                 ).pack(side="left")
+        key_var = tk.StringVar()
+        key_entry = tk.Entry(fields, textvariable=key_var, font=FONTS["default"],
+                             relief="solid", bd=1)
+        key_entry.pack(side="left", fill="x", expand=True, padx=(4, 10))
+
+        kind_var = tk.StringVar(value="note")
+        section_var = tk.StringVar(value="profile")
+        if is_working:
+            tk.Label(fields, text="Вид:", bg=COLORS["bg"],
+                     font=FONTS["default"]).pack(side="left")
+            ttk.Combobox(fields, textvariable=kind_var,
+                         values=("decision", "artifact", "note"), state="readonly",
+                         width=12).pack(side="left", padx=(4, 0))
+        else:
+            tk.Label(fields, text="Раздел:", bg=COLORS["bg"],
+                     font=FONTS["default"]).pack(side="left")
+            ttk.Combobox(fields, textvariable=section_var,
+                         values=("profile", "decisions", "knowledge"),
+                         state="readonly", width=12).pack(side="left", padx=(4, 0))
+
+        buttons = tk.Frame(dialog, bg=COLORS["bg"])
+        buttons.pack(fill="x", padx=10, pady=(10, 10))
+
+        def _confirm() -> None:
+            value = value_text.get("1.0", "end-1c").strip()
+            if not value:
+                self._set_status("Значение не может быть пустым.")
+                return
+            # Значения Tk-переменных читаем в главном потоке: обращение к
+            # Tk из фонового потока небезопасно.
+            key = key_var.get().strip() or None
+            kind = kind_var.get()
+            section = section_var.get()
+            if is_working:
+                self._run_action(
+                    lambda: self.agent.save_to_memory(
+                        "working", value, key=key, kind=kind,
+                        source="manual", message_index=index,
+                    ),
+                    self._on_save_result,
+                )
+            else:
+                self._run_action(
+                    lambda: self.agent.save_to_memory(
+                        "long_term", value, key=key, section=section,
+                        source="manual", message_index=index,
+                    ),
+                    self._on_save_result,
+                )
+            self._close_save_dialog()
+
+        self._make_button(buttons, "Сохранить", _confirm).pack(side="left")
+        self._make_button(buttons, "Отмена",
+                          self._close_save_dialog).pack(side="left", padx=(8, 0))
+
+        # Предзаполнение локальными правилами (без сети, не блокирует UI)
+        self._prefill_save_dialog(message.get("content") or "", key_var,
+                                  kind_var, section_var, is_working)
+
+    def _prefill_save_dialog(self, text: str, key_var, kind_var, section_var,
+                             is_working: bool) -> None:
+        """Заполняет ключ/вид/раздел по локальным правилам классификации."""
+        try:
+            from .memory import MemoryClassifier
+            local = MemoryClassifier.classify_local(text)
+        except Exception:
+            return
+        if is_working:
+            candidates = local.get("working") or []
+            if candidates:
+                first = candidates[0]
+                if first.get("key") and not key_var.get():
+                    key_var.set(first["key"])
+                if first.get("kind"):
+                    kind_var.set(first["kind"])
+        else:
+            candidates = local.get("long_term") or []
+            if candidates:
+                first = candidates[0]
+                if first.get("key") and not key_var.get():
+                    key_var.set(first["key"])
+                if first.get("section"):
+                    section_var.set(first["section"])
+
+    def _close_save_dialog(self) -> None:
+        """Закрывает окно сохранения в память."""
+        dialog = self._save_dialog
+        self._save_dialog = None
+        if dialog is not None:
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+    def _on_save_result(self, result: Dict[str, Any]) -> None:
+        """Обрабатывает результат сохранения в память."""
+        self._refresh_chat()
+        self._update_token_stats()
+        self._refresh_memory_dialog()
+        if result.get("ok"):
+            layer = result.get("layer")
+            title = {"working": "рабочая память",
+                     "long_term": "долговременная память"}.get(layer, layer)
+            self._set_status(
+                f"Сохранено: {title} · {result.get('key')} = {result.get('value')}"
+            )
+        else:
+            self._set_status(f"Ошибка: {result.get('error')}")
+
+    # ------------------------------------------------------------------
+    # Окно «Память…» (три вкладки + pending + предпросмотр запроса)
+    # ------------------------------------------------------------------
+
+    def _open_memory_dialog(self) -> None:
+        """Открывает окно «Память…» с тремя вкладками и предпросмотром."""
+        window = self._memory_window
+        if window is not None and window.winfo_exists():
+            self._refresh_memory_dialog()
+            window.lift()
+            window.focus_set()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._memory_window = window
+        window.title("Память")
+        window.geometry("820x560")
+        window.minsize(640, 420)
+        window.configure(bg=COLORS["bg"])
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self._close_memory_dialog)
+
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        self._memory_notebook = notebook
+
+        # --- Вкладка 1: краткосрочная ---
+        short_tab = tk.Frame(notebook, bg=COLORS["bg"])
+        notebook.add(short_tab, text="Краткосрочная (диалог)")
+        self._short_header = tk.Label(short_tab, text="", bg=COLORS["bg"],
+                                      font=FONTS["small"], fg=COLORS["muted"],
+                                      anchor="w")
+        self._short_header.pack(fill="x", padx=8, pady=(6, 2))
+        self._build_tree(short_tab, "short", ("index", "role", "preview", "pinned"))
+        short_btns = tk.Frame(short_tab, bg=COLORS["bg"])
+        short_btns.pack(fill="x", padx=8, pady=(4, 8))
+        self._make_button(short_btns, "Закрепить/Открепить",
+                          self._on_short_toggle, small=True).pack(side="left")
+        self._make_button(short_btns, "Открепить все",
+                          self._on_short_unpin_all, small=True).pack(
+            side="left", padx=(8, 0))
+
+        # --- Вкладка 2: рабочая ---
+        working_tab = tk.Frame(notebook, bg=COLORS["bg"])
+        notebook.add(working_tab, text="Рабочая (задача)")
+        self._working_fields = {}
+        for label, key, height in (
+            ("Цель", "goal", 1), ("Статус", "status", 1),
+            ("План (по строке)", "plan", 3),
+            ("Ограничения (по строке)", "constraints", 3),
+            ("Открытые вопросы (по строке)", "open_questions", 3),
+        ):
+            row = tk.Frame(working_tab, bg=COLORS["bg"])
+            row.pack(fill="x", padx=8, pady=(2, 0))
+            tk.Label(row, text=label + ":", bg=COLORS["bg"],
+                     font=FONTS["small"], fg=COLORS["text"]).pack(anchor="w")
+            widget = tk.Text(row, wrap="word", height=height,
+                             bg=COLORS["input_bg"], fg=COLORS["text"],
+                             font=FONTS["default"], relief="solid", bd=1,
+                             highlightthickness=1,
+                             highlightbackground=COLORS["input_border"])
+            widget.pack(fill="x", pady=(2, 0))
+            self._working_fields[key] = widget
+        self._build_tree(working_tab, "working",
+                         ("key", "value", "kind", "source", "updated"))
+        working_btns = tk.Frame(working_tab, bg=COLORS["bg"])
+        working_btns.pack(fill="x", padx=8, pady=(4, 8))
+        self._make_button(working_btns, "Сохранить поля",
+                          self._on_working_save_fields, small=True).pack(side="left")
+        self._make_button(working_btns, "Добавить элемент",
+                          self._on_working_add_item, small=True).pack(
+            side="left", padx=(8, 0))
+        self._make_button(working_btns, "Удалить элемент",
+                          self._on_working_delete_item, small=True).pack(
+            side="left", padx=(8, 0))
+        self._make_button(working_btns, "Новая задача",
+                          self._on_working_new_task, small=True).pack(
+            side="left", padx=(8, 0))
+        self._make_button(working_btns, "Очистить рабочую",
+                          self._on_working_clear, small=True).pack(
+            side="left", padx=(8, 0))
+
+        # --- Вкладка 3: долговременная ---
+        long_tab = tk.Frame(notebook, bg=COLORS["bg"])
+        notebook.add(long_tab, text="Долговременная")
+        search_row = tk.Frame(long_tab, bg=COLORS["bg"])
+        search_row.pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(search_row, text="Поиск:", bg=COLORS["bg"],
+                 font=FONTS["small"]).pack(side="left")
+        self._long_search = tk.Entry(search_row, font=FONTS["default"],
+                                     relief="solid", bd=1)
+        self._long_search.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self._long_search.bind("<KeyRelease>", lambda _e: self._refresh_long_tab())
+        self._build_tree(long_tab, "long",
+                         ("section", "key", "value", "source", "created", "updated"))
+        long_btns = tk.Frame(long_tab, bg=COLORS["bg"])
+        long_btns.pack(fill="x", padx=8, pady=(4, 8))
+        self._make_button(long_btns, "Добавить", self._on_long_add,
+                          small=True).pack(side="left")
+        self._make_button(long_btns, "Забыть", self._on_long_forget,
+                          small=True).pack(side="left", padx=(8, 0))
+        self._make_button(long_btns, "Очистить раздел", self._on_long_clear_section,
+                          small=True).pack(side="left", padx=(8, 0))
+        self._make_button(long_btns, "Очистить долговременную",
+                          self._on_long_clear_all, small=True).pack(
+            side="left", padx=(8, 0))
+        self._make_button(long_btns, "Экспорт…", self._on_long_export,
+                          small=True).pack(side="left", padx=(8, 0))
+        self._make_button(long_btns, "Импорт…", self._on_long_import,
+                          small=True).pack(side="left", padx=(8, 0))
+
+        # --- Вкладка 4: предложения ---
+        pending_tab = tk.Frame(notebook, bg=COLORS["bg"])
+        notebook.add(pending_tab, text="Предложения (pending)")
+        self._build_tree(pending_tab, "pending",
+                         ("id", "layer", "section", "key", "value", "confidence"))
+        pending_btns = tk.Frame(pending_tab, bg=COLORS["bg"])
+        pending_btns.pack(fill="x", padx=8, pady=(4, 8))
+        self._make_button(pending_btns, "Принять в …", self._on_pending_accept,
+                          small=True).pack(side="left")
+        self._make_button(pending_btns, "Отклонить", self._on_pending_reject,
+                          small=True).pack(side="left", padx=(8, 0))
+        self._make_button(pending_btns, "Отклонить все",
+                          self._on_pending_reject_all, small=True).pack(
+            side="left", padx=(8, 0))
+
+        # --- Низ окна: сводка + «Что уходит в запрос» ---
+        bottom = tk.Frame(window, bg=COLORS["bg"])
+        bottom.pack(fill="x", padx=8, pady=(4, 8))
+        self._memory_summary_label = tk.Label(
+            bottom, text="", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"], anchor="w")
+        self._memory_summary_label.pack(side="left", fill="x", expand=True)
+        self._make_button(bottom, "Что уходит в запрос",
+                          self._open_preview_window, small=True).pack(side="right")
+
+        self._refresh_memory_dialog()
+
+    def _build_tree(self, parent, name: str, columns) -> None:
+        """Создаёт Treeview с горизонтальной прокруткой и кнопками."""
+        wrap = tk.Frame(parent, bg=COLORS["bg"])
+        wrap.pack(fill="both", expand=True, padx=8)
+        tree = ttk.Treeview(wrap, columns=columns, show="headings",
+                            selectmode="browse", height=8)
+        for column in columns:
+            tree.heading(column, text=column)
+            tree.column(column, width=120, anchor="w")
+        tree.pack(side="left", fill="both", expand=True)
+        yscroll = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        yscroll.pack(side="right", fill="y")
+        setattr(self, f"_memory_{name}_tree", tree)
+
+    def _memory_tree(self, name: str):
+        """Возвращает Treeview вкладки (None, если окна нет)."""
+        window = self._memory_window
+        if window is None or not window.winfo_exists():
+            return None
+        return getattr(self, f"_memory_{name}_tree", None)
+
+    def _selected_memory_item(self, name: str) -> Optional[tuple]:
+        """iid выбранной строки таблицы (None, если нет)."""
+        tree = self._memory_tree(name)
+        if tree is None:
+            return None
+        try:
+            selection = tree.selection()
+        except (tk.TclError, AttributeError):
+            return None
+        if not selection:
+            return None
+        try:
+            values = tree.item(selection[0], "values")
+            return tuple(values)
+        except (tk.TclError, AttributeError):
+            return None
+
+    def _refresh_memory_dialog(self) -> None:
+        """Перерисовывает окно «Память…» по состоянию агента."""
+        window = self._memory_window
+        if window is None or not window.winfo_exists():
+            return
+        self._refresh_short_tab()
+        self._refresh_working_tab()
+        self._refresh_long_tab()
+        self._refresh_pending_tab()
+        self._refresh_memory_summary()
+
+    def _refresh_short_tab(self) -> None:
+        tree = self._memory_tree("short")
+        if tree is None:
+            return
+        try:
+            tree.delete(*tree.get_children())
+            pinned = {int(p["index"]) for p in self.agent.list_pinned()}
+            history = self.agent.history[1:]
+            for i, message in enumerate(history):
+                role = "Вы" if message.get("role") == "user" else "Ассистент"
+                preview = " ".join(str(message.get("content") or "").split())[:60]
+                tree.insert("", "end", values=(
+                    str(i + 1), role, preview,
+                    "✓" if i in pinned else "",
+                ))
+            self._short_header.config(
+                text=f"{len(history)} сообщений · закреплено {len(pinned)}"
+            )
+        except tk.TclError:
+            pass
+
+    def _refresh_working_tab(self) -> None:
+        tree = self._memory_tree("working")
+        if tree is None:
+            return
+        try:
+            working = self.agent.get_working_memory()
+            task = working.get("task") or {}
+            items = working.get("items") or {}
+            for key, widget in self._working_fields.items():
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                if key in ("plan", "constraints", "open_questions"):
+                    widget.insert("1.0", "\n".join(task.get(key, [])))
+                else:
+                    widget.insert("1.0", task.get(key, ""))
+            tree.delete(*tree.get_children())
+            for key, item in items.items():
+                tree.insert("", "end", values=(
+                    key, item.get("value", ""), item.get("kind", "note"),
+                    item.get("source", "manual"),
+                    (item.get("updated_at") or "")[:16],
+                ))
+        except tk.TclError:
+            pass
+
+    def _refresh_long_tab(self) -> None:
+        tree = self._memory_tree("long")
+        if tree is None:
+            return
+        try:
+            query = ""
+            try:
+                query = self._long_search.get().strip()
+            except (tk.TclError, AttributeError):
+                pass
+            items = self.agent.get_long_memory()
+            if query:
+                needle = query.lower()
+                items = [i for i in items
+                         if needle in str(i.get("key", "")).lower()
+                         or needle in str(i.get("value", "")).lower()]
+            tree.delete(*tree.get_children())
+            for item in items:
+                tree.insert("", "end", values=(
+                    item.get("section", ""), item.get("key", ""),
+                    item.get("value", ""), item.get("source", "manual"),
+                    (item.get("created_at") or "")[:16],
+                    (item.get("updated_at") or "")[:16],
+                ))
+        except tk.TclError:
+            pass
+
+    def _refresh_pending_tab(self) -> None:
+        tree = self._memory_tree("pending")
+        if tree is None:
+            return
+        try:
+            tree.delete(*tree.get_children())
+            for item in self.agent.get_pending_memory():
+                tree.insert("", "end", values=(
+                    item.get("id"), item.get("layer"), item.get("section") or "",
+                    item.get("key") or "", item.get("value", ""),
+                    item.get("confidence"),
+                ))
+        except tk.TclError:
+            pass
+
+    def _refresh_memory_summary(self) -> None:
+        try:
+            report = self.agent.get_memory_report()
+        except Exception:
+            return
+        short = report.get("short_term") or {}
+        working = report.get("working") or {}
+        long_term = report.get("long_term") or {}
+        budget = report.get("budget") or {}
+        text = (
+            f"Краткосрочная: {int(short.get('pinned_count') or 0)}/≈0 ток. · "
+            f"Рабочая: {int(working.get('count') or 0)}/"
+            f"≈{int(working.get('tokens') or 0)} · "
+            f"Долговременная: {int(long_term.get('count') or 0)}/"
+            f"≈{int(long_term.get('tokens') or 0)} · "
+            f"бюджет ≈{int(budget.get('max_tokens') or 0)} ток."
+        )
+        try:
+            self._memory_summary_label.config(text=text)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _close_memory_dialog(self) -> None:
+        """Закрывает окно «Память…»."""
+        window = self._memory_window
+        self._memory_window = None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+    def _open_preview_window(self) -> None:
+        """Окно «Что уходит в запрос» — построчный предпросмотр контекста."""
+        try:
+            preview = self.agent.preview_context()
+        except Exception as exc:
+            messagebox.showerror("Предпросмотр", str(exc), parent=self._memory_window)
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Что уходит в запрос")
+        window.geometry("720x520")
+        window.configure(bg=COLORS["bg"])
+        window.transient(self._memory_window or self.root)
+        text = tk.Text(window, wrap="word", bg=COLORS["input_bg"],
+                       fg=COLORS["text"], font=FONTS["default"],
+                       relief="flat", padx=8, pady=6, cursor="arrow")
+        text.pack(fill="both", expand=True, padx=8, pady=8)
+        layer_titles = {"system": "system", "long_term": "долговременная",
+                        "working": "рабочая", "pinned": "закреплённые",
+                        "short_term": "краткосрочная"}
+        for item in preview:
+            layer = layer_titles.get(item.get("layer"), item.get("layer"))
+            text.insert("end", f"[{layer} · {item.get('tokens', 0)} ток.]\n")
+            text.insert("end", f"{item.get('role')}: {item.get('content')}\n\n")
+        text.configure(state="disabled")
+
+    # --- Обработчики вкладок окна «Память…» ---
+
+    def _on_short_toggle(self) -> None:
+        selected = self._selected_memory_item("short")
+        if selected is None:
+            self._set_status("Выберите сообщение в таблице.")
+            return
+        index = int(selected[0]) - 1  # в таблице нумерация с 1
+        self._on_save_short(index)
+
+    def _on_short_unpin_all(self) -> None:
+        for pin in list(self.agent.list_pinned()):
+            self.agent.unpin_message(int(pin["index"]))
+        self._refresh_chat()
+        self._update_token_stats()
+        self._refresh_memory_dialog()
+        self._set_status("Все закрепления сняты.")
+
+    def _on_working_save_fields(self) -> None:
+        fields = {}
+        for key, widget in self._working_fields.items():
+            fields[key] = widget.get("1.0", "end-1c")
+        self._run_action(
+            lambda: self._save_working_fields(fields), self._on_memory_action_done
+        )
+
+    def _save_working_fields(self, fields: Dict[str, str]) -> Dict[str, Any]:
+        for key, value in fields.items():
+            if key in ("plan", "constraints", "open_questions"):
+                self.agent.set_task_field(key, value.split("\n"))
+            else:
+                self.agent.set_task_field(key, value)
+        return {"ok": True, "error": None}
+
+    def _on_working_add_item(self) -> None:
+        parent = self._memory_window or self.root
+        key = simpledialog.askstring("Элемент", "Ключ:", parent=parent)
+        if key is None:
+            return
+        value = simpledialog.askstring("Элемент", "Значение:", parent=parent)
+        if value is None:
+            return
+        kind = simpledialog.askstring(
+            "Элемент", "Вид (decision/artifact/note):",
+            initialvalue="note", parent=parent,
+        ) or "note"
+        self._run_action(
+            lambda: self.agent.add_working_item(key, value, kind),
+            self._on_memory_action_done,
+        )
+
+    def _on_working_delete_item(self) -> None:
+        selected = self._selected_memory_item("working")
+        if selected is None:
+            self._set_status("Выберите элемент в таблице.")
+            return
+        key = selected[0]
+        self._run_action(
+            lambda: self.agent.forget_working_item(key),
+            self._on_memory_action_done,
+        )
+
+    def _on_working_new_task(self) -> None:
+        parent = self._memory_window or self.root
+        if not messagebox.askyesno(
+            "Новая задача",
+            "Начать новую задачу?\n\nРабочая память будет очищена. "
+            "Перенести решения (kind=decision) в долговременную память?",
+            parent=parent,
+        ):
+            # Отмена: просто очищаем без переноса
+            self._run_action(
+                lambda: self.agent.clear_working_memory(),
+                self._on_memory_action_done,
+            )
+            return
+        working = self.agent.get_working_memory()
+        decisions = [
+            key for key, item in (working.get("items") or {}).items()
+            if item.get("kind") == "decision"
+        ]
+        self._run_action(
+            lambda: self.agent.start_new_task(carry_to_long=decisions),
+            self._on_memory_action_done,
+        )
+
+    def _on_working_clear(self) -> None:
+        parent = self._memory_window or self.root
+        if not messagebox.askyesno("Очистить рабочую память",
+                                   "Очистить рабочую память задачи?",
+                                   parent=parent):
+            return
+        self._run_action(lambda: self.agent.clear_working_memory(),
+                         self._on_memory_action_done)
+
+    def _on_long_add(self) -> None:
+        parent = self._memory_window or self.root
+        section = simpledialog.askstring(
+            "Добавить", "Раздел (profile/decisions/knowledge):",
+            initialvalue="profile", parent=parent,
+        )
+        if section is None:
+            return
+        key = simpledialog.askstring("Добавить", "Ключ:", parent=parent)
+        if key is None:
+            return
+        value = simpledialog.askstring("Добавить", "Значение:", parent=parent)
+        if value is None:
+            return
+        self._run_action(
+            lambda: self.agent.remember_forever(section, key, value),
+            self._on_memory_action_done,
+        )
+
+    def _on_long_forget(self) -> None:
+        selected = self._selected_memory_item("long")
+        if selected is None:
+            self._set_status("Выберите запись в таблице.")
+            return
+        section, key = selected[0], selected[1]
+        self._run_action(
+            lambda: self.agent.forget_forever(section, key),
+            self._on_memory_action_done,
+        )
+
+    def _on_long_clear_section(self) -> None:
+        selected = self._selected_memory_item("long")
+        if selected is None:
+            self._set_status("Выберите запись в таблице (для определения раздела).")
+            return
+        section = selected[0]
+        parent = self._memory_window or self.root
+        if not messagebox.askyesno(
+            "Очистить раздел",
+            f"Очистить раздел «{section}» долговременной памяти?\n\n"
+            "Краткосрочная и рабочая память не пострадают.",
+            parent=parent,
+        ):
+            return
+        self._run_action(
+            lambda: self.agent.clear_long_memory(section),
+            self._on_memory_action_done,
+        )
+
+    def _on_long_clear_all(self) -> None:
+        parent = self._memory_window or self.root
+        if not messagebox.askyesno(
+            "Очистить долговременную память",
+            "Удалить ВСЮ долговременную память?\n\nЭто действие необратимо.",
+            parent=parent,
+        ):
+            return
+        self._run_action(
+            lambda: self.agent.clear_long_memory(None),
+            self._on_memory_action_done,
+        )
+
+    def _on_long_export(self) -> None:
+        parent = self._memory_window or self.root
+        path = simpledialog.askstring(
+            "Экспорт", "Путь к файлу Markdown:", parent=parent,
+        )
+        if path is None:
+            return
+        self._run_action(
+            lambda: self.agent.export_long_memory(path),
+            self._on_memory_action_done,
+        )
+
+    def _on_long_import(self) -> None:
+        parent = self._memory_window or self.root
+        path = simpledialog.askstring(
+            "Импорт", "Путь к файлу Markdown:", parent=parent,
+        )
+        if path is None:
+            return
+        self._run_action(
+            lambda: self.agent.import_long_memory(path),
+            self._on_memory_action_done,
+        )
+
+    def _on_pending_accept(self) -> None:
+        selected = self._selected_memory_item("pending")
+        if selected is None:
+            self._set_status("Выберите предложение в таблице.")
+            return
+        pending_id = int(selected[0])
+        self._run_action(
+            lambda: self.agent.accept_pending(pending_id),
+            self._on_memory_action_done,
+        )
+
+    def _on_pending_reject(self) -> None:
+        selected = self._selected_memory_item("pending")
+        if selected is None:
+            self._set_status("Выберите предложение в таблице.")
+            return
+        pending_id = int(selected[0])
+        self._run_action(
+            lambda: self.agent.reject_pending(pending_id),
+            self._on_memory_action_done,
+        )
+
+    def _on_pending_reject_all(self) -> None:
+        self._run_action(lambda: self.agent.clear_pending_memory(),
+                         self._on_memory_action_done)
+
+    def _on_memory_action_done(self, result: Dict[str, Any]) -> None:
+        """Обрабатывает результат фоновой операции окна «Память…»."""
+        self._refresh_chat()
+        self._update_token_stats()
+        self._refresh_memory_dialog()
+        error = result.get("error") if isinstance(result, dict) else None
+        if error:
+            self._set_status(f"Ошибка: {error}")
+        else:
+            self._set_status("Готово.")
+
+    # ------------------------------------------------------------------
     # Фоновые операции UI (ветки и прочие вызовы API по кнопкам)
     # ------------------------------------------------------------------
 
@@ -2088,6 +3029,7 @@ class ChatApplication:
             self.apply_prompt_btn,
             self.context_btn,
             self.branches_btn,
+            self.memory_btn,
             self.temp_scale,
             self.tokens_spin,
             self.prompt_entry,
@@ -2186,7 +3128,10 @@ class ChatApplication:
             return
         confirmed = messagebox.askyesno(
             "Очистить историю",
-            "Удалить всю историю диалога?",
+            "Удалить всю историю диалога?\n\n"
+            "Будут очищены сообщения активной ветки, её закрепления и рабочая "
+            "память. Долговременная память (профиль, решения, знания) "
+            "сохранится.",
             parent=self.root,
         )
         if not confirmed:
@@ -2197,6 +3142,7 @@ class ChatApplication:
         self._update_strategy_controls()
         self._refresh_branches_dialog()
         self._refresh_context_dialog()
+        self._refresh_memory_dialog()
         self._set_status("История очищена.")
         self._set_info("")
 
@@ -2341,5 +3287,7 @@ class ChatApplication:
         self._cancel_autosize()
         self._close_context_dialog()
         self._close_branches_dialog()
+        self._close_memory_dialog()
+        self._close_save_dialog()
         self.agent.close()
         self.root.destroy()

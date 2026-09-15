@@ -98,12 +98,34 @@ DEFAULTS: Dict[str, Any] = {
     "FACTS_PROMPT": "",             # "" — встроенная инструкция извлечения
     # Ветки диалога (режим branching)
     "BRANCH_MAX": 20,               # максимум веток в одном хранилище
+    # ------------------------------------------------------------------
+    # Явная модель памяти агента (short_term | working | long_term)
+    # ------------------------------------------------------------------
+    "MEMORY_ENABLED": True,          # общий выключатель модели памяти
+    "MEMORY_WORKING_ENABLED": True,  # рабочая память (задача, привязана к ветке)
+    "MEMORY_LONG_ENABLED": True,     # долговременная память (профиль/решения/знания)
+    "MEMORY_LONG_PATH": "data/long_memory.db",  # отдельный файл БД (от корня)
+    "MEMORY_LONG_MAX_ITEMS": 200,    # максимум записей долговременной памяти
+    "MEMORY_MAX_TOKENS": 600,        # общий бюджет блоков памяти в запросе
+    "MEMORY_LONG_MAX_TOKENS": 300,   # бюджет долговременной памяти
+    "MEMORY_WORKING_MAX_TOKENS": 250,  # бюджет рабочей памяти
+    "MEMORY_PIN_MAX": 5,             # максимум закреплённых сообщений
+    "MEMORY_PROPOSE_LLM": True,      # предлагать классификацию после хода
+    "MEMORY_MODEL": "",              # "" — модель диалога
+    "MEMORY_TEMPERATURE": 0.0,       # температура служебного запроса
+    "MEMORY_PROMPT": "",             # "" — встроенная инструкция
+    "MEMORY_MIN_CONFIDENCE": 0.6,    # порог уверенности кандидатов
+    # ВНИМАНИЕ: true нарушает принцип явного выбора слоя (не рекомендуется).
+    "MEMORY_AUTO_APPLY": False,
+    "MEMORY_EXPORT_PATH": "data/memory_export.md",  # путь экспорта по умолчанию
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
 _BOOL_KEYS = (
     "MOCK_MODE", "STORAGE_ENABLED", "TOKENIZER_ENABLED", "SUMMARY_ENABLED",
     "FACTS_ENABLED",
+    "MEMORY_ENABLED", "MEMORY_WORKING_ENABLED", "MEMORY_LONG_ENABLED",
+    "MEMORY_PROPOSE_LLM", "MEMORY_AUTO_APPLY",
 )
 
 # Переменные, значения которых нужно приводить к числу
@@ -111,10 +133,13 @@ _INT_KEYS = (
     "UI_WIDTH", "UI_HEIGHT", "DEFAULT_MAX_TOKENS", "MAX_HISTORY_MESSAGES",
     "SUMMARY_KEEP_LAST_N", "SUMMARY_EVERY_N", "SUMMARY_MAX_TOKENS",
     "WINDOW_KEEP_LAST_N", "FACTS_MAX_TOKENS", "FACTS_MAX_ITEMS", "BRANCH_MAX",
+    "MEMORY_LONG_MAX_ITEMS", "MEMORY_MAX_TOKENS", "MEMORY_LONG_MAX_TOKENS",
+    "MEMORY_WORKING_MAX_TOKENS", "MEMORY_PIN_MAX",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
-    "SUMMARY_TEMPERATURE", "FACTS_TEMPERATURE",
+    "SUMMARY_TEMPERATURE", "FACTS_TEMPERATURE", "MEMORY_TEMPERATURE",
+    "MEMORY_MIN_CONFIDENCE",
 )
 
 # Суффиксы переменных окружения с ценами по конкретной модели:
@@ -406,4 +431,98 @@ def get_strategy_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, 
         "facts_max_tokens": _int("FACTS_MAX_TOKENS", 300, 20, 4000),
         "facts_max_items": _int("FACTS_MAX_ITEMS", 50, 1, 500),
         "facts_prompt": str(cfg.get("FACTS_PROMPT") or "").strip(),
+    }
+
+
+def get_memory_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки модели памяти (memory layers).
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+    Пустая строка ``MEMORY_LONG_PATH`` выключает долговременный слой.
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "working_enabled", "long_enabled", "long_path",
+        "long_max_items", "max_tokens", "long_max_tokens",
+        "working_max_tokens", "pin_max", "propose_llm", "model",
+        "temperature", "prompt", "min_confidence", "auto_apply",
+        "export_path"}.
+    """
+    cfg = config if config is not None else get_config()
+    logger = get_logger("deepseek-chat.config")
+
+    def _int(key: str, default: int, low: int, high: int) -> int:
+        raw = cfg.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Некорректное значение %s=%r — беру %d.", key, raw, default)
+            return default
+        if not (low <= value <= high):
+            logger.warning(
+                "%s=%d вне диапазона [%d, %d] — беру %d.",
+                key, value, low, high, default,
+            )
+            return default
+        return value
+
+    def _float(key: str, default: float, low: float, high: float) -> float:
+        raw = cfg.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("Некорректное значение %s=%r — беру %.2f.", key, raw, default)
+            return default
+        if not (low <= value <= high):
+            logger.warning(
+                "%s=%.2f вне диапазона [%.2f, %.2f] — беру %.2f.",
+                key, value, low, high, default,
+            )
+            return default
+        return value
+
+    max_tokens = _int("MEMORY_MAX_TOKENS", 600, 100, 4000)
+    long_max_tokens = _int("MEMORY_LONG_MAX_TOKENS", 300, 20, max_tokens)
+    working_max_tokens = _int("MEMORY_WORKING_MAX_TOKENS", 250, 20, max_tokens)
+
+    # Сумма бюджетов слоёв не должна превышать общий бюджет: иначе усекаем
+    # бюджеты слоёв пропорционально (с предупреждением).
+    if long_max_tokens + working_max_tokens > max_tokens:
+        logger.warning(
+            "MEMORY_LONG_MAX_TOKENS(%d) + MEMORY_WORKING_MAX_TOKENS(%d) > "
+            "MEMORY_MAX_TOKENS(%d) — усекаю бюджеты слоёв.",
+            long_max_tokens, working_max_tokens, max_tokens,
+        )
+        long_max_tokens = max(20, max_tokens // 2)
+        working_max_tokens = max(20, max_tokens - long_max_tokens)
+
+    # Путь к БД долговременной памяти: отсутствие ключа — значение по
+    # умолчанию, явная пустая строка — слой выключен.
+    raw_long_path = cfg.get("MEMORY_LONG_PATH")
+    if raw_long_path is None:
+        raw_long_path = DEFAULTS["MEMORY_LONG_PATH"]
+    long_path = str(raw_long_path or "").strip()
+    long_enabled = bool(cfg.get("MEMORY_LONG_ENABLED", True))
+
+    return {
+        "enabled": bool(cfg.get("MEMORY_ENABLED", True)),
+        "working_enabled": bool(cfg.get("MEMORY_WORKING_ENABLED", True)),
+        "long_enabled": long_enabled and bool(long_path),
+        "long_path": long_path,
+        "long_max_items": _int("MEMORY_LONG_MAX_ITEMS", 200, 1, 100000),
+        "max_tokens": max_tokens,
+        "long_max_tokens": long_max_tokens,
+        "working_max_tokens": working_max_tokens,
+        "pin_max": _int("MEMORY_PIN_MAX", 5, 1, 50),
+        "propose_llm": bool(cfg.get("MEMORY_PROPOSE_LLM", True)),
+        "model": str(cfg.get("MEMORY_MODEL") or "").strip(),
+        "temperature": _float("MEMORY_TEMPERATURE", 0.0, 0.0, 2.0),
+        "prompt": str(cfg.get("MEMORY_PROMPT") or "").strip(),
+        "min_confidence": _float("MEMORY_MIN_CONFIDENCE", 0.6, 0.0, 1.0),
+        "auto_apply": bool(cfg.get("MEMORY_AUTO_APPLY", False)),
+        "export_path": str(cfg.get("MEMORY_EXPORT_PATH")
+                           or "data/memory_export.md").strip(),
     }

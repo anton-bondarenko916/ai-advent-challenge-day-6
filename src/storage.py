@@ -35,7 +35,7 @@ Message = Dict[str, str]
 
 # Версия схемы БД. При изменении структуры таблиц — увеличить и добавить
 # миграцию.
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 #: Идентификатор корневой ветки (создаётся всегда)
 ROOT_BRANCH_ID = 1
@@ -48,12 +48,18 @@ _KEY_SCHEMA = "schema_version"
 _KEY_STATS = "stats"
 _KEY_SUMMARY = "summary"
 _KEY_FACTS = "facts"
+_KEY_WORKING = "working_memory"
 _KEY_ACTIVE_BRANCH = "active_branch"
 
 
 def _facts_key(branch_id: int) -> str:
     """Ключ meta с фактами конкретной ветки (артефакты принадлежат ветке)."""
     return f"facts:{int(branch_id)}"
+
+
+def _working_key(branch_id: int) -> str:
+    """Ключ meta с рабочей памятью конкретной ветки (задача принадлежит ветке)."""
+    return f"working_memory:{int(branch_id)}"
 
 
 class ContextStore:
@@ -126,7 +132,7 @@ class ContextStore:
 
                 if has_v2:
                     rows = conn.execute(
-                        "SELECT role, content FROM messages "
+                        "SELECT role, content, pinned, pin_note FROM messages "
                         "WHERE branch_id = ? "
                         "ORDER BY COALESCE(seq, id), id",
                         (active_branch if active_branch is not None
@@ -134,7 +140,8 @@ class ContextStore:
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        "SELECT role, content FROM messages ORDER BY id"
+                        "SELECT role, content, pinned, pin_note "
+                        "FROM messages ORDER BY id"
                     ).fetchall()
                 if not rows:
                     return None
@@ -143,9 +150,16 @@ class ContextStore:
                 stats = self._read_json_meta(conn, _KEY_STATS, "статистику токенов")
                 summary = self._read_json_meta(conn, _KEY_SUMMARY, "конспект диалога")
                 facts = self._read_json_meta(conn, _KEY_FACTS, "факты диалога")
+                working = self._read_json_meta(conn, _KEY_WORKING,
+                                               "рабочую память")
 
                 messages = [
-                    {"role": role, "content": content} for role, content in rows
+                    {"role": role, "content": content} for role, content, _, _ in rows
+                ]
+                pinned = [
+                    {"index": index - 1, "note": pin_note}
+                    for index, (_, _, is_pinned, pin_note) in enumerate(rows)
+                    if is_pinned
                 ]
                 return {
                     "messages": messages,
@@ -153,6 +167,8 @@ class ContextStore:
                     "stats": stats if isinstance(stats, dict) else {},
                     "summary": summary if isinstance(summary, dict) else None,
                     "facts": facts if isinstance(facts, dict) else None,
+                    "pinned": pinned,
+                    "working_memory": working if isinstance(working, dict) else None,
                     "branches": self._load_branches(conn) if has_v2 else [],
                     "active_branch": active_branch,
                 }
@@ -164,7 +180,9 @@ class ContextStore:
                    stats: Optional[Dict[str, Any]] = None,
                    summary: Optional[Dict[str, Any]] = None,
                    branch_id: Optional[int] = None,
-                   facts: Optional[Dict[str, Any]] = None) -> bool:
+                   facts: Optional[Dict[str, Any]] = None,
+                   pinned: Optional[Dict[int, Optional[str]]] = None,
+                   working: Optional[Dict[str, Any]] = None) -> bool:
         """Перезаписывает сообщения ветки и параметры в одной транзакции.
 
         Полная перезапись сообщений ветки (≤ 50–60 строк) надёжнее точечных
@@ -180,12 +198,31 @@ class ContextStore:
             branch_id: ветка, в которую пишутся сообщения; None — активная.
             facts: факты диалога; None — не изменять сохранённые,
                 пустой словарь {} — явно стереть факты.
+            pinned: закрепления ``{индекс диалога без system: заметка|None}``
+                или список индексов; None — закреплений нет (нули).
+            working: рабочая память; None — не изменять сохранённую,
+                {} — явно стереть.
 
         Returns:
             True при успехе, False при ошибке БД (ошибка залогирована).
         """
         if not self.enabled or self._closed:
             return False
+        # Нормализуем pinned к словарю индекс → заметка
+        pin_map: Dict[int, Optional[str]] = {}
+        if pinned is not None:
+            if isinstance(pinned, dict):
+                for index, note in pinned.items():
+                    try:
+                        pin_map[int(index)] = note
+                    except (TypeError, ValueError):
+                        continue
+            else:
+                for index in pinned:
+                    try:
+                        pin_map[int(index)] = None
+                    except (TypeError, ValueError):
+                        continue
         try:
             self._prepare_disk()
             with self._session() as conn:
@@ -204,9 +241,15 @@ class ContextStore:
                     )
                     conn.executemany(
                         "INSERT INTO messages(role, content, created_at, "
-                        "branch_id, seq) VALUES (?, ?, ?, ?, ?)",
-                        [(m.get("role", ""), m.get("content", ""), now, target, index)
-                         for index, m in enumerate(messages)],
+                        "branch_id, seq, pinned, pin_note) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (m.get("role", ""), m.get("content", ""), now, target,
+                             index,
+                             1 if (index - 1) in pin_map else 0,
+                             pin_map.get(index - 1))
+                            for index, m in enumerate(messages)
+                        ],
                     )
                     conn.execute(
                         "UPDATE branches SET updated_at = ? WHERE id = ?",
@@ -215,10 +258,14 @@ class ContextStore:
                 else:
                     conn.execute("DELETE FROM messages")
                     conn.executemany(
-                        "INSERT INTO messages(role, content, created_at) "
-                        "VALUES (?, ?, ?)",
-                        [(m.get("role", ""), m.get("content", ""), now)
-                         for m in messages],
+                        "INSERT INTO messages(role, content, created_at, "
+                        "pinned, pin_note) VALUES (?, ?, ?, ?, ?)",
+                        [
+                            (m.get("role", ""), m.get("content", ""), now,
+                             1 if (index - 1) in pin_map else 0,
+                             pin_map.get(index - 1))
+                            for index, m in enumerate(messages)
+                        ],
                     )
 
                 self._write_meta(
@@ -243,6 +290,12 @@ class ContextStore:
                             conn, _facts_key(target),
                             json.dumps(facts, ensure_ascii=False),
                         )
+                if working is not None:
+                    serialized = json.dumps(working, ensure_ascii=False)
+                    self._write_meta(conn, _KEY_WORKING, serialized)
+                    # Рабочая память принадлежит ветке: держим копию по её id.
+                    if has_v2:
+                        self._write_meta(conn, _working_key(target), serialized)
             return True
         except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
             self._log.error("Ошибка сохранения контекста в БД: %s", exc)
@@ -274,6 +327,11 @@ class ContextStore:
     def clear(self) -> bool:
         """Удаляет диалог, ветки, артефакты и параметры (схема остаётся).
 
+        Очищаются сообщения активной ветки (вместе с их закреплениями),
+        параметры, статистика, конспект, факты и рабочая память.
+        **Долговременная память не трогается** — она живёт в отдельном файле
+        ``data/long_memory.db`` (осознанное свойство, см. src/memory.py).
+
         Returns:
             True при успехе, False при ошибке БД или отсутствии файла.
         """
@@ -286,11 +344,12 @@ class ContextStore:
                 if has_v2:
                     conn.execute("DELETE FROM branches")
                 conn.execute(
-                    "DELETE FROM meta WHERE key IN (?, ?, ?, ?, ?)",
+                    "DELETE FROM meta WHERE key IN (?, ?, ?, ?, ?, ?)",
                     (_KEY_PARAMS, _KEY_STATS, _KEY_SUMMARY, _KEY_FACTS,
-                     _KEY_ACTIVE_BRANCH),
+                     _KEY_WORKING, _KEY_ACTIVE_BRANCH),
                 )
                 conn.execute("DELETE FROM meta WHERE key LIKE 'facts:%'")
+                conn.execute("DELETE FROM meta WHERE key LIKE 'working_memory:%'")
             return True
         except sqlite3.Error as exc:
             self._log.error("Ошибка очистки контекста в БД: %s", exc)
@@ -422,6 +481,12 @@ class ContextStore:
                     f"DELETE FROM branches WHERE id IN ({placeholders})",
                     tuple(targets),
                 )
+                # Рабочая память и факты удаляемых веток (копии по id)
+                for target in targets:
+                    conn.execute(
+                        "DELETE FROM meta WHERE key IN (?, ?)",
+                        (_facts_key(int(target)), _working_key(int(target))),
+                    )
                 active = self._read_active_branch(conn)
                 if active is not None and int(active) in targets:
                     conn.execute(
@@ -552,9 +617,55 @@ class ContextStore:
             self._log.error("Ошибка чтения фактов ветки: %s", exc)
             return None
 
-    # ------------------------------------------------------------------
-    # Приватные методы: соединение и схема
-    # ------------------------------------------------------------------
+    def save_branch_working(self, branch_id: int,
+                            working: Optional[Dict[str, Any]]) -> bool:
+        """Сохраняет рабочую память ветки (задача принадлежит ветке).
+
+        Args:
+            branch_id: идентификатор ветки.
+            working: сериализованная рабочая память; {} — явно стереть.
+
+        Returns:
+            True при успехе.
+        """
+        if not self.enabled or self._closed:
+            return False
+        try:
+            self._prepare_disk()
+            with self._session() as conn:
+                if self._ensure_schema(conn) != SCHEMA_VERSION:
+                    return False
+                self._write_meta(
+                    conn, _working_key(branch_id),
+                    json.dumps(working or {}, ensure_ascii=False),
+                )
+            return True
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            self._log.error("Ошибка сохранения рабочей памяти ветки: %s", exc)
+            return False
+
+    def load_branch_working(self, branch_id: int) -> Optional[Dict[str, Any]]:
+        """Читает рабочую память ветки (None, если её нет)."""
+        if not self.enabled or self._closed or not self.exists:
+            return None
+        try:
+            with self._session() as conn:
+                if self._ensure_schema(conn) != SCHEMA_VERSION:
+                    return None
+                raw = self._read_meta(conn, _working_key(branch_id))
+                if raw is None and int(branch_id) == ROOT_BRANCH_ID:
+                    raw = self._read_meta(conn, _KEY_WORKING)
+                if not raw:
+                    return None
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, TypeError):
+                    self._log.warning("Не удалось разобрать рабочую память ветки.")
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+        except sqlite3.Error as exc:
+            self._log.error("Ошибка чтения рабочей памяти ветки: %s", exc)
+            return None
 
     def _connect(self) -> sqlite3.Connection:
         """Открывает новое соединение с БД.
@@ -611,12 +722,12 @@ class ContextStore:
     def _ensure_schema(self, conn: sqlite3.Connection) -> str:
         """Создаёт или мигрирует схему БД.
 
-        Свежая БД создаётся сразу в версии 2. Старая БД версии 1 получает
-        таблицу ``branches`` и колонки ``branch_id``/``seq``; вся история
-        проставляется в корневую ветку ``main``.
+        Свежая БД создаётся сразу в версии 3. Старая БД версии 1/2 получает
+        недостающие колонки (ветки, ``branch_id``/``seq``, ``pinned``/
+        ``pin_note``); вся история проставляется в корневую ветку ``main``.
 
         Returns:
-            Фактическая версия схемы: "2" при успехе, "1" — если ветки
+            Фактическая версия схемы: "3" при успехе, "1" — если ветки
             недоступны (тогда хранилище работает как раньше, одной историей).
         """
         tables = self._table_names(conn)
@@ -625,17 +736,18 @@ class ContextStore:
             self._create_tables(conn)
         else:
             version = self._read_meta(conn, _KEY_SCHEMA)
-            if version not in (None, "1", SCHEMA_VERSION):
+            if version not in (None, "1", "2", SCHEMA_VERSION):
                 self._log.warning(
                     "Версия схемы БД %r неизвестна — работаю в режиме "
                     "одной истории.", version,
                 )
                 return "1"
             self._upgrade_columns(conn)
+            self._upgrade_columns_v3(conn)
 
-        if not self._has_v2_schema(conn):
+        if not self._has_v3_schema(conn):
             self._log.warning(
-                "Не удалось подготовить схему веток (v2) — работаю в режиме "
+                "Не удалось подготовить схему веток (v3) — работаю в режиме "
                 "одной истории."
             )
             return "1"
@@ -646,7 +758,7 @@ class ContextStore:
         return SCHEMA_VERSION
 
     def _create_tables(self, conn: sqlite3.Connection) -> None:
-        """Создаёт таблицы схемы v2 (идемпотентно)."""
+        """Создаёт таблицы схемы v3 (идемпотентно)."""
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -655,7 +767,9 @@ class ContextStore:
                 content    TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 branch_id  INTEGER NOT NULL DEFAULT 1,
-                seq        INTEGER
+                seq        INTEGER,
+                pinned     INTEGER NOT NULL DEFAULT 0,
+                pin_note   TEXT
             )
             """
         )
@@ -682,7 +796,7 @@ class ContextStore:
         )
 
     def _upgrade_columns(self, conn: sqlite3.Connection) -> None:
-        """Добавляет колонки веток и таблицу branches (миграция v1 → v2).
+        """Добавляет колонки веток и таблицу branches (миграция v1 → v3).
 
         Каждый шаг идемпотентен и не роняет приложение: при сбое отдельного
         DDL-оператора схема просто остаётся прежней, а хранилище продолжает
@@ -728,11 +842,29 @@ class ContextStore:
                 "Не удалось проставить принадлежность старых сообщений: %s", exc
             )
 
-    def _has_v2_schema(self, conn: sqlite3.Connection) -> bool:
-        """True, если доступны и таблица веток, и колонки принадлежности."""
+    def _upgrade_columns_v3(self, conn: sqlite3.Connection) -> None:
+        """Добавляет колонки закрепления (миграция v2 → v3).
+
+        Идемпотентно: каждая DDL в try/except, при сбое — лог и работа как
+        раньше, без потери данных.
+        """
+        for statement in (
+            "ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE messages ADD COLUMN pin_note TEXT",
+        ):
+            try:
+                conn.execute(statement)
+            except sqlite3.Error as exc:
+                self._log.debug(
+                    "Колонка уже есть или миграция v3 недоступна: %s", exc
+                )
+
+    def _has_v3_schema(self, conn: sqlite3.Connection) -> bool:
+        """True, если доступны таблица веток, колонки принадлежности и pin."""
         return (
             "branches" in self._table_names(conn)
             and self._has_column(conn, "messages", "branch_id")
+            and self._has_column(conn, "messages", "pinned")
         )
 
     def _ensure_root_branch(self, conn: sqlite3.Connection) -> None:

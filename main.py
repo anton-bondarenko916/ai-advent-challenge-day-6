@@ -20,6 +20,7 @@ from src import utils
 from src.agent import DeepSeekAgent
 from src.config import (
     PROJECT_ROOT,
+    get_memory_settings,
     get_prices,
     get_strategy_settings,
     load_config,
@@ -84,6 +85,8 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         encoding_name=str(config.get("TOKENIZER_ENCODING", "cl100k_base")),
     )
     prices = get_prices(config)
+    # Модель памяти (short_term | working | long_term): настройки из конфигурации
+    memory_settings = get_memory_settings(config)
 
     return DeepSeekAgent(
         api_key=config["DEEPSEEK_API_KEY"],
@@ -100,6 +103,7 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         # (summary) не входит в него и оставлена для обратной совместимости.
         strategy=strategy_settings["name"],
         strategy_settings=strategy_settings,
+        memory_settings=memory_settings,
     )
 
 
