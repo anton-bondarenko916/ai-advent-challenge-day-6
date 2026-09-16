@@ -100,8 +100,14 @@ class ContextStore:
         """True, если файл БД уже создан на диске."""
         return self.db_path.exists()
 
-    def load_state(self) -> Optional[Dict[str, Any]]:
+    def load_state(self,
+                   profile_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Загружает диалог активной ветки, параметры, статистику и артефакты.
+
+        Args:
+            profile_id: если задан и в таблице messages есть колонка
+                ``profile_id``, загружаются только сообщения этого профиля
+                (изоляция истории по профилям). None — старое поведение.
 
         Returns:
             Словарь {"messages", "params", "stats", "summary", "facts",
@@ -130,18 +136,30 @@ class ContextStore:
                 if active_branch is None and has_v2:
                     active_branch = ROOT_BRANCH_ID
 
+                use_profile = (
+                    profile_id is not None
+                    and self._has_column(conn, "messages", "profile_id")
+                )
+                profile_filter = (
+                    " AND profile_id = ?" if use_profile else ""
+                )
+                extra_params = (
+                    (int(profile_id),) if use_profile else ()
+                )
                 if has_v2:
                     rows = conn.execute(
                         "SELECT role, content, pinned, pin_note FROM messages "
-                        "WHERE branch_id = ? "
+                        "WHERE branch_id = ?" + profile_filter + " "
                         "ORDER BY COALESCE(seq, id), id",
                         (active_branch if active_branch is not None
-                         else ROOT_BRANCH_ID,),
+                         else ROOT_BRANCH_ID,) + extra_params,
                     ).fetchall()
                 else:
                     rows = conn.execute(
                         "SELECT role, content, pinned, pin_note "
-                        "FROM messages ORDER BY id"
+                        "FROM messages WHERE 1 = 1" + profile_filter +
+                        " ORDER BY id",
+                        extra_params,
                     ).fetchall()
                 if not rows:
                     return None
@@ -182,7 +200,8 @@ class ContextStore:
                    branch_id: Optional[int] = None,
                    facts: Optional[Dict[str, Any]] = None,
                    pinned: Optional[Dict[int, Optional[str]]] = None,
-                   working: Optional[Dict[str, Any]] = None) -> bool:
+                   working: Optional[Dict[str, Any]] = None,
+                   profile_id: Optional[int] = None) -> bool:
         """Перезаписывает сообщения ветки и параметры в одной транзакции.
 
         Полная перезапись сообщений ветки (≤ 50–60 строк) надёжнее точечных
@@ -202,6 +221,11 @@ class ContextStore:
                 или список индексов; None — закреплений нет (нули).
             working: рабочая память; None — не изменять сохранённую,
                 {} — явно стереть.
+            profile_id: профиль-владелец сообщений. Если задан и в таблице
+                messages есть колонка ``profile_id``, перезаписываются
+                только сообщения этой пары (ветка, профиль) — истории
+                других профилей в той же ветке не трогаются, а сообщениям
+                проставляется ``profile_id``.
 
         Returns:
             True при успехе, False при ошибке БД (ошибка залогирована).
@@ -227,6 +251,10 @@ class ContextStore:
             self._prepare_disk()
             with self._session() as conn:
                 has_v2 = self._ensure_schema(conn) == SCHEMA_VERSION
+                has_profile_col = self._has_column(
+                    conn, "messages", "profile_id"
+                )
+                use_profile = profile_id is not None and has_profile_col
                 now = datetime.now().isoformat(timespec="seconds")
                 target = branch_id
                 if target is None:
@@ -236,37 +264,78 @@ class ContextStore:
                 target = int(target)
 
                 if has_v2:
-                    conn.execute(
-                        "DELETE FROM messages WHERE branch_id = ?", (target,)
-                    )
-                    conn.executemany(
-                        "INSERT INTO messages(role, content, created_at, "
-                        "branch_id, seq, pinned, pin_note) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        [
-                            (m.get("role", ""), m.get("content", ""), now, target,
-                             index,
-                             1 if (index - 1) in pin_map else 0,
-                             pin_map.get(index - 1))
-                            for index, m in enumerate(messages)
-                        ],
-                    )
+                    if use_profile:
+                        conn.execute(
+                            "DELETE FROM messages "
+                            "WHERE branch_id = ? AND profile_id = ?",
+                            (target, int(profile_id)),
+                        )
+                    else:
+                        conn.execute(
+                            "DELETE FROM messages WHERE branch_id = ?",
+                            (target,),
+                        )
+                    if use_profile:
+                        conn.executemany(
+                            "INSERT INTO messages(role, content, created_at, "
+                            "branch_id, seq, pinned, pin_note, profile_id) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                (m.get("role", ""), m.get("content", ""), now,
+                                 target, index,
+                                 1 if (index - 1) in pin_map else 0,
+                                 pin_map.get(index - 1), int(profile_id))
+                                for index, m in enumerate(messages)
+                            ],
+                        )
+                    else:
+                        conn.executemany(
+                            "INSERT INTO messages(role, content, created_at, "
+                            "branch_id, seq, pinned, pin_note) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                (m.get("role", ""), m.get("content", ""), now, target,
+                                 index,
+                                 1 if (index - 1) in pin_map else 0,
+                                 pin_map.get(index - 1))
+                                for index, m in enumerate(messages)
+                            ],
+                        )
                     conn.execute(
                         "UPDATE branches SET updated_at = ? WHERE id = ?",
                         (now, target),
                     )
                 else:
-                    conn.execute("DELETE FROM messages")
-                    conn.executemany(
-                        "INSERT INTO messages(role, content, created_at, "
-                        "pinned, pin_note) VALUES (?, ?, ?, ?, ?)",
-                        [
-                            (m.get("role", ""), m.get("content", ""), now,
-                             1 if (index - 1) in pin_map else 0,
-                             pin_map.get(index - 1))
-                            for index, m in enumerate(messages)
-                        ],
-                    )
+                    if use_profile:
+                        conn.execute(
+                            "DELETE FROM messages WHERE profile_id = ?",
+                            (int(profile_id),),
+                        )
+                    else:
+                        conn.execute("DELETE FROM messages")
+                    if use_profile:
+                        conn.executemany(
+                            "INSERT INTO messages(role, content, created_at, "
+                            "pinned, pin_note, profile_id) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            [
+                                (m.get("role", ""), m.get("content", ""), now,
+                                 1 if (index - 1) in pin_map else 0,
+                                 pin_map.get(index - 1), int(profile_id))
+                                for index, m in enumerate(messages)
+                            ],
+                        )
+                    else:
+                        conn.executemany(
+                            "INSERT INTO messages(role, content, created_at, "
+                            "pinned, pin_note) VALUES (?, ?, ?, ?, ?)",
+                            [
+                                (m.get("role", ""), m.get("content", ""), now,
+                                 1 if (index - 1) in pin_map else 0,
+                                 pin_map.get(index - 1))
+                                for index, m in enumerate(messages)
+                            ],
+                        )
 
                 self._write_meta(
                     conn, _KEY_PARAMS, json.dumps(params, ensure_ascii=False)

@@ -24,6 +24,11 @@
   независимых веток диалога от одной точки (checkpoint/развилка);
 - поддерживает блок фактов (key → value): факты обновляются после каждого хода
   и отправляются отдельным system-сообщением вместе с последними N сообщениями;
+- поддерживает персонализацию через профиль пользователя (ProfileRepository):
+  системный промпт собирается из активного профиля, настройки агента
+  (модель/temperature/max_tokens) привязаны к профилю, история диалога
+  изолирована по профилям (messages.profile_id) и переключается вместе
+  с профилем без потери;
 - сохраняет совместимость со старым режимом сжатия в конспект (summary):
   он работает только если настройки summary переданы явно, а стратегия не задана.
 """
@@ -57,6 +62,9 @@ from .memory import (
     WorkingMemory,
     normalize_layer,
 )
+from .models import ProfileAgentSettings, UserProfile
+from .profile_prompt_builder import build_system_prompt
+from .profile_repository import ProfileRepository
 from .storage import ContextStore
 from .strategies import (
     AVAILABLE_STRATEGIES,
@@ -127,6 +135,8 @@ class DeepSeekAgent:
         memory_settings: Optional[Dict[str, Any]] = None,
         memory_manager: Optional[MemoryManager] = None,
         long_memory: Optional[LongTermStore] = None,
+        profile_repository: Optional[ProfileRepository] = None,
+        profile_id: Optional[int] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -166,6 +176,10 @@ class DeepSeekAgent:
             memory_manager: готовый менеджер памяти (для тестов); None — создать.
             long_memory: готовое хранилище долговременной памяти (для тестов);
                 None — создать из настроек (не создаётся в mock-режиме).
+            profile_repository: репозиторий профилей (персонализация); None —
+                агент работает без профилей, поведение как раньше.
+            profile_id: профиль для активации; None — активный профиль из
+                репозитория (is_active=1, обычно Default после миграции).
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -177,6 +191,35 @@ class DeepSeekAgent:
         )
         self.temperature = temperature if temperature is not None else 0.7
         self.max_tokens = max_tokens if max_tokens is not None else 1000
+
+        # Персонализация: репозиторий профилей, активный профиль и его
+        # настройки. Параметры из конструктора перекрываются настройками
+        # профиля (model/temperature/max_tokens из profile_agent_settings),
+        # а системный промпт собирается из профиля (build_system_prompt).
+        # Кэш историй позволяет переключать профили без потери диалогов.
+        self._profile_repo: Optional[ProfileRepository] = profile_repository
+        self._profile: Optional[UserProfile] = None
+        self._profile_settings: Optional[ProfileAgentSettings] = None
+        self._profile_histories: Dict[int, Dict[str, Any]] = {}
+        if self._profile_repo is not None:
+            profile = (
+                self._profile_repo.get_by_id(int(profile_id))
+                if profile_id is not None
+                else self._profile_repo.get_active()
+            )
+            if profile_id is not None and profile is None:
+                raise AgentConfigError(
+                    f"Профиль id={profile_id} не найден в репозитории."
+                )
+            if profile is not None:
+                self._profile = profile
+                self._profile_settings = self._profile_repo.get_settings(
+                    profile.id
+                )
+                self._apply_profile_settings()
+                self.system_prompt = build_system_prompt(
+                    self._profile, self._profile_settings
+                )
 
         # Проверяем параметры ДО создания клиента
         self._validate_parameters()
@@ -296,6 +339,20 @@ class DeepSeekAgent:
         if not self._mock_mode:
             self._load_context()
 
+        # Профиль перекрывает параметры, восстановленные из хранилища:
+        # источник истины для модели/промпта — настройки активного профиля.
+        if self._profile_repo is not None and self._profile is not None:
+            self._apply_profile_settings()
+            prompt = build_system_prompt(self._profile, self._profile_settings)
+            self.system_prompt = prompt
+            if (self._message_history
+                    and self._message_history[0].get("role") == "system"):
+                self._message_history[0]["content"] = prompt
+            else:
+                self._message_history.insert(
+                    0, {"role": "system", "content": prompt}
+                )
+
     # ------------------------------------------------------------------
     # Публичное API
     # ------------------------------------------------------------------
@@ -335,6 +392,10 @@ class DeepSeekAgent:
             return self._error_result("Пустое сообщение.")
 
         with self._lock:
+            # Профиль мог измениться в БД (редактирование профиля или его
+            # настроек в UI): перечитываем его и обновляем system-сообщение
+            # в позиции [0] — без очистки истории.
+            self._refresh_profile_locked()
             # Сжатие старой части диалога выполняется ДО добавления нового
             # сообщения, чтобы границы блока всегда совпадали с парами
             # «вопрос-ответ» и в запрос уходили ровно последние N сообщений.
@@ -523,6 +584,258 @@ class DeepSeekAgent:
                 elif any(k in kwargs for k in
                          ("model", "temperature", "max_tokens")):
                     self._persist_params()
+
+    # ------------------------------------------------------------------
+    # Персонализация: профиль пользователя (третий слой памяти)
+    # ------------------------------------------------------------------
+
+    @property
+    def profile_repository(self) -> Optional[ProfileRepository]:
+        """Репозиторий профилей (None — агент работает без персонализации)."""
+        return self._profile_repo
+
+    @property
+    def profile(self) -> Optional[UserProfile]:
+        """Активный профиль пользователя (None — персонализация выключена)."""
+        with self._lock:
+            return self._profile
+
+    @property
+    def profile_settings(self) -> Optional[ProfileAgentSettings]:
+        """Настройки агента активного профиля (None — без персонализации)."""
+        with self._lock:
+            return self._profile_settings
+
+    def _active_profile_id(self) -> Optional[int]:
+        """Идентификатор активного профиля (None — без персонализации)."""
+        return self._profile.id if self._profile is not None else None
+
+    def _apply_profile_settings(self) -> None:
+        """Применяет настройки профиля к параметрам агента (с валидацией).
+
+        Некорректные значения в БД не роняют агента: параметр игнорируется
+        с предупреждением в логе. Суммаризатор и стратегия следуют за
+        моделью (как в :meth:`update_config`).
+        """
+        settings = self._profile_settings
+        if settings is None:
+            return
+        try:
+            self.model = utils.validate_model(settings.model)
+        except AgentConfigError as exc:
+            logger.warning(
+                "Профиль: некорректная модель %r (%s) — оставлено %s.",
+                settings.model, exc, self.model,
+            )
+        try:
+            self.temperature = utils.validate_temperature(settings.temperature)
+        except (AgentConfigError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Профиль: некорректная temperature=%r (%s) — оставлено %s.",
+                settings.temperature, exc, self.temperature,
+            )
+        try:
+            self.max_tokens = utils.validate_max_tokens(settings.max_tokens)
+        except (AgentConfigError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Профиль: некорректный max_tokens=%r (%s) — оставлено %s.",
+                settings.max_tokens, exc, self.max_tokens,
+            )
+        # Суммаризатор следует за моделью диалога (если нет отдельной)
+        if (getattr(self, "_summarizer", None) is not None
+                and not str((self._summary_settings or {}).get("model") or "")):
+            self._summarizer.model = self.model
+        # Стратегия получает модель как зависимость (служебные запросы)
+        if getattr(self, "_strategy", None) is not None:
+            self._strategy = self._make_strategy()
+
+    def _replace_system_message(self, prompt: str) -> None:
+        """Заменяет system-сообщение в позиции [0], не создавая дубликатов."""
+        if (self._message_history
+                and self._message_history[0].get("role") == "system"):
+            self._message_history[0]["content"] = prompt
+        else:
+            self._message_history.insert(
+                0, {"role": "system", "content": prompt}
+            )
+
+    def _refresh_profile_locked(self) -> None:
+        """Перечитывает профиль из БД и обновляет промпт (вызов под lock).
+
+        Вызывается в начале каждого :meth:`send_message`: если профиль или
+        его настройки были изменены (UI, другой процесс), новый
+        system-промпт и параметры применяются к текущему запросу без
+        перезапуска. История диалога при этом не очищается.
+        """
+        if self._profile_repo is None or self._profile is None:
+            return
+        profile = self._profile_repo.get_by_id(self._profile.id)
+        if profile is None:
+            # Профиль удалён извне — пробуем переключиться на активный
+            active = self._profile_repo.get_active()
+            if active is not None and active.id != self._profile.id:
+                self.set_profile(active.id)
+            return
+        self._profile = profile
+        self._profile_settings = self._profile_repo.get_settings(profile.id)
+        self._apply_profile_settings()
+        prompt = build_system_prompt(self._profile, self._profile_settings)
+        self.system_prompt = prompt
+        self._replace_system_message(prompt)
+
+    def refresh_profile(self) -> Dict[str, Any]:
+        """Публичная перечитка профиля (редактирование профиля в UI).
+
+        Загружает профиль и его настройки из БД заново, применяет параметры
+        (модель/temperature/max_tokens) и пересобирает системный промпт,
+        заменяя system-сообщение в позиции [0] без очистки истории.
+
+        Returns:
+            ``{"profile", "settings", "error"}``.
+        """
+        with self._lock:
+            if self._profile_repo is None:
+                return {
+                    "profile": None,
+                    "settings": None,
+                    "error": "Профили не подключены (нет ProfileRepository).",
+                }
+            if self._profile is None:
+                active = self._profile_repo.get_active()
+                if active is not None:
+                    return self.set_profile(active.id)
+                return {"profile": None, "settings": None, "error": None}
+            before = self._profile.id
+            self._refresh_profile_locked()
+            if self._profile is None or self._profile.id != before:
+                return {
+                    "profile": self._profile,
+                    "settings": self._profile_settings,
+                    "error": "Активный профиль был удалён.",
+                }
+            return {
+                "profile": self._profile,
+                "settings": self._profile_settings,
+                "error": None,
+            }
+
+    def set_profile(self, profile_id: int) -> Dict[str, Any]:
+        """Переключается на другой профиль (история не очищается — меняется).
+
+        Порядок действий:
+        1. текущая история/конспект/факты кэшируются за активным профилем
+           и сохраняются на диск (с его ``profile_id``);
+        2. загружаются целевой профиль и его настройки, применяются
+           параметры (модель/temperature/max_tokens);
+        3. восстанавливается история целевого профиля: из кэша этой сессии,
+           либо из БД (сообщения с его ``profile_id``), либо пустая.
+
+        Args:
+            profile_id: идентификатор целевого профиля.
+
+        Returns:
+            ``{"profile", "settings", "error"}``.
+        """
+        with self._lock:
+            if self._profile_repo is None:
+                return {
+                    "profile": None,
+                    "settings": None,
+                    "error": "Профили не подключены (нет ProfileRepository).",
+                }
+            profile = self._profile_repo.get_by_id(int(profile_id))
+            if profile is None:
+                return {
+                    "profile": None,
+                    "settings": None,
+                    "error": f"Профиль id={profile_id} не найден.",
+                }
+            if self._profile is not None and profile.id == self._profile.id:
+                return {
+                    "profile": self._profile,
+                    "settings": self._profile_settings,
+                    "error": None,
+                }
+
+            # 1. Кэшируем и сохраняем состояние текущего профиля
+            current_id = self._active_profile_id()
+            if current_id is not None:
+                self._profile_histories[current_id] = {
+                    "messages": [dict(m) for m in self._message_history],
+                    "summary": dict(self._summary) if self._summary else None,
+                    "facts": self._facts_store.as_dict(),
+                }
+            self._persist()  # пишет сообщения с profile_id текущего профиля
+
+            # 2. Переключаем профиль и применяем его настройки
+            self._profile = profile
+            self._profile_settings = self._profile_repo.get_settings(profile.id)
+            self._apply_profile_settings()
+            # Активный профиль фиксируется в БД: при следующем запуске
+            # приложение восстановит последний использованный профиль.
+            self._profile_repo.set_active(profile.id)
+            prompt = build_system_prompt(self._profile, self._profile_settings)
+            self.system_prompt = prompt
+
+            # Артефакты диалога (конспект, факты, закрепления) относятся
+            # к истории конкретного профиля — сбрасываем перед загрузкой.
+            self._summary = None
+            self._last_summary_error = None
+            self._facts_store = self._new_facts_store({})
+            self._facts = self._facts_store.data
+            self._facts_error = None
+            self._facts_updated_at = None
+            self._memory_manager.pins.clear()
+
+            # 3. История целевого профиля: кэш → БД → пустая
+            cached = self._profile_histories.pop(profile.id, None)
+            messages_loaded = False
+            if cached is not None:
+                self._message_history = [
+                    dict(m) for m in cached.get("messages") or []
+                ]
+                if cached.get("summary"):
+                    self._restore_summary(cached["summary"])
+                if cached.get("facts"):
+                    self._facts_store = self._new_facts_store(cached["facts"])
+                    self._facts = self._facts_store.data
+                messages_loaded = True
+            elif not self._mock_mode and self._storage is not None:
+                try:
+                    state = self._storage.load_state(profile_id=profile.id)
+                except Exception as exc:
+                    logger.warning(
+                        "Не удалось загрузить историю профиля id=%s: %s",
+                        profile.id, exc,
+                    )
+                    state = None
+                if state and state.get("messages"):
+                    self._message_history = [
+                        {"role": str(m.get("role", "")),
+                         "content": str(m.get("content", ""))}
+                        for m in state["messages"]
+                    ]
+                    messages_loaded = True
+            if not messages_loaded:
+                self._message_history = []
+
+            # Ровно одно system-сообщение в позиции [0] — собранный промпт
+            self._replace_system_message(prompt)
+            if self._trimming_active():
+                self._trim_history()
+
+            self._persist()
+            logger.info(
+                "Профиль переключён: %r (id=%s), модель=%s, "
+                "сообщений в истории: %d.",
+                profile.name, profile.id, self.model,
+                max(0, len(self._message_history) - 1),
+            )
+            return {
+                "profile": self._profile,
+                "settings": self._profile_settings,
+                "error": None,
+            }
 
     def close(self) -> None:
         """Закрывает агента: финальный flush контекста и хранилища.
@@ -933,6 +1246,9 @@ class DeepSeekAgent:
                 pinned=self._memory_manager.pins,
                 working=self._memory_manager.working.as_dict()
                 if self._memory_enabled else None,
+                # Сообщения пишутся с profile_id: история изолирована
+                # по профилям (другие профили той же ветки не трогаются)
+                profile_id=self._active_profile_id(),
             )
         except Exception as exc:
             logger.error("Не удалось сохранить контекст: %s", exc)
@@ -957,7 +1273,9 @@ class DeepSeekAgent:
         if self._storage is None:
             return
         try:
-            state = self._storage.load_state()
+            state = self._storage.load_state(
+                profile_id=self._active_profile_id()
+            )
         except Exception as exc:  # хранилище не должно ронять запуск
             logger.warning("Не удалось прочитать сохранённый контекст: %s", exc)
             return

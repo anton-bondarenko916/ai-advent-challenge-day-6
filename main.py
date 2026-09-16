@@ -27,6 +27,7 @@ from src.config import (
     validate_api_key,
 )
 from src.storage import ContextStore
+from src.profile_repository import ProfileRepository
 from src.tokens import create_counter
 from src.utils import AgentConfigError, get_logger
 
@@ -78,6 +79,17 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
             default_strategy=str(strategy_settings["branch_strategy"]),
         )
 
+    # Персонализация: репозиторий профилей (SQLite, тот же файл БД, что и
+    # у хранилища контекста). Миграция выполняется в конструкторе: создаёт
+    # таблицы profiles/profile_agent_settings, колонку messages.profile_id
+    # и профиль Default с настройками из .env (лог — migration.log).
+    profile_repository = None
+    if storage is not None:
+        profile_repository = ProfileRepository(
+            db_path=storage.db_path,
+            config=config,
+        )
+
     # Счётчик токенов и цены: tiktoken при наличии, иначе встроенная эвристика
     token_counter = create_counter(
         model=config["DEFAULT_MODEL"],
@@ -104,6 +116,9 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         strategy=strategy_settings["name"],
         strategy_settings=strategy_settings,
         memory_settings=memory_settings,
+        # Персонализация: активный профиль подставляется в каждый запрос,
+        # а его настройки перекрывают DEFAULT_* из .env
+        profile_repository=profile_repository,
     )
 
 

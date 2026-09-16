@@ -12,9 +12,10 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
@@ -22,6 +23,7 @@ from tkinter import messagebox, simpledialog, ttk
 from . import utils
 from .agent import DeepSeekAgent
 from .config import get_config
+from .models import ProfileAgentSettings, UserProfile
 
 # ---------------------------------------------------------------------------
 # Константы оформления
@@ -148,6 +150,8 @@ class ChatApplication:
         self._apply_config_to_controls()
         self._refresh_chat()
         self._set_initial_status()
+        # Персонализация: заполняем переключатель профиля и статус-бар
+        self._update_profile_status()
         # Показываем статистику токенов (в т.ч. восстановленную сессию)
         self._update_token_stats()
         self._set_info(self._token_context_text())
@@ -204,9 +208,18 @@ class ChatApplication:
         )
         self.clear_top_btn.pack(side="right", padx=10, pady=6)
 
-        # ---- 2. Область чата (растягивается) ----
-        chat_wrap = tk.Frame(root, bg=COLORS["bg"])
-        chat_wrap.pack(fill="both", expand=True, padx=8, pady=(4, 4))
+        # ---- 2. Вкладки: Чат / Профиль / Настройки агента ----
+        # Вкладка «Чат» содержит область чата; «Профиль» — управление
+        # профилями пользователя; «Настройки агента» — параметры, привязанные
+        # к активному профилю. Панель ввода и статус-бар остаются общими.
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=(4, 0))
+
+        chat_tab = tk.Frame(self.notebook, bg=COLORS["bg"])
+        self.notebook.add(chat_tab, text="Чат")
+
+        chat_wrap = tk.Frame(chat_tab, bg=COLORS["bg"])
+        chat_wrap.pack(fill="both", expand=True, pady=(4, 4))
 
         self.chat = tk.Text(
             chat_wrap,
@@ -252,6 +265,10 @@ class ChatApplication:
             label="Показать, что сохранено об этом сообщении",
             command=self._on_menu_show_saved,
         )
+
+        # ---- 2б. Вкладки «Профиль» и «Настройки агента» ----
+        self._build_profile_tab()
+        self._build_agent_settings_tab()
 
         # ---- 3. Панель параметров (186 px: модель/темп/токены, промпт, стратегия, статистика) ----
         self.params_bar = tk.Frame(
@@ -350,11 +367,35 @@ class ChatApplication:
         )
         self.status_label.pack(side="left", padx=10)
 
+        # Персонализация: быстрый переключатель активного профиля
+        tk.Label(
+            self.status_bar, text="Профиль:", bg=COLORS["status_bg"],
+            fg=COLORS["status_fg"], font=FONTS["status"],
+        ).pack(side="left")
+        self.profile_switch_var = tk.StringVar()
+        self.profile_switch = ttk.Combobox(
+            self.status_bar,
+            textvariable=self.profile_switch_var,
+            state="readonly",
+            width=16,
+        )
+        self.profile_switch.pack(side="left", padx=(4, 10), pady=4)
+        self.profile_switch.bind(
+            "<<ComboboxSelected>>", self._on_status_profile_switch
+        )
+
         self.info_label = tk.Label(
             self.status_bar, text="", bg=COLORS["status_bg"],
             fg=COLORS["status_fg"], font=FONTS["status"], anchor="e",
         )
         self.info_label.pack(side="right", padx=10)
+
+        # Персонализация: активный профиль · модель · temperature
+        self.profile_info_label = tk.Label(
+            self.status_bar, text="", bg=COLORS["status_bg"],
+            fg=COLORS["status_fg"], font=FONTS["status"], anchor="e",
+        )
+        self.profile_info_label.pack(side="right", padx=10)
 
     def _build_params_widgets(self) -> None:
         """Строит содержимое панели параметров (2 ряда)."""
@@ -543,6 +584,595 @@ class ChatApplication:
             font=FONTS["small"], fg=COLORS["muted"],
         )
         self.token_counter_label.pack(side="right")
+
+    # ------------------------------------------------------------------
+    # Персонализация: вкладка «Профиль»
+    # ------------------------------------------------------------------
+
+    def _profile_repo(self):
+        """Репозиторий профилей агента (None — персонализация выключена)."""
+        return getattr(self.agent, "profile_repository", None)
+
+    def _build_profile_tab(self) -> None:
+        """Строит вкладку «Профиль»: список профилей и форма редактирования.
+
+        Сверху — выпадающий список профилей и кнопки управления; ниже —
+        форма: имя, отображаемое имя, стиль, формат, язык, ограничения
+        (многострочно, по одному в строке) и контекст (многострочно,
+        строки вида ``ключ: значение``).
+        """
+        tab = tk.Frame(self.notebook, bg=COLORS["bg"])
+        self.notebook.add(tab, text="Профиль")
+
+        # --- Верхняя строка: выбор профиля и кнопки управления ---
+        top = tk.Frame(tab, bg=COLORS["bg"])
+        top.pack(fill="x", padx=10, pady=(10, 4))
+
+        tk.Label(
+            top, text="Профиль:", bg=COLORS["bg"], font=FONTS["default"]
+        ).pack(side="left")
+
+        self.profile_var = tk.StringVar()
+        self.profile_combo = ttk.Combobox(
+            top,
+            textvariable=self.profile_var,
+            state="readonly",
+            width=24,
+        )
+        self.profile_combo.pack(side="left", padx=(4, 12))
+        self.profile_combo.bind(
+            "<<ComboboxSelected>>", self._on_profile_form_selected
+        )
+
+        self.profile_new_btn = self._make_button(
+            top, "Новый", self._on_profile_new, small=True
+        )
+        self.profile_new_btn.pack(side="left", padx=(0, 6))
+
+        self.profile_save_btn = self._make_button(
+            top, "Сохранить", self._on_profile_save, small=True
+        )
+        self.profile_save_btn.pack(side="left", padx=(0, 6))
+
+        self.profile_delete_btn = self._make_button(
+            top, "Удалить", self._on_profile_delete, small=True
+        )
+        self.profile_delete_btn.pack(side="left", padx=(0, 6))
+
+        self.profile_activate_btn = self._make_button(
+            top, "Сделать активным", self._on_profile_activate, small=True
+        )
+        self.profile_activate_btn.pack(side="left")
+
+        # --- Форма редактирования профиля ---
+        form = tk.LabelFrame(
+            tab, text="Редактирование профиля", bg=COLORS["bg"],
+            font=FONTS["default"], fg=COLORS["text"],
+        )
+        form.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+
+        def _entry_row(label: str) -> tk.Entry:
+            """Строка формы: подпись + однострочное поле."""
+            row = tk.Frame(form, bg=COLORS["bg"])
+            row.pack(fill="x", padx=8, pady=(6, 0))
+            tk.Label(
+                row, text=label, bg=COLORS["bg"], font=FONTS["default"],
+                width=18, anchor="w",
+            ).pack(side="left")
+            entry = tk.Entry(
+                row, bg=COLORS["input_bg"], font=FONTS["default"],
+                relief="solid", bd=1,
+            )
+            entry.pack(side="left", fill="x", expand=True)
+            return entry
+
+        self.profile_name_entry = _entry_row("Имя профиля:")
+        self.profile_display_entry = _entry_row("Отображаемое имя:")
+        self.profile_style_entry = _entry_row("Стиль:")
+        self.profile_format_entry = _entry_row("Формат:")
+        self.profile_language_entry = _entry_row("Язык:")
+
+        def _text_row(label: str, height: int) -> tk.Text:
+            """Строка формы: подпись + многострочное поле."""
+            row = tk.Frame(form, bg=COLORS["bg"])
+            row.pack(fill="both", expand=True, padx=8, pady=(6, 0))
+            tk.Label(
+                row, text=label, bg=COLORS["bg"], font=FONTS["default"],
+                width=18, anchor="n",
+            ).pack(side="left")
+            text = tk.Text(
+                row, height=height, wrap="word", bg=COLORS["input_bg"],
+                fg=COLORS["text"], font=FONTS["default"], relief="solid",
+                bd=1, undo=True,
+            )
+            text.pack(side="left", fill="both", expand=True)
+            return text
+
+        self.profile_constraints_text = _text_row(
+            "Ограничения\n(по одному\nв строке):", 4
+        )
+        self.profile_context_text = _text_row(
+            "Контекст\n(ключ: значение):", 4
+        )
+
+        self._profile_form_id: Optional[int] = None
+        self._refresh_profile_tab()
+
+    # ------------------------------------------------------------------
+    # Персонализация: вкладка «Настройки агента»
+    # ------------------------------------------------------------------
+
+    def _build_agent_settings_tab(self) -> None:
+        """Строит вкладку «Настройки агента», привязанные к активному профилю.
+
+        Модель, temperature, max_tokens и базовый системный промпт
+        редактируются здесь и сохраняются в ``profile_agent_settings``.
+        """
+        tab = tk.Frame(self.notebook, bg=COLORS["bg"])
+        self.notebook.add(tab, text="Настройки агента")
+
+        header = tk.Label(
+            tab,
+            text="Настройки привязаны к активному профилю",
+            bg=COLORS["bg"], font=FONTS["header"], fg=COLORS["muted"],
+        )
+        header.pack(anchor="w", padx=10, pady=(10, 2))
+
+        # --- Модель ---
+        model_row = tk.Frame(tab, bg=COLORS["bg"])
+        model_row.pack(fill="x", padx=10, pady=(6, 0))
+        tk.Label(
+            model_row, text="Модель:", bg=COLORS["bg"], font=FONTS["default"]
+        ).pack(side="left")
+        self.profile_model_var = tk.StringVar()
+        self.profile_model_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.profile_model_var,
+            values=list(utils.AVAILABLE_MODELS),
+            state="readonly",
+            width=24,
+        )
+        self.profile_model_combo.pack(side="left", padx=(8, 0))
+
+        # --- Температура ---
+        temp_row = tk.Frame(tab, bg=COLORS["bg"])
+        temp_row.pack(fill="x", padx=10, pady=(8, 0))
+        tk.Label(
+            temp_row, text="Temperature:", bg=COLORS["bg"],
+            font=FONTS["default"],
+        ).pack(side="left")
+        self.profile_temp_var = tk.DoubleVar(value=0.7)
+        self.profile_temp_scale = tk.Scale(
+            temp_row,
+            from_=TEMP_MIN,
+            to=TEMP_MAX,
+            resolution=0.1,
+            orient="horizontal",
+            variable=self.profile_temp_var,
+            length=220,
+            showvalue=False,
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            highlightthickness=0,
+            troughcolor="#D0D0D0",
+            command=lambda _v: self._update_profile_temp_label(),
+        )
+        self.profile_temp_scale.pack(side="left", padx=(8, 4))
+        self.profile_temp_label = tk.Label(
+            temp_row, text="0.7", width=4, bg=COLORS["bg"],
+            font=FONTS["default"], fg=COLORS["text"],
+        )
+        self.profile_temp_label.pack(side="left")
+
+        # --- Max tokens ---
+        tokens_row = tk.Frame(tab, bg=COLORS["bg"])
+        tokens_row.pack(fill="x", padx=10, pady=(8, 0))
+        tk.Label(
+            tokens_row, text="Max tokens:", bg=COLORS["bg"],
+            font=FONTS["default"],
+        ).pack(side="left")
+        self.profile_tokens_var = tk.StringVar(value="1000")
+        self.profile_tokens_spin = tk.Spinbox(
+            tokens_row,
+            from_=TOKENS_MIN,
+            to=TOKENS_MAX,
+            increment=50,
+            textvariable=self.profile_tokens_var,
+            width=7,
+            font=FONTS["default"],
+        )
+        self.profile_tokens_spin.pack(side="left", padx=(8, 0))
+
+        # --- Базовый системный промпт ---
+        prompt_row = tk.Frame(tab, bg=COLORS["bg"])
+        prompt_row.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+        tk.Label(
+            prompt_row, text="Base system prompt:", bg=COLORS["bg"],
+            font=FONTS["default"], anchor="n",
+        ).pack(side="left", anchor="n")
+        self.profile_prompt_text = tk.Text(
+            prompt_row, height=8, wrap="word", bg=COLORS["input_bg"],
+            fg=COLORS["text"], font=FONTS["default"], relief="solid",
+            bd=1, undo=True,
+        )
+        self.profile_prompt_text.pack(
+            side="left", fill="both", expand=True, padx=(8, 0)
+        )
+
+        # --- Сохранение ---
+        save_row = tk.Frame(tab, bg=COLORS["bg"])
+        save_row.pack(fill="x", padx=10, pady=(8, 10))
+        self.profile_settings_save_btn = self._make_button(
+            save_row, "Сохранить настройки", self._on_profile_settings_save
+        )
+        self.profile_settings_save_btn.pack(side="left")
+
+        self._refresh_agent_settings_tab()
+
+    # ------------------------------------------------------------------
+    # Персонализация: работа с профилями (форма, переключение, статус)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_constraints_text(text: str) -> List[str]:
+        """Каждая непустая строка Text-поля формы — отдельное ограничение."""
+        return [line.strip() for line in (text or "").splitlines()
+                if line.strip()]
+
+    @staticmethod
+    def _parse_context_text(text: str) -> Dict[str, Any]:
+        """Каждая строка формы вида ``ключ: значение`` — пара контекста.
+
+        Значение пытается приводиться к JSON-типу (числа, списки,
+        true/false); не удалось — остаётся строкой. Строки без ``:``
+        пропускаются (это ограничения, а не контекст).
+        """
+        context: Dict[str, Any] = {}
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            key, sep, value = line.partition(":")
+            if not sep or not key.strip():
+                continue
+            try:
+                context[key.strip()] = json.loads(value.strip())
+            except ValueError:
+                context[key.strip()] = value.strip()
+        return context
+
+    def _refresh_profile_tab(self, select_id: Optional[int] = None) -> None:
+        """Перечитывает профили из БД и заполняет список и форму.
+
+        Args:
+            select_id: профиль, который нужно выбрать (после сохранения);
+                None — оставить текущий выбор или взять активный профиль.
+        """
+        repo = self._profile_repo()
+        profiles: List[UserProfile] = repo.get_all() if repo is not None else []
+        self._profiles_by_name = {p.name: p for p in profiles}
+        names = [p.name for p in profiles]
+        try:
+            self.profile_combo.configure(values=names)
+        except tk.TclError:
+            return
+
+        if repo is None:
+            for widget in (self.profile_new_btn, self.profile_save_btn,
+                           self.profile_delete_btn, self.profile_activate_btn):
+                widget.configure(state="disabled")
+            self.profile_combo.configure(state="disabled")
+
+        chosen: Optional[UserProfile] = None
+        wanted = select_id if select_id is not None else self._profile_form_id
+        if wanted is not None:
+            chosen = next((p for p in profiles if p.id == wanted), None)
+        if chosen is None:
+            chosen = self.agent.profile or (profiles[0] if profiles else None)
+        if chosen is not None:
+            self.profile_var.set(chosen.name)
+            self._load_profile_into_form(chosen)
+        else:
+            self.profile_var.set("")
+            self._clear_profile_form()
+
+    def _load_profile_into_form(self, profile: UserProfile) -> None:
+        """Заполняет форму редактирования данными профиля."""
+        self._profile_form_id = profile.id
+
+        def _set_entry(entry: tk.Entry, value: str) -> None:
+            entry.delete(0, "end")
+            entry.insert(0, value)
+
+        _set_entry(self.profile_name_entry, profile.name)
+        _set_entry(self.profile_display_entry, profile.display_name)
+        _set_entry(self.profile_style_entry, profile.style)
+        _set_entry(self.profile_format_entry, profile.format)
+        _set_entry(self.profile_language_entry, profile.language or "русский")
+
+        self.profile_constraints_text.delete("1.0", "end")
+        if profile.constraints:
+            self.profile_constraints_text.insert(
+                "1.0", "\n".join(profile.constraints)
+            )
+        self.profile_context_text.delete("1.0", "end")
+        if profile.context:
+            lines = []
+            for key, value in profile.context.items():
+                if isinstance(value, (list, tuple, dict)):
+                    value = json.dumps(value, ensure_ascii=False)
+                lines.append(f"{key}: {value}")
+            self.profile_context_text.insert("1.0", "\n".join(lines))
+
+    def _clear_profile_form(self) -> None:
+        """Очищает форму под создание нового профиля."""
+        self._profile_form_id = None
+        for entry in (self.profile_name_entry, self.profile_display_entry,
+                      self.profile_style_entry, self.profile_format_entry):
+            entry.delete(0, "end")
+        self.profile_language_entry.delete(0, "end")
+        self.profile_language_entry.insert(0, "русский")
+        self.profile_constraints_text.delete("1.0", "end")
+        self.profile_context_text.delete("1.0", "end")
+
+    def _profile_from_form(self) -> UserProfile:
+        """Собирает UserProfile из полей формы (id не проставляется)."""
+        return UserProfile(
+            name=self.profile_name_entry.get().strip(),
+            display_name=self.profile_display_entry.get().strip(),
+            style=self.profile_style_entry.get().strip(),
+            format=self.profile_format_entry.get().strip(),
+            language=self.profile_language_entry.get().strip() or "русский",
+            constraints=self._parse_constraints_text(
+                self.profile_constraints_text.get("1.0", "end-1c")
+            ),
+            context=self._parse_context_text(
+                self.profile_context_text.get("1.0", "end-1c")
+            ),
+        )
+
+    def _on_profile_form_selected(self, _event=None) -> None:
+        """Выбор профиля в списке — загрузка его в форму редактирования."""
+        profile = self._profiles_by_name.get(self.profile_var.get())
+        if profile is not None:
+            self._load_profile_into_form(profile)
+
+    def _on_profile_new(self, _event=None) -> None:
+        """Кнопка «Новый»: очистка формы под создание профиля."""
+        self._clear_profile_form()
+        self._set_status(
+            "Новый профиль: заполните форму и нажмите «Сохранить»."
+        )
+
+    def _on_profile_save(self, _event=None) -> None:
+        """Кнопка «Сохранить»: создание или обновление профиля из формы.
+
+        После сохранения активного профиля агент перечитывает его и
+        перестраивает системный промпт (без очистки истории).
+        """
+        if self._busy:
+            return
+        repo = self._profile_repo()
+        if repo is None:
+            self._set_status("Профили недоступны (нет репозитория).")
+            return
+        profile = self._profile_from_form()
+        if not profile.name:
+            self._set_status("Имя профиля не может быть пустым.")
+            return
+        try:
+            if self._profile_form_id is None:
+                saved = repo.create(profile)
+            else:
+                profile.id = self._profile_form_id
+                saved = repo.update(profile)
+        except ValueError as exc:
+            self._set_status(f"Ошибка: {exc}")
+            return
+        self._refresh_profile_tab(select_id=saved.id)
+        # Редактировали активный профиль — перестраиваем промпт в агенте
+        active = self.agent.profile
+        if active is not None and active.id == saved.id:
+            result = self.agent.refresh_profile()
+            if result.get("error"):
+                self._set_status(f"Ошибка: {result['error']}")
+                return
+            self._apply_config_to_controls()
+        self._update_profile_status()
+        self._set_status(f'Профиль "{saved.name}" сохранён.')
+
+    def _on_profile_delete(self, _event=None) -> None:
+        """Кнопка «Удалить»: подтверждение и каскадное удаление профиля.
+
+        История чата и настройки профиля удаляются вместе с ним; если
+        удалён активный профиль — агент переключается на оставшийся.
+        """
+        if self._busy:
+            return
+        repo = self._profile_repo()
+        profile_id = self._profile_form_id
+        name = self.profile_name_entry.get().strip()
+        if repo is None or profile_id is None:
+            self._set_status("Сначала выберите профиль в списке.")
+            return
+        confirmed = messagebox.askyesno(
+            "Удалить профиль",
+            f'Удалить профиль "{name}"?\n\n'
+            "Будут также удалены его настройки и вся история чата "
+            "этого профиля.",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        # Если удаляем активный профиль — сначала переключаем агента на
+        # другой (иначе агент останется ссылаться на несуществующий id).
+        if self.agent.profile is not None and self.agent.profile.id == profile_id:
+            other = next(
+                (p for p in repo.get_all() if p.id != profile_id), None
+            )
+            if other is not None:
+                self.agent.set_profile(other.id)
+        if not repo.delete(profile_id):
+            self._set_status(
+                "Ошибка: профиль не удалён (последний профиль удалить нельзя)."
+            )
+            return
+        self._refresh_profile_tab()
+        self._refresh_agent_settings_tab()
+        self._apply_profile_change_ui()
+        self._set_status(f'Профиль "{name}" удалён вместе с его историей.')
+
+    def _on_profile_activate(self, _event=None) -> None:
+        """Кнопка «Сделать активным»: переключение агента на профиль из формы."""
+        if self._busy:
+            return
+        repo = self._profile_repo()
+        profile_id = self._profile_form_id
+        if repo is None or profile_id is None:
+            self._set_status("Сначала выберите или сохраните профиль.")
+            return
+        result = self.agent.set_profile(profile_id)
+        if result.get("error"):
+            self._set_status(f"Ошибка: {result['error']}")
+            return
+        self._apply_profile_change_ui()
+        self._set_status(
+            f'Активный профиль: "{result["profile"].name}".'
+        )
+
+    def _on_status_profile_switch(self, _event=None) -> None:
+        """Переключение активного профиля из статус-бара.
+
+        История чата перезагружается под выбранный профиль (у каждого
+        профиля своя), настройки и системный промпт применяются сразу.
+        """
+        if self._busy:
+            self._update_profile_status()
+            self._set_status(
+                "Дождитесь ответа — переключение профиля временно заблокировано."
+            )
+            return
+        repo = self._profile_repo()
+        profile = self._profiles_by_name.get(self.profile_switch_var.get())
+        if repo is None or profile is None:
+            return
+        result = self.agent.set_profile(profile.id)
+        if result.get("error"):
+            self._set_status(f"Ошибка: {result['error']}")
+            self._update_profile_status()
+            return
+        self._apply_profile_change_ui()
+        self._refresh_profile_tab()
+        self._refresh_agent_settings_tab()
+        self._set_status(f'Профиль переключён: "{profile.name}".')
+
+    def _apply_profile_change_ui(self) -> None:
+        """Синхронизирует весь UI после переключения/удаления профиля."""
+        self._refresh_chat()
+        self._apply_config_to_controls()
+        self._update_token_stats()
+        self._update_strategy_controls()
+        self._refresh_branches_dialog()
+        self._refresh_context_dialog()
+        self._refresh_memory_dialog()
+        self._update_profile_status()
+
+    def _update_profile_status(self) -> None:
+        """Показывает в статус-баре активный профиль, модель и temperature."""
+        try:
+            repo = self._profile_repo()
+            names = [p.name for p in repo.get_all()] if repo is not None else []
+            self.profile_switch.configure(values=names)
+        except (tk.TclError, AttributeError):
+            return
+        profile = self.agent.profile
+        if profile is not None and profile.name in names:
+            if self.profile_switch_var.get() != profile.name:
+                self.profile_switch_var.set(profile.name)
+            self.profile_info_label.config(
+                text=(
+                    f'Профиль "{profile.name}" · {self.agent.model} · '
+                    f"temperature={self.agent.temperature:.1f}"
+                )
+            )
+        else:
+            self.profile_switch_var.set("")
+            self.profile_info_label.config(text="")
+
+    # ------------------------------------------------------------------
+    # Персонализация: вкладка «Настройки агента» (обработчики)
+    # ------------------------------------------------------------------
+
+    def _refresh_agent_settings_tab(self) -> None:
+        """Загружает настройки АКТИВНОГО профиля в виджеты вкладки."""
+        settings = self.agent.profile_settings
+        if settings is None:
+            for widget in (self.profile_model_combo, self.profile_temp_scale,
+                           self.profile_tokens_spin, self.profile_prompt_text,
+                           self.profile_settings_save_btn):
+                try:
+                    widget.configure(state="disabled")
+                except tk.TclError:
+                    pass
+            return
+        self.profile_model_var.set(settings.model)
+        self.profile_temp_var.set(float(settings.temperature))
+        self._update_profile_temp_label()
+        self.profile_tokens_var.set(str(settings.max_tokens))
+        self.profile_prompt_text.delete("1.0", "end")
+        self.profile_prompt_text.insert("1.0", settings.base_system_prompt or "")
+
+    def _update_profile_temp_label(self) -> None:
+        """Обновляет подпись значения temperature на вкладке настроек."""
+        try:
+            value = round(float(self.profile_temp_var.get()), 1)
+        except (tk.TclError, TypeError, ValueError):
+            return
+        self.profile_temp_label.config(text=f"{value:.1f}")
+
+    def _on_profile_settings_save(self, _event=None) -> None:
+        """Сохраняет настройки активного профиля и применяет их к агенту.
+
+        Новый temperature/max_tokens/модель действуют со следующего
+        запроса без перезапуска приложения.
+        """
+        if self._busy:
+            return
+        repo = self._profile_repo()
+        profile = self.agent.profile
+        if repo is None or profile is None:
+            self._set_status("Профили недоступны (нет репозитория).")
+            return
+        try:
+            tokens = int(self.profile_tokens_var.get().strip())
+            tokens = max(TOKENS_MIN, min(TOKENS_MAX, tokens))
+            temperature = round(float(self.profile_temp_var.get()), 1)
+        except (TypeError, ValueError):
+            self._set_status("Ошибка: неверное значение max tokens.")
+            return
+        settings = ProfileAgentSettings(
+            profile_id=profile.id,
+            model=self.profile_model_var.get(),
+            temperature=temperature,
+            max_tokens=tokens,
+            base_system_prompt=self.profile_prompt_text.get(
+                "1.0", "end-1c"
+            ).strip(),
+        )
+        if not repo.update_settings(settings):
+            self._set_status("Ошибка: не удалось сохранить настройки профиля.")
+            return
+        result = self.agent.refresh_profile()
+        if result.get("error"):
+            self._set_status(f"Ошибка: {result['error']}")
+            return
+        self._apply_config_to_controls()
+        self._update_profile_status()
+        self._set_status(
+            f'Настройки профиля "{profile.name}" сохранены: '
+            f"{settings.model}, temperature={settings.temperature:.1f}, "
+            f"max_tokens={settings.max_tokens}."
+        )
 
     # ------------------------------------------------------------------
     # Вспомогательные конструкторы
@@ -3034,11 +3664,30 @@ class ChatApplication:
             self.tokens_spin,
             self.prompt_entry,
             self.input,
+            # Персонализация: вкладка «Профиль»
+            self.profile_new_btn,
+            self.profile_save_btn,
+            self.profile_delete_btn,
+            self.profile_activate_btn,
+            self.profile_name_entry,
+            self.profile_display_entry,
+            self.profile_style_entry,
+            self.profile_format_entry,
+            self.profile_language_entry,
+            self.profile_constraints_text,
+            self.profile_context_text,
+            # Персонализация: вкладка «Настройки агента»
+            self.profile_temp_scale,
+            self.profile_tokens_spin,
+            self.profile_prompt_text,
+            self.profile_settings_save_btn,
         ):
             widget.configure(state="normal" if enabled else "disabled")
 
         # ttk.Combobox: обычное состояние — "readonly", а не "normal"
-        for combo in (self.model_combo, self.strategy_combo):
+        for combo in (self.model_combo, self.strategy_combo,
+                      self.profile_combo, self.profile_model_combo,
+                      self.profile_switch):
             combo.configure(state="readonly" if enabled else "disabled")
 
         # Подсказка не должна висеть поверх заблокированного поля
