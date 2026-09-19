@@ -28,6 +28,7 @@ from src.config import (
 )
 from src.storage import ContextStore
 from src.profile_repository import ProfileRepository
+from src.task_repository import TaskRepository
 from src.tokens import create_counter
 from src.utils import AgentConfigError, get_logger
 
@@ -90,6 +91,17 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
             config=config,
         )
 
+    # Подсистема задач (FSM): отдельная БД SQLite, состояние задачи
+    # переживает перезапуск приложения. В mock-режиме задачи тоже работают
+    # (LLM-этапы имитируются) — это удобно для тестов и демонстрации.
+    task_repository = None
+    if config.get("TASKS_ENABLED", True):
+        raw_task_path = str(config.get("TASKS_PATH", "data/tasks.db"))
+        task_db_path = Path(raw_task_path)
+        if not task_db_path.is_absolute():
+            task_db_path = PROJECT_ROOT / task_db_path
+        task_repository = TaskRepository(db_path=task_db_path)
+
     # Счётчик токенов и цены: tiktoken при наличии, иначе встроенная эвристика
     token_counter = create_counter(
         model=config["DEFAULT_MODEL"],
@@ -119,6 +131,8 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         # Персонализация: активный профиль подставляется в каждый запрос,
         # а его настройки перекрывают DEFAULT_* из .env
         profile_repository=profile_repository,
+        # Подсистема задач (FSM): план → шаги → проверка, пауза/восстановление
+        task_repository=task_repository,
     )
 
 

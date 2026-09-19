@@ -24,6 +24,15 @@ from . import utils
 from .agent import DeepSeekAgent
 from .config import get_config
 from .models import ProfileAgentSettings, UserProfile
+from .task_models import (
+    AWAITING_STAGES,
+    MODE_TITLES,
+    STAGE_TITLES,
+    WORKING_STAGES,
+    Task,
+    TaskMode,
+    TaskStage,
+)
 
 # ---------------------------------------------------------------------------
 # Константы оформления
@@ -53,7 +62,12 @@ FONTS = {
     "status": ("Segoe UI", 9),
 }
 
-PLACEHOLDER = "Введите сообщение..."
+PLACEHOLDER = "Введите сообщение... (/задача — поставить задачу)"
+
+# Команды чата, создающие задачу: остальной текст сообщения — описание.
+# Задачи создаётся в ручном режиме (пользователь подтверждает план и
+# итог); режим можно сменить на лету в панели задачи.
+TASK_COMMANDS = ("/задача", "/task")
 
 TEMP_MIN, TEMP_MAX = 0.0, 2.0
 TOKENS_MIN, TOKENS_MAX = 50, 4000
@@ -136,6 +150,15 @@ class ChatApplication:
         self._memory_window: Optional[tk.Toplevel] = None
         self._save_dialog: Optional[tk.Toplevel] = None
 
+        # Подсистема задач (FSM): очередь результатов и флаг занятости.
+        # Тяжёлые LLM-этапы задачи выполняются в фоновом потоке, UI
+        # опрашивает очередь через root.after (как и обычные запросы).
+        self._task_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._task_busy = False
+        self._task_steps_visible = False   # раскрыт ли список шагов
+        self._task_status_text = ""        # хвост статус-бара про задачу
+        self._status_base_text = ""        # основной текст статус-бара
+
         # Индекс сообщения диалога (без system) под правой кнопкой мыши:
         # используется кнопкой «Создать от выбранного сообщения».
         self._chat_selected_index: Optional[int] = None
@@ -155,6 +178,9 @@ class ChatApplication:
         # Показываем статистику токенов (в т.ч. восстановленную сессию)
         self._update_token_stats()
         self._set_info(self._token_context_text())
+        # Подсистема задач: восстанавливаем активную задачу профиля
+        # (без авто-запуска; панель появится, если задача есть)
+        self._restore_task_on_startup()
 
     def _set_initial_status(self) -> None:
         """Показывает стартовый статус в статус-баре.
@@ -208,6 +234,14 @@ class ChatApplication:
         )
         self.clear_top_btn.pack(side="right", padx=10, pady=6)
 
+        # Подсистема задач: очистка всей истории задач (с подтверждением).
+        # Отдельной кнопки создания задачи нет — задача создаётся
+        # сообщением «/задача <описание>» в чате (см. _send_text).
+        self.clear_tasks_btn = self._make_button(
+            self.top_bar, "Очистить задачи", self._on_clear_tasks
+        )
+        self.clear_tasks_btn.pack(side="right", pady=6)
+
         # ---- 2. Вкладки: Чат / Профиль / Настройки агента ----
         # Вкладка «Чат» содержит область чата; «Профиль» — управление
         # профилями пользователя; «Настройки агента» — параметры, привязанные
@@ -220,6 +254,10 @@ class ChatApplication:
 
         chat_wrap = tk.Frame(chat_tab, bg=COLORS["bg"])
         chat_wrap.pack(fill="both", expand=True, pady=(4, 4))
+
+        # Панель задачи (FSM) над областью чата: этап, шаг, кнопки
+        # управления. Показывается только при активной задаче.
+        self._build_task_panel(chat_wrap)
 
         self.chat = tk.Text(
             chat_wrap,
@@ -396,6 +434,461 @@ class ChatApplication:
             fg=COLORS["status_fg"], font=FONTS["status"], anchor="e",
         )
         self.profile_info_label.pack(side="right", padx=10)
+
+    # ------------------------------------------------------------------
+    # Панель задачи (FSM): этап, шаги, кнопки управления
+    # ------------------------------------------------------------------
+
+    def _build_task_panel(self, parent: tk.Frame) -> None:
+        """Создаёт панель задачи над областью чата (изначально скрыта).
+
+        Состав: название задачи, переключатель режима (auto/manual),
+        этап, ожидаемое действие, прогресс-бар по шагам и кнопки
+        Пауза / Продолжить / Стоп / Принять / Отклонить / Удалить,
+        состояние которых отражает текущую стадию FSM.
+        """
+        self.task_panel = tk.Frame(
+            parent, bg=COLORS["params_bg"], bd=1,
+            highlightthickness=1, highlightbackground=COLORS["assistant_border"],
+        )
+        # Панель НЕ пакуется здесь: показ/скрытие — в _refresh_task_panel.
+
+        # --- Ряд 1: название задачи + режим + раскрытие списка шагов ---
+        row1 = tk.Frame(self.task_panel, bg=COLORS["params_bg"])
+        row1.pack(fill="x", padx=10, pady=(6, 2))
+
+        self.task_title_label = tk.Label(
+            row1, text="", bg=COLORS["params_bg"],
+            font=FONTS["header"], fg=COLORS["text"], anchor="w",
+        )
+        self.task_title_label.pack(side="left")
+
+        tk.Label(
+            row1, text="Режим:", bg=COLORS["params_bg"], font=FONTS["small"],
+            fg=COLORS["muted"],
+        ).pack(side="left", padx=(14, 2))
+        self.task_mode_var = tk.StringVar(value=MODE_TITLES[TaskMode.MANUAL])
+        self.task_mode_combo = ttk.Combobox(
+            row1, textvariable=self.task_mode_var, state="readonly",
+            width=9, values=(MODE_TITLES[TaskMode.AUTO],
+                             MODE_TITLES[TaskMode.MANUAL]),
+        )
+        self.task_mode_combo.pack(side="left")
+        self.task_mode_combo.bind(
+            "<<ComboboxSelected>>", self._on_task_mode_change
+        )
+
+        self.task_steps_toggle = self._make_button(
+            row1, "Шаги ▸", self._on_toggle_task_steps, small=True
+        )
+        self.task_steps_toggle.pack(side="right")
+
+        # --- Ряд 2: этап + ожидаемое действие ---
+        row2 = tk.Frame(self.task_panel, bg=COLORS["params_bg"])
+        row2.pack(fill="x", padx=10, pady=2)
+        self.task_stage_label = tk.Label(
+            row2, text="", bg=COLORS["params_bg"],
+            font=FONTS["small"], fg=COLORS["text"], anchor="w",
+        )
+        self.task_stage_label.pack(side="left")
+        self.task_expected_label = tk.Label(
+            row2, text="", bg=COLORS["params_bg"],
+            font=FONTS["small"], fg=COLORS["muted"], anchor="w",
+        )
+        self.task_expected_label.pack(side="left", padx=(16, 0))
+
+        # --- Ряд 3: прогресс-бар по шагам ---
+        row3 = tk.Frame(self.task_panel, bg=COLORS["params_bg"])
+        row3.pack(fill="x", padx=10, pady=(2, 4))
+        self.task_progress = ttk.Progressbar(row3, maximum=1, value=0)
+        self.task_progress.pack(side="left", fill="x", expand=True)
+        self.task_step_label = tk.Label(
+            row3, text="", bg=COLORS["params_bg"], font=FONTS["small"],
+            fg=COLORS["text"], anchor="e",
+        )
+        self.task_step_label.pack(side="left", padx=(10, 0))
+
+        # --- Ряд 4: кнопки управления ---
+        row4 = tk.Frame(self.task_panel, bg=COLORS["params_bg"])
+        row4.pack(fill="x", padx=10, pady=(0, 6))
+        self.task_pause_btn = self._make_button(
+            row4, "⏸ Пауза", self._on_task_pause, small=True
+        )
+        self.task_resume_btn = self._make_button(
+            row4, "▶ Продолжить", self._on_task_resume, small=True
+        )
+        self.task_stop_btn = self._make_button(
+            row4, "⏹ Стоп", self._on_task_stop, small=True
+        )
+        self.task_approve_btn = self._make_button(
+            row4, "✓ Принять", self._on_task_approve, small=True
+        )
+        self.task_reject_btn = self._make_button(
+            row4, "✗ Отклонить", self._on_task_reject, small=True
+        )
+        self.task_delete_btn = self._make_button(
+            row4, "✕ Удалить", self._on_task_delete, small=True
+        )
+        for button in (self.task_pause_btn, self.task_resume_btn,
+                       self.task_stop_btn, self.task_approve_btn,
+                       self.task_reject_btn, self.task_delete_btn):
+            button.pack(side="left", padx=(0, 6), pady=2)
+
+        # --- Список шагов (раскрывается кнопкой «Шаги») ---
+        self.task_steps_text = tk.Text(
+            self.task_panel, height=6, wrap="word", state="disabled",
+            bg=COLORS["assistant_bg"], fg=COLORS["text"], font=FONTS["small"],
+            relief="flat", padx=8, pady=4,
+            highlightthickness=1,
+            highlightbackground=COLORS["assistant_border"],
+        )
+        # Не пакуется: показывается в _on_toggle_task_steps.
+
+    def _on_toggle_task_steps(self) -> None:
+        """Раскрывает/скрывает список шагов плана с их статусами."""
+        self._task_steps_visible = not self._task_steps_visible
+        task = self.agent.active_task
+        if self._task_steps_visible and task is not None:
+            self.task_steps_text.pack(
+                fill="x", padx=10, pady=(0, 6),
+                before=self.task_panel.winfo_children()[0],
+            )
+            self._refresh_task_steps_text(task)
+            self.task_steps_toggle.config(text="Шаги ▾")
+        else:
+            self.task_steps_text.pack_forget()
+            self.task_steps_toggle.config(text="Шаги ▸")
+
+    def _refresh_task_steps_text(self, task: Task) -> None:
+        """Перерисовывает список шагов (текущий подсвечен, статусы ✓/⏳/✗)."""
+        marks = {"done": "✓", "in_progress": "⏳", "rejected": "✗",
+                 "failed": "✗", "pending": "·"}
+        lines = []
+        for step in task.plan:
+            mark = marks.get(step.status, "·")
+            current = " ←" if step.step_index == task.current_step_index \
+                and task.stage in (TaskStage.EXECUTION,
+                                   TaskStage.AWAITING_STEP_APPROVAL) else ""
+            lines.append(f"{mark} {step.step_index + 1}. {step.description}"
+                         f"{current}")
+        self.task_steps_text.configure(state="normal")
+        self.task_steps_text.delete("1.0", "end")
+        self.task_steps_text.insert("1.0", "\n".join(lines) or "Плана ещё нет.")
+        self.task_steps_text.configure(state="disabled")
+
+    def _refresh_task_panel(self, task: Optional[Task]) -> None:
+        """Перерисовывает панель задачи и статус-бар под состояние FSM.
+
+        Кнопки активны/неактивны строго по матрице переходов:
+        - Пауза — в рабочих стадиях (planning/execution/validation);
+        - Продолжить — на паузе (и для задачи, прерванной перезапуском);
+        - Принять/Отклонить — в стадиях ожидания подтверждения;
+        - Стоп — всегда, кроме done/cancelled.
+        """
+        if not self._widgets_alive():
+            return
+        if task is None:
+            self.task_panel.pack_forget()
+            self.task_steps_text.pack_forget()
+            self._task_steps_visible = False
+            self._set_task_status_text("")
+            return
+
+        self.task_title_label.config(
+            text=f"ЗАДАЧА: {task.title or task.description}"
+        )
+        self.task_mode_var.set(MODE_TITLES.get(task.mode, task.mode.value))
+        stage_title = STAGE_TITLES.get(task.stage, task.stage.value)
+        self.task_stage_label.config(text=f"Этап: {stage_title}")
+        self.task_expected_label.config(
+            text=f"Ожидается: {task.expected_action or '—'}"
+        )
+
+        total = len(task.plan)
+        done = task.done_steps_count()
+        self.task_progress.configure(
+            maximum=max(1, total), value=done,
+        )
+        if total and task.stage in (TaskStage.EXECUTION,
+                                    TaskStage.AWAITING_STEP_APPROVAL,
+                                    TaskStage.AWAITING_FINAL_APPROVAL):
+            step = task.current_step()
+            step_text = f"Шаг {task.current_step_index + 1} из {total}"
+            if step is not None:
+                step_text += f": {step.description[:60]}"
+        elif total:
+            step_text = f"Шаги: {done} из {total} выполнено"
+        else:
+            step_text = ""
+        self.task_step_label.config(text=step_text)
+
+        stage = task.stage
+        interrupted = "прервана" in (task.expected_action or "")
+        self.task_pause_btn.config(
+            state="normal" if stage in WORKING_STAGES else "disabled")
+        self.task_resume_btn.config(
+            state="normal" if (stage == TaskStage.PAUSED
+                               or (stage in WORKING_STAGES and interrupted))
+            else "disabled")
+        self.task_stop_btn.config(
+            state="normal" if stage not in (TaskStage.DONE,
+                                            TaskStage.CANCELLED)
+            else "disabled")
+        awaiting = stage in AWAITING_STAGES
+        self.task_approve_btn.config(
+            state="normal" if awaiting else "disabled")
+        self.task_reject_btn.config(
+            state="normal" if awaiting else "disabled")
+        # Завершённую задачу можно убрать с панели и из БД;
+        # активную — только после «Стоп»
+        self.task_delete_btn.config(
+            state="normal" if task.is_terminal() else "disabled")
+        self.task_mode_combo.config(state="readonly")
+
+        # Панель должна идти до области чата (chat — первый ребёнок wrap)
+        if not self.task_panel.winfo_ismapped():
+            try:
+                self.task_panel.pack(
+                    fill="x", before=self.chat, pady=(0, 4))
+            except tk.TclError:
+                self.task_panel.pack(fill="x", pady=(0, 4))
+        if self._task_steps_visible:
+            self._refresh_task_steps_text(task)
+
+        # Статус-бар: «Задача: execution (2/5)»
+        status = f"Задача: {stage.value}"
+        if stage in (TaskStage.EXECUTION, TaskStage.AWAITING_STEP_APPROVAL) \
+                and total:
+            status += f" ({task.current_step_index + 1}/{total})"
+        elif stage in (TaskStage.DONE, TaskStage.CANCELLED,
+                       TaskStage.FAILED):
+            status += " (новая — «/задача …» в чате, убрать — «✕ Удалить»)"
+        self._set_task_status_text(status)
+
+    def _set_task_status_text(self, text: str) -> None:
+        """Обновляет задачный хвост статус-бара и перерисовывает бар."""
+        self._task_status_text = text
+        combined = self._status_base_text
+        if text:
+            combined = f"{combined} · {text}" if combined else text
+        if self._widgets_alive():
+            self.status_label.config(text=combined)
+
+    def _restore_task_on_startup(self) -> None:
+        """Восстанавливает активную задачу после перезапуска приложения.
+
+        Задача не запускается автоматически: если она была прервана в
+        рабочей стадии, показываем «Задача прервана. Продолжить?» и ждём
+        явного решения пользователя (кнопка «Продолжить»).
+        """
+        try:
+            result = self.agent.restore_task()
+        except Exception as exc:  # задачи не должны ломать запуск
+            utils.get_logger("deepseek-chat.ui").warning(
+                "Не удалось восстановить задачу: %s", exc)
+            return
+        task = result.get("task")
+        if task is None:
+            return
+        self._refresh_task_panel(task)
+        if result.get("interrupted"):
+            self._set_status("Задача прервана. Нажмите «Продолжить», "
+                             "чтобы возобновить работу.")
+
+    # ---- фоновое выполнение задачных операций ------------------------
+
+    def _run_task_action(self, fn) -> None:
+        """Запускает задачную операцию агента в фоновом потоке.
+
+        Пока операция идёт, кнопки панели блокируются (повторные клики
+        не должны ломать FSM).
+        """
+        if self._task_busy:
+            return
+        self._task_busy = True
+        for button in (self.task_pause_btn, self.task_resume_btn,
+                       self.task_stop_btn, self.task_approve_btn,
+                       self.task_reject_btn, self.task_delete_btn,
+                       self.task_mode_combo):
+            try:
+                button.config(state="disabled")
+            except tk.TclError:
+                pass
+        worker = threading.Thread(
+            target=self._task_worker, args=(fn,), daemon=True,
+            name="task-fsm",
+        )
+        worker.start()
+        self.root.after(100, self._poll_task_queue)
+
+    def _task_worker(self, fn) -> None:
+        """Рабочий поток задачной операции: результат → очередь."""
+        try:
+            result = fn()
+        except Exception as exc:  # агент не должен бросать, но страхуемся
+            result = {"task": None, "error": f"Непредвиденная ошибка: {exc}"}
+        self._task_queue.put(result)
+
+    def _poll_task_queue(self) -> None:
+        """Опрашивает очередь результатов задач (вызывается через after)."""
+        try:
+            while True:
+                result = self._task_queue.get_nowait()
+                self._on_task_result(result)
+        except queue.Empty:
+            pass
+        finally:
+            if self._task_busy:
+                self.root.after(100, self._poll_task_queue)
+
+    def _on_task_result(self, result: Dict[str, Any]) -> None:
+        """Обрабатывает результат задачной операции (в главном потоке)."""
+        self._task_busy = False
+        task = result.get("task")
+        self._refresh_task_panel(task)
+
+        error = result.get("error")
+        if error:
+            short = error if len(error) <= 120 else error[:117] + "..."
+            self._set_status(f"Задача: {short}")
+            self.root.bell()
+            return
+
+        # Очистка: удаление одной задачи или всех задач сразу
+        if result.get("deleted"):
+            self._set_task_status_text("")
+            self._set_status("Задача удалена.")
+            return
+        if result.get("cleared") is not None:
+            self._set_task_status_text("")
+            self._set_status(f"Удалено задач: {result['cleared']}.")
+            return
+
+        if task is None:
+            return
+        stage_title = STAGE_TITLES.get(task.stage, task.stage.value)
+        self._set_status(f"Задача: {stage_title}.")
+
+        # Завершённая задача дописывает итог в чат как сообщение
+        # ассистента (задача начиналась сообщением пользователя)
+        if task.stage == TaskStage.DONE and task.result:
+            self.agent.note_task_message(
+                f"Задача «{task.title or task.description}» завершена.\n\n"
+                f"{task.result}",
+                role="assistant",
+            )
+            self._refresh_chat()
+
+        # Авто-продолжение внутри этапа: шаги и проверка цепочкой идут
+        # сами в обоих режимах (пользователь подтверждает только переходы
+        # между этапами). Один этап за раз — пауза и закрытие окна
+        # остаются безопасными между вызовами.
+        if result.get("auto"):
+            self.root.after(
+                120, lambda: self._run_task_action(self.agent.continue_task)
+            )
+
+    # ---- обработчики кнопок панели задачи ----------------------------
+
+    def _on_task_pause(self) -> None:
+        """Ставит задачу на паузу (текущая стадия сохраняется в БД)."""
+        self._run_task_action(self.agent.pause_task)
+
+    def _on_task_resume(self) -> None:
+        """Продолжает задачу: после паузы или прерывания перезапуском."""
+        task = self.agent.active_task
+        if task is not None and task.stage == TaskStage.PAUSED:
+            self._run_task_action(self.agent.resume_task)
+        else:
+            self._run_task_action(self.agent.continue_task)
+
+    def _on_task_stop(self) -> None:
+        """Останавливает задачу (с подтверждением)."""
+        if not messagebox.askyesno(
+                "Остановка задачи",
+                "Отменить задачу? Её прогресс останется в журнале, "
+                "но выполнение прекратится.",
+                parent=self.root):
+            return
+        self._run_task_action(self.agent.cancel_task)
+
+    def _on_task_approve(self) -> None:
+        """«Принять»: подтверждает переход этапа (план или итог).
+
+        Шаги внутри выполнения идут автоматически — пользователь
+        подтверждает только переходы между этапами.
+        """
+        task = self.agent.active_task
+        if task is None:
+            return
+        if task.stage == TaskStage.AWAITING_PLAN_APPROVAL:
+            self._run_task_action(self.agent.approve_plan)
+        elif task.stage == TaskStage.AWAITING_FINAL_APPROVAL:
+            self._run_task_action(self.agent.approve_final)
+
+    def _on_task_reject(self) -> None:
+        """«Отклонить»: запрос причины и возврат этапа на переделку."""
+        task = self.agent.active_task
+        if task is None:
+            return
+        reason = simpledialog.askstring(
+            "Причина отклонения",
+            "Укажите, что именно не так (необязательно):",
+            parent=self.root,
+        )
+        if task.stage == TaskStage.AWAITING_PLAN_APPROVAL:
+            self._run_task_action(
+                lambda: self.agent.reject_plan(reason or ""))
+        elif task.stage == TaskStage.AWAITING_FINAL_APPROVAL:
+            self._run_task_action(
+                lambda: self.agent.reject_final(reason or ""))
+
+    def _on_task_mode_change(self, _event=None) -> None:
+        """Смена режима (auto/manual) на лету, прямо из панели задачи."""
+        mode = (TaskMode.AUTO
+                if self.task_mode_var.get() == MODE_TITLES[TaskMode.AUTO]
+                else TaskMode.MANUAL)
+        task = self.agent.active_task
+        if task is None or task.mode == mode:
+            return
+        self._run_task_action(lambda: self.agent.set_task_mode(mode))
+
+    def _on_task_delete(self) -> None:
+        """«✕ Удалить»: убирает завершённую задачу с панели и из БД.
+
+        Активную задачу сначала нужно остановить («Стоп») — кнопка
+        удаления активна только в конечных стадиях (done/failed/cancelled).
+        """
+        task = self.agent.active_task
+        if task is None:
+            return
+        if not messagebox.askyesno(
+                "Удаление задачи",
+                f"Удалить задачу «{task.title or task.description}»?\n\n"
+                "Шаги и журнал событий будут удалены вместе с ней.",
+                parent=self.root):
+            return
+        self._run_task_action(self.agent.delete_task)
+
+    def _on_clear_tasks(self) -> None:
+        """«Очистить задачи»: удаляет ВСЕ задачи после подтверждения.
+
+        Каскадно удаляются шаги и журналы всех задач, включая активную.
+        """
+        repo = self.agent.task_repository
+        count = repo.count_tasks() if repo is not None else 0
+        if count <= 0:
+            self._set_status("Задач нет — очищать нечего.")
+            return
+        message = (f"Удалить все задачи ({count})?\n\n"
+                   "Шаги и журналы событий будут удалены безвозвратно.")
+        if self.agent.active_task is not None:
+            message += ("\n\nВнимание: активная задача будет удалена "
+                        "вместе с прогрессом.")
+        if not messagebox.askyesno("Очистка задач", message,
+                                   parent=self.root):
+            return
+        self._run_task_action(self.agent.clear_tasks)
 
     def _build_params_widgets(self) -> None:
         """Строит содержимое панели параметров (2 ряда)."""
@@ -1696,8 +2189,17 @@ class ChatApplication:
     # ------------------------------------------------------------------
 
     def _set_status(self, text: str) -> None:
-        """Показывает текст статуса слева в статус-баре."""
-        self.status_label.config(text=text)
+        """Показывает текст статуса слева в статус-баре.
+
+        К основному тексту добавляется краткая информация о задаче
+        (подсистема FSM): «… · Задача: execution (2/5)».
+        """
+        self._status_base_text = text
+        combined = text
+        if self._task_status_text:
+            combined = (f"{text} · {self._task_status_text}"
+                        if text else self._task_status_text)
+        self.status_label.config(text=combined)
 
     def _set_info(self, text: str) -> None:
         """Показывает служебную информацию справа в статус-баре."""
@@ -3808,13 +4310,75 @@ class ChatApplication:
         self._clear_input()
         self._send_text(text)
 
+    @staticmethod
+    def _parse_task_command(text: str) -> Optional[str]:
+        """Разбирает команду создания задачи.
+
+        Задача задаётся сообщением в чате: ``/задача <описание>`` или
+        ``/task <описание>`` (регистр не важен).
+
+        Returns:
+            Описание задачи (пустая строка — команда без описания) или
+            None, если это обычное сообщение, а не команда.
+        """
+        stripped = text.strip()
+        lowered = stripped.lower()
+        for command in TASK_COMMANDS:
+            if lowered == command:
+                return ""
+            if lowered.startswith(command + " "):
+                return stripped[len(command):].strip()
+        return None
+
+    def _start_task_from_chat(self, message: str,
+                              description: str) -> None:
+        """Создаёт задачу из сообщения чата (вместо отдельной кнопки).
+
+        Сообщение показывается в чате как обычно и остаётся в истории
+        диалога; задача создаётся в ручном режиме — пользователь
+        управляет переходами между этапами (подтверждает план и итог).
+        """
+        if not description:
+            self._set_status(
+                "Укажите описание после команды: /задача что нужно сделать.")
+            self.root.bell()
+            return
+        if self._task_busy:
+            self._set_status(
+                "Дождитесь завершения текущей операции с задачей.")
+            self.root.bell()
+            return
+
+        # Показываем сообщение пользователя сразу (это обычное сообщение
+        # чата, просто оно ещё и создаёт задачу)
+        self.chat.configure(state="normal")
+        try:
+            self._insert_message("user", message)
+        finally:
+            self.chat.configure(state="disabled")
+        self._scroll_to_end()
+        self._set_status("Создание задачи...")
+
+        def action():
+            # Сообщение остаётся в истории диалога (без вызова LLM)
+            self.agent.note_task_message(message)
+            return self.agent.start_task(description, TaskMode.MANUAL)
+
+        self._run_task_action(action)
+
     def _send_text(self, text: str) -> None:
         """Отправляет текст агенту в фоновом потоке.
 
         Сообщение пользователя немедленно показывается в чате, интерфейс
         блокируется, а результат обрабатывается по завершении потока.
+        Сообщение «/задача …» вместо обычного запроса создаёт задачу.
         """
         if self._busy:
+            return
+
+        description = self._parse_task_command(text)
+        if description is not None:
+            self._start_task_from_chat(text.strip(), description)
             return
 
         self._busy = True

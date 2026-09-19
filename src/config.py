@@ -118,12 +118,17 @@ DEFAULTS: Dict[str, Any] = {
     # ВНИМАНИЕ: true нарушает принцип явного выбора слоя (не рекомендуется).
     "MEMORY_AUTO_APPLY": False,
     "MEMORY_EXPORT_PATH": "data/memory_export.md",  # путь экспорта по умолчанию
+    # ------------------------------------------------------------------
+    # Подсистема задач (FSM): состояние задачи в отдельной БД SQLite
+    # ------------------------------------------------------------------
+    "TASKS_ENABLED": True,           # False — задачи недоступны в UI
+    "TASKS_PATH": "data/tasks.db",   # путь к БД задач (относительно корня)
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
 _BOOL_KEYS = (
     "MOCK_MODE", "STORAGE_ENABLED", "TOKENIZER_ENABLED", "SUMMARY_ENABLED",
-    "FACTS_ENABLED",
+    "FACTS_ENABLED", "TASKS_ENABLED",
     "MEMORY_ENABLED", "MEMORY_WORKING_ENABLED", "MEMORY_LONG_ENABLED",
     "MEMORY_PROPOSE_LLM", "MEMORY_AUTO_APPLY",
 )

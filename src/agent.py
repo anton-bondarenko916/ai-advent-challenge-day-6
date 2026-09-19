@@ -66,6 +66,17 @@ from .models import ProfileAgentSettings, UserProfile
 from .profile_prompt_builder import build_system_prompt
 from .profile_repository import ProfileRepository
 from .storage import ContextStore
+from .task_fsm import TaskFSM
+from .task_models import (
+    WORKING_STAGES,
+    ActiveTaskExistsError,
+    InvalidTransitionError,
+    Task,
+    TaskMode,
+    TaskStage,
+    TaskStep,
+)
+from .task_repository import TaskRepository
 from .strategies import (
     AVAILABLE_STRATEGIES,
     BRANCHING,
@@ -137,6 +148,7 @@ class DeepSeekAgent:
         long_memory: Optional[LongTermStore] = None,
         profile_repository: Optional[ProfileRepository] = None,
         profile_id: Optional[int] = None,
+        task_repository: Optional["TaskRepository"] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -180,6 +192,9 @@ class DeepSeekAgent:
                 агент работает без профилей, поведение как раньше.
             profile_id: профиль для активации; None — активный профиль из
                 репозитория (is_active=1, обычно Default после миграции).
+            task_repository: репозиторий задач (подсистема FSM); None —
+                создаётся лениво при первой операции с задачами, если
+                подключено хранилище контекста.
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -316,6 +331,12 @@ class DeepSeekAgent:
             max_branches=self._setting_int("branch_max", 20),
             default_strategy=self._sub_strategy_name,
         )
+
+        # Подсистема задач (FSM): репозиторий создаётся лениво при первой
+        # операции с задачами (или передаётся явно), fsm привязывается к
+        # конкретной задаче в start_task/continue_task/restore_task.
+        self._task_repo: Optional[TaskRepository] = task_repository
+        self._fsm: Optional[TaskFSM] = None
 
         # Клиент создаётся только вне mock-режима
         self._client: Optional[OpenAI] = None
@@ -2968,6 +2989,674 @@ class DeepSeekAgent:
                 return {"ok": True, "layer": canonical}
             return {"ok": True, "layer": canonical,
                     **self._memory_manager.long_clear_all()}
+
+    # ------------------------------------------------------------------
+    # Подсистема задач (FSM): план → шаги → проверка
+    # ------------------------------------------------------------------
+    #
+    # FSM (task_fsm.py) управляет переходами и сохранением состояния,
+    # агент — бизнес-логикой LLM: сформировать план, выполнить шаг,
+    # проверить результат. Всё состояние задачи живёт в SQLite
+    # (task_repository.py), поэтому пауза/перезапуск не теряют контекст.
+
+    @property
+    def task_repository(self) -> Optional[TaskRepository]:
+        """Репозиторий задач (создаётся лениво; None — хранилища нет)."""
+        if self._task_repo is None and self._storage is not None:
+            self._task_repo = TaskRepository(self._storage.db_path)
+        return self._task_repo
+
+    @property
+    def active_task(self) -> Optional[Task]:
+        """Текущая задача, привязанная к FSM (None — задачи нет)."""
+        with self._lock:
+            return self._fsm.task if self._fsm is not None else None
+
+    def start_task(self, description: str,
+                   mode: TaskMode = TaskMode.MANUAL) -> Dict[str, Any]:
+        """Создаёт задачу и запускает FSM (первый этап — планирование).
+
+        Правило «одна активная задача на профиль» enforced репозиторием:
+        при наличии активной задачи возвращается ошибка.
+
+        Args:
+            description: описание задачи.
+            mode: режим работы (auto/manual).
+
+        Returns:
+            ``{"task": Task|None, "acted": bool, "auto": bool, "error": str|None}``.
+            ``auto=True`` означает, что после выполненного этапа задача
+            продолжает работать сама (авто-режим) — вызывающий должен
+            вызвать :meth:`continue_task` ещё раз.
+        """
+        with self._lock:
+            repo = self.task_repository
+            if repo is None:
+                return self._task_result(None, error="Задачи недоступны: "
+                                                     "хранилище не подключено.")
+            if not description or not description.strip():
+                return self._task_result(None, error="Пустое описание задачи.")
+            try:
+                task = repo.create_task(
+                    self._active_profile_id() or 0,
+                    description.strip(), mode,
+                )
+            except ActiveTaskExistsError as exc:
+                return self._task_result(None, error=str(exc))
+            self._fsm = TaskFSM(task, repo)
+            self._fsm.transition(TaskStage.PLANNING, "start_task")
+            result = self._advance_task(task)
+            return self._task_result(task, **result)
+
+    def continue_task(self, task_id: Optional[int] = None) -> Dict[str, Any]:
+        """Выполняет следующий этап задачи для текущей стадии FSM.
+
+        Вызывается после паузы, подтверждения или (в авто-режиме) в цикле —
+        пока не встретится ожидание пользователя/пауза/конечная стадия.
+        Один вызов = один этап (план / один шаг / валидация), чтобы UI
+        оставался отзывчивым и пауза работала между шагами.
+
+        Args:
+            task_id: идентификатор задачи; None — текущая/активная задача.
+
+        Returns:
+            ``{"task": Task|None, "acted": bool, "auto": bool, "error": str|None}``.
+        """
+        with self._lock:
+            task, error = self._ensure_fsm(task_id)
+            if error:
+                return self._task_result(task, error=error)
+            assert task is not None
+            result = self._advance_if_working(task)
+            return self._task_result(task, **result)
+
+    def run_task(self, task_id: Optional[int] = None,
+                 max_steps: int = 50) -> Dict[str, Any]:
+        """Прогоняет задачу до остановки (ожидание/пауза/конец), без UI.
+
+        Удобно для тестов и авто-режима «под ключ»: циклически вызывает
+        :meth:`continue_task`, пока задача продолжает работать сама.
+
+        Args:
+            task_id: идентификатор задачи; None — текущая.
+            max_steps: защитный лимит итераций.
+
+        Returns:
+            Результат последнего вызова :meth:`continue_task`.
+        """
+        result: Dict[str, Any] = self.continue_task(task_id)
+        steps = 0
+        while result.get("auto") and steps < max_steps:
+            result = self.continue_task(task_id)
+            steps += 1
+        return result
+
+    def pause_task(self) -> Dict[str, Any]:
+        """Ставит активную задачу на паузу (стадия сохраняется в БД)."""
+        with self._lock:
+            if self._fsm is None:
+                return self._task_result(None, error="Активной задачи нет.")
+            try:
+                self._fsm.pause()
+            except InvalidTransitionError as exc:
+                return self._task_result(self._fsm.task, error=str(exc))
+            return self._task_result(self._fsm.task)
+
+    def resume_task(self) -> Dict[str, Any]:
+        """Продолжает задачу после паузы и выполняет следующий этап."""
+        with self._lock:
+            if self._fsm is None:
+                return self._task_result(None, error="Активной задачи нет.")
+            task = self._fsm.task
+            try:
+                self._fsm.resume()
+            except InvalidTransitionError as exc:
+                return self._task_result(task, error=str(exc))
+            result = self._advance_if_working(task)
+            return self._task_result(task, **result)
+
+    def cancel_task(self) -> Dict[str, Any]:
+        """Отменяет активную задачу (стадия CANCELLED, событие в журнале)."""
+        with self._lock:
+            if self._fsm is None:
+                return self._task_result(None, error="Активной задачи нет.")
+            try:
+                self._fsm.cancel()
+            except InvalidTransitionError as exc:
+                return self._task_result(self._fsm.task, error=str(exc))
+            return self._task_result(self._fsm.task)
+
+    def approve_plan(self) -> Dict[str, Any]:
+        """Подтверждает план (ручной режим) и выполняет первый шаг."""
+        with self._lock:
+            error = self._require_stage(TaskStage.AWAITING_PLAN_APPROVAL,
+                                        "Подтвердить план")
+            if error:
+                return error
+            assert self._fsm is not None
+            task = self._fsm.task
+            self._fsm.approve_plan()
+            result = self._advance_if_working(task)
+            return self._task_result(task, **result)
+
+    def reject_plan(self, reason: str = "") -> Dict[str, Any]:
+        """Отклоняет план: возврат в планирование за новым планом."""
+        with self._lock:
+            error = self._require_stage(TaskStage.AWAITING_PLAN_APPROVAL,
+                                        "Отклонить план")
+            if error:
+                return error
+            assert self._fsm is not None
+            task = self._fsm.task
+            self._fsm.reject_plan(reason)
+            result = self._advance_if_working(task)
+            return self._task_result(task, **result)
+
+    def approve_final(self) -> Dict[str, Any]:
+        """Финальное подтверждение: задача завершена (DONE)."""
+        with self._lock:
+            error = self._require_stage(TaskStage.AWAITING_FINAL_APPROVAL,
+                                        "Финальное подтверждение")
+            if error:
+                return error
+            assert self._fsm is not None
+            task = self._fsm.task
+            self._fsm.approve_final(result=task.result)
+            return self._task_result(task)
+
+    def reject_final(self, reason: str = "") -> Dict[str, Any]:
+        """Отклоняет итог: возврат в выполнение для переделки."""
+        with self._lock:
+            error = self._require_stage(TaskStage.AWAITING_FINAL_APPROVAL,
+                                        "Отклонить итог")
+            if error:
+                return error
+            assert self._fsm is not None
+            task = self._fsm.task
+            self._fsm.reject_final(reason)
+            result = self._advance_if_working(task)
+            return self._task_result(task, **result)
+
+    def set_task_mode(self, mode: TaskMode) -> Dict[str, Any]:
+        """Меняет режим задачи на лету (auto ↔ manual)."""
+        with self._lock:
+            if self._fsm is None:
+                return self._task_result(None, error="Активной задачи нет.")
+            self._fsm.set_mode(mode)
+            return self._task_result(self._fsm.task)
+
+    def get_task_events(self, task_id: Optional[int] = None) -> List[dict]:
+        """Журнал событий задачи (для UI/диагностики)."""
+        with self._lock:
+            repo = self.task_repository
+            if repo is None:
+                return []
+            target = task_id
+            if target is None and self._fsm is not None:
+                target = self._fsm.task.id
+            if target is None:
+                return []
+            return repo.get_task_events(int(target))
+
+    def note_task_message(self, text: str, role: str = "user") -> None:
+        """Добавляет сообщение о задаче в историю чата (без вызова LLM).
+
+        Задача создаётся сообщением в чате: это сообщение остаётся в
+        истории диалога, а итог завершённой задачи дописывается как
+        сообщение ассистента. Состояние задачи при этом живёт в БД
+        задач, а не в истории чата (разные слои).
+        """
+        with self._lock:
+            self._append_message({"role": role, "content": text})
+            if self._trimming_active():
+                self._trim_history()
+            self._persist()
+
+    def delete_task(self, task_id: Optional[int] = None) -> Dict[str, Any]:
+        """Удаляет задачу из БД (каскадно: шаги и журнал событий).
+
+        Без аргумента удаляется текущая задача панели. Незавершённую
+        (активную) задачу сначала нужно остановить — защита от потери
+        работающего прогресса одним кликом.
+
+        Args:
+            task_id: идентификатор задачи; None — текущая задача панели.
+
+        Returns:
+            Стандартный результат задачных методов; ``deleted=True`` при
+            успехе.
+        """
+        with self._lock:
+            repo = self.task_repository
+            if repo is None:
+                return self._task_result(
+                    None, error="Задачи недоступны: хранилище не подключено.")
+            target = task_id
+            if target is None and self._fsm is not None:
+                target = self._fsm.task.id
+            if target is None:
+                return self._task_result(None, error="Активной задачи нет.")
+            task = repo.get_task_by_id(int(target))
+            if task is not None and not task.is_terminal():
+                return self._task_result(
+                    task,
+                    error="Сначала остановите задачу («Стоп»), "
+                          "затем удаляйте.",
+                )
+            if not repo.delete_task(int(target)):
+                return self._task_result(
+                    None, error=f"Не удалось удалить задачу #{target}.")
+            if self._fsm is not None and self._fsm.task.id == int(target):
+                self._fsm = None  # панель скрывается (задачи больше нет)
+            result = self._task_result(None)
+            result["deleted"] = True
+            return result
+
+    def clear_tasks(self) -> Dict[str, Any]:
+        """Удаляет ВСЕ задачи (каскадно, со всеми шагами и журналами).
+
+        Используется кнопкой «Очистить задачи»: полная очистка истории
+        задач профиля(-ей), включая активную задачу.
+
+        Returns:
+            Стандартный результат задачных методов; ``cleared`` — число
+            удалённых задач.
+        """
+        with self._lock:
+            repo = self.task_repository
+            if repo is None:
+                return self._task_result(
+                    None, error="Задачи недоступны: хранилище не подключено.")
+            deleted = repo.delete_all_tasks()
+            if deleted < 0:
+                return self._task_result(
+                    None, error="Не удалось очистить задачи (ошибка БД).")
+            self._fsm = None
+            result = self._task_result(None)
+            result["cleared"] = deleted
+            return result
+
+    def restore_task(self) -> Dict[str, Any]:
+        """Восстанавливает активную задачу профиля после запуска приложения.
+
+        Задача НЕ запускается автоматически: если она была прервана в
+        рабочей стадии (planning/execution/validation), вызывающий должен
+        показать «Задача прервана. Продолжить?» и ждать пользователя.
+        Для стадий paused/awaiting_* достаточно показать панель задачи —
+        они сами ждут действия пользователя.
+
+        Returns:
+            ``{"task": Task|None, "interrupted": bool, "error": str|None}``.
+            ``interrupted=True`` — задача остановилась в рабочей стадии.
+        """
+        with self._lock:
+            repo = self.task_repository
+            if repo is None:
+                return {"task": None, "interrupted": False,
+                        "error": "Задачи недоступны: хранилище не подключено."}
+            task = repo.get_active_task(self._active_profile_id() or 0)
+            if task is None:
+                self._fsm = None
+                return {"task": None, "interrupted": False, "error": None}
+            self._fsm = TaskFSM(task, repo)
+            interrupted = task.stage in WORKING_STAGES
+            if interrupted:
+                # Не запускаем автоматически: ждём явного «Продолжить».
+                message = "Задача прервана. Продолжить?"
+                task.expected_action = message
+                repo.update_task_stage(task.id, task.stage, message)
+            return {"task": task, "interrupted": interrupted, "error": None}
+
+    # ---- внутренняя механика подсистемы задач -------------------------
+
+    def _task_result(self, task: Optional[Task], acted: bool = False,
+                     auto: bool = False,
+                     error: Optional[str] = None) -> Dict[str, Any]:
+        """Единая форма результата задачных методов агента."""
+        return {"task": task, "acted": acted, "auto": auto, "error": error}
+
+    def _ensure_fsm(self, task_id: Optional[int]) -> tuple:
+        """Гарантирует, что self._fsm привязан к запрошенной задаче из БД.
+
+        Состояние всегда перечитывается из БД — агент не держит единственную
+        копию состояния задачи в памяти (перезапуск/пауза безопасны).
+
+        Returns:
+            ``(task, error)`` — ровно одно из значений не None.
+        """
+        repo = self.task_repository
+        if repo is None:
+            return None, "Задачи недоступны: хранилище не подключено."
+        target_id = task_id
+        if target_id is None and self._fsm is not None:
+            target_id = self._fsm.task.id
+        if target_id is None:
+            return None, "Активной задачи нет."
+        task = repo.get_task_by_id(int(target_id))
+        if task is None:
+            return None, f"Задача id={target_id} не найдена."
+        if (self._fsm is None
+                or self._fsm.task.id != task.id
+                or task_id is not None):
+            self._fsm = TaskFSM(task, repo)
+        else:
+            self._fsm.task = task  # свежая копия из БД
+        return task, None
+
+    def _require_stage(self, stage: TaskStage,
+                       action: str) -> Optional[Dict[str, Any]]:
+        """Проверяет, что активная задача находится в ожидаемой стадии.
+
+        Returns:
+            None — проверка пройдена; иначе готовый результат с ошибкой.
+        """
+        if self._fsm is None:
+            return self._task_result(None, error="Активной задачи нет.")
+        if self._fsm.task.stage != stage:
+            return self._task_result(
+                self._fsm.task,
+                error=(f"{action} можно только в стадии "
+                       f"{stage.value} (сейчас: {self._fsm.task.stage.value})."),
+            )
+        return None
+
+    def _advance_if_working(self, task: Task) -> Dict[str, Any]:
+        """Выполняет этап, если стадия рабочая; иначе просто ждёт."""
+        if task.stage in WORKING_STAGES:
+            return self._advance_task(task)
+        return {"acted": False, "auto": False}
+
+    def _advance_task(self, task: Task) -> Dict[str, Any]:
+        """Диспетчер этапов: выполняет работу текущей стадии.
+
+        Один вызов — один этап LLM (план / один шаг / валидация).
+        Пользователь управляет только переходами между этапами, поэтому
+        шаги внутри EXECUTION и проверка цепочкой продолжаются сами
+        (auto=True) в обоих режимах — пока не встретится ожидание
+        подтверждения (manual), пауза или конечная стадия.
+
+        Returns:
+            ``{"acted": True, "auto": bool}`` — auto=True, если задача
+            продолжает работать сама (нужен ещё вызов continue_task).
+        """
+        try:
+            if task.stage == TaskStage.PLANNING:
+                self._generate_plan(task)
+            elif task.stage == TaskStage.EXECUTION:
+                self._execute_current_step(task)
+            elif task.stage == TaskStage.VALIDATION:
+                self._validate_result(task)
+            else:
+                return {"acted": False, "auto": False}
+        except Exception as exc:  # любая ошибка этапа — задача FAILED
+            logger.error("Ошибка этапа задачи #%s (%s): %s",
+                         task.id, task.stage.value, exc)
+            try:
+                self._fsm.fail(humanize_api_error(exc))
+            except InvalidTransitionError:
+                pass
+            return {"acted": False, "auto": False}
+        return {"acted": True, "auto": task.stage in WORKING_STAGES}
+
+    def _generate_plan(self, task: Task) -> None:
+        """Этап PLANNING: LLM разбивает задачу на шаги (JSON-план).
+
+        В manual-режиме после плана задача переходит в ожидание
+        подтверждения, в auto — сразу в выполнение.
+        """
+        assert self._fsm is not None
+        system = self.system_prompt + "\n\n" + self._task_context_block(task)
+        user = (
+            "Разбей задачу на 3–7 последовательных шагов. Верни СТРОГО JSON "
+            "без пояснений в формате: {\"steps\": [\"шаг 1\", \"шаг 2\", ...]}. "
+            f"Задача: {task.description}"
+        )
+        if self._mock_mode:
+            steps_text = [
+                f"Проанализировать задачу: {task.description[:80]}",
+                "Выполнить основную работу",
+                "Проверить и оформить результат",
+            ]
+        else:
+            raw = self._task_llm_call(system, user)
+            steps_text = self._parse_plan_steps(raw)
+        steps = [TaskStep(description=text, status="pending")
+                 for text in steps_text]
+        if not steps:
+            raise ValueError("LLM вернул пустой план.")
+        self.task_repository.update_task_plan(task.id, steps)
+        task.plan = steps
+        if not task.title:
+            task.title = task.description.strip().splitlines()[0][:60]
+            self.task_repository.update_task_fields(task.id, title=task.title)
+        if task.mode == TaskMode.MANUAL:
+            self._fsm.transition(TaskStage.AWAITING_PLAN_APPROVAL,
+                                 "plan_ready")
+        else:
+            self._fsm.transition(TaskStage.EXECUTION, "plan_ready_auto")
+
+    def _execute_current_step(self, task: Task) -> None:
+        """Этап EXECUTION: выполняет текущий шаг плана одним LLM-вызовом.
+
+        Контекст запроса: задача + текущий шаг + история выполнения
+        предыдущих шагов (из БД) + причина отклонения (при переделке).
+        Пользователь шаги не подтверждает: после выполненного шага
+        автоматом переходим к следующему (или в валидацию, если шаги
+        кончились).
+        """
+        assert self._fsm is not None
+        step = task.current_step()
+        if step is None:
+            if task.plan:
+                self._fsm.transition(TaskStage.VALIDATION,
+                                     "steps_completed")
+                return
+            raise ValueError("План задачи пуст — нечего выполнять.")
+        self._fsm.mark_step_started(step)
+        history = "\n".join(
+            f"  {i + 1}. {s.description} — {s.status}: {s.result or '—'}"
+            for i, s in enumerate(task.plan[:task.current_step_index])
+        ) or "  (шаг первый — истории ещё нет)"
+        redo = f"\nЗамечание от пользователя (переделать): {step.rejection_reason}" \
+            if step.rejection_reason else ""
+        system = self.system_prompt + "\n\n" + self._task_context_block(task)
+        user = (
+            f"Выполни текущий шаг задачи и верни краткий результат работы "
+            f"(без вопросов и уточнений).\n"
+            f"Текущий шаг ({task.current_step_index + 1}/{len(task.plan)}): "
+            f"{step.description}\n"
+            f"История выполнения предыдущих шагов:\n{history}{redo}"
+        )
+        if self._mock_mode:
+            result_text = (f"Шаг {task.current_step_index + 1} выполнен "
+                           f"(mock): {step.description}")
+            if step.rejection_reason:
+                result_text += f" (с учётом замечания: {step.rejection_reason})"
+        else:
+            result_text = self._task_llm_call(system, user)
+        self._fsm.mark_step_done(step, result_text)
+        self._fsm.next_step()
+
+    def _validate_result(self, task: Task) -> None:
+        """Этап VALIDATION: LLM проверяет результат по шагам.
+
+        Вердикт JSON: {"verdict": "pass"|"fail", "comment": "..."}.
+        pass: manual → ожидание финального подтверждения, auto → DONE.
+        fail: возврат в EXECUTION (retry_count растёт; > лимита — FAILED).
+        """
+        assert self._fsm is not None
+        steps_report = "\n".join(
+            f"  {i + 1}. {s.description} — {s.status}: {s.result or '—'}"
+            for i, s in enumerate(task.plan)
+        )
+        system = self.system_prompt + "\n\n" + self._task_context_block(task)
+        user = (
+            "Проверь, достигнута ли цель задачи по истории выполнения шагов. "
+            "Верни СТРОГО JSON: {\"verdict\": \"pass\"|\"fail\", "
+            "\"comment\": \"краткое обоснование\"}.\n"
+            f"Задача: {task.description}\nВыполненные шаги:\n{steps_report}"
+        )
+        if self._mock_mode:
+            verdict, comment = "pass", "Все шаги выполнены (mock-проверка)."
+        else:
+            raw = self._task_llm_call(system, user)
+            verdict, comment = self._parse_verdict(raw)
+        summary = "\n".join(
+            f"{i + 1}. {s.description}: {s.result or '—'}"
+            for i, s in enumerate(task.plan)
+        )
+        task.result = f"{comment}\n\nИтоги шагов:\n{summary}"
+        self.task_repository.set_task_result(task.id, task.result)
+        if verdict == "pass":
+            if task.mode == TaskMode.MANUAL:
+                self._fsm.transition(TaskStage.AWAITING_FINAL_APPROVAL,
+                                     "validation_passed")
+            else:
+                self._fsm.transition(TaskStage.DONE, "validation_passed")
+            return
+        # Валидация не пройдена: переделка с ростом retry_count
+        retries = self.task_repository.increment_retry_count(task.id)
+        task.retry_count = max(0, retries)
+        self._fsm.transition(TaskStage.EXECUTION, "validation_failed",
+                             payload={"comment": comment,
+                                      "retry_count": task.retry_count})
+        if task.retry_count > self._task_retry_limit():
+            self._fsm.fail(
+                f"Превышен лимит повторов валидации "
+                f"({self._task_retry_limit()}): {comment}"
+            )
+
+    def _task_retry_limit(self) -> int:
+        """Лимит повторов (единый с FSM)."""
+        from .task_fsm import TASK_RETRY_LIMIT
+        return TASK_RETRY_LIMIT
+
+    def _task_llm_call(self, system: str, user: str) -> str:
+        """Служебный LLM-вызов для задач (мимо истории диалога).
+
+        История чата не загрязняется: контекст задачи собирается из БД
+        (состояние задачи + шаги), а не из message_history.
+
+        Returns:
+            Текст ответа модели.
+
+        Raises:
+            ApiError: при любой ошибке API (этап переведёт задачу в FAILED).
+        """
+        if self._client is None:
+            raise ApiError("Клиент API не инициализирован (mock-режим?).")
+        request = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        try:
+            response = self._client.chat.completions.create(**request)
+        except Exception as exc:
+            raise ApiError(humanize_api_error(exc), original=exc)
+        return str(self._handle_response(response).get("content") or "")
+
+    def _task_context_block(self, task: Task) -> str:
+        """Блок «[Состояние задачи]» для system-промпта задачных вызовов.
+
+        Ключ к возобновлению без повторных вопросов: агент каждый раз
+        получает полное состояние из БД — название, этап, текущий шаг,
+        ожидаемое действие и историю выполнения.
+        """
+        current = task.current_step()
+        history = "\n".join(
+            f"  {i + 1}. {s.description} — {s.status}: {s.result or '—'}"
+            for i, s in enumerate(task.plan)
+        ) or "  (пока пусто)"
+        current_line = (
+            f"Текущий шаг ({task.current_step_index + 1}/{len(task.plan)}): "
+            f"{current.description}" if current
+            else "Текущий шаг: —"
+        )
+        return (
+            "[Состояние задачи]\n"
+            f"Название: {task.title or task.description}\n"
+            f"Описание: {task.description}\n"
+            f"Режим: {task.mode.value}\n"
+            f"Этап: {task.stage.value}\n"
+            f"{current_line}\n"
+            f"Ожидаемое действие: {task.expected_action or '—'}\n"
+            f"История выполнения:\n{history}"
+        )
+
+    @staticmethod
+    def _extract_json(text: str) -> Optional[str]:
+        """Извлекает первый JSON-объект из ответа LLM (с учётом ```-блоков)."""
+        cleaned = text.strip()
+        if "```" in cleaned:
+            parts = cleaned.split("```")
+            for part in parts:
+                candidate = part.strip()
+                if candidate.startswith("json"):
+                    candidate = candidate[4:].strip()
+                if candidate.startswith("{") or candidate.startswith("["):
+                    cleaned = candidate
+                    break
+        start = cleaned.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        for index in range(start, len(cleaned)):
+            if cleaned[index] == "{":
+                depth += 1
+            elif cleaned[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return cleaned[start:index + 1]
+        return None
+
+    @staticmethod
+    def _parse_plan_steps(raw: str) -> List[str]:
+        """Разбирает JSON-план LLM в список описаний шагов."""
+        import json as _json
+
+        blob = DeepSeekAgent._extract_json(raw)
+        if not blob:
+            return []
+        try:
+            data = _json.loads(blob)
+        except ValueError:
+            return []
+        steps_raw = data.get("steps") if isinstance(data, dict) else data
+        if not isinstance(steps_raw, list):
+            return []
+        steps: List[str] = []
+        for item in steps_raw:
+            if isinstance(item, str) and item.strip():
+                steps.append(item.strip())
+            elif isinstance(item, dict):
+                text = str(item.get("step") or item.get("description") or "")
+                if text.strip():
+                    steps.append(text.strip())
+        return steps
+
+    @staticmethod
+    def _parse_verdict(raw: str) -> tuple:
+        """Разбирает вердикт валидации; неразбираемый ответ считается fail."""
+        import json as _json
+
+        blob = DeepSeekAgent._extract_json(raw)
+        if blob:
+            try:
+                data = _json.loads(blob)
+                if isinstance(data, dict):
+                    verdict = str(data.get("verdict") or "").strip().lower()
+                    comment = str(data.get("comment") or "").strip()
+                    if verdict in ("pass", "fail"):
+                        return verdict, comment
+                    return "fail", f"Неизвестный вердикт: {raw[:200]}"
+            except ValueError:
+                pass
+        return "fail", f"Не удалось разобрать вердикт: {raw[:200]}"
 
     # ------------------------------------------------------------------
     # Служебные свойства (для UI и отладки)
