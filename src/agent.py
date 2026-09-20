@@ -29,6 +29,12 @@
   (модель/temperature/max_tokens) привязаны к профилю, история диалога
   изолирована по профилям (messages.profile_id) и переключается вместе
   с профилем без потери;
+- поддерживает инварианты (InvariantRepository): жёсткие правила
+  «что можно делать» (global + активный профиль) попадают в system-промпт
+  перед блоком профиля; после каждого ответа работает пост-проверка
+  (InvariantValidator, второй LLM-вызов) — при обнаружении нарушения ответ
+  перегенерируется с явным напоминанием про инвариант (лимит попыток из
+  конфига), отказы и перегенерации пишутся в лог нарушений;
 - сохраняет совместимость со старым режимом сжатия в конспект (summary):
   он работает только если настройки summary переданы явно, а стратегия не задана.
 """
@@ -63,6 +69,10 @@ from .memory import (
     normalize_layer,
 )
 from .models import ProfileAgentSettings, UserProfile
+from .invariant_models import Invariant, InvariantCategory
+from .invariant_prompt_builder import build_invariants_block
+from .invariant_repository import InvariantRepository
+from .invariant_validator import Conflict, InvariantValidator
 from .profile_prompt_builder import build_system_prompt
 from .profile_repository import ProfileRepository
 from .storage import ContextStore
@@ -149,6 +159,8 @@ class DeepSeekAgent:
         profile_repository: Optional[ProfileRepository] = None,
         profile_id: Optional[int] = None,
         task_repository: Optional["TaskRepository"] = None,
+        invariant_repository: Optional[InvariantRepository] = None,
+        invariant_validator: Optional[InvariantValidator] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -195,6 +207,13 @@ class DeepSeekAgent:
             task_repository: репозиторий задач (подсистема FSM); None —
                 создаётся лениво при первой операции с задачами, если
                 подключено хранилище контекста.
+            invariant_repository: репозиторий инвариантов (SQLite); None —
+                создаётся лениво при первом обращении, если подключено
+                хранилище контекста. Без репозитория инварианты выключены
+                (промпт и пост-проверка работают как раньше).
+            invariant_validator: валидатор пост-проверки ответов; None —
+                создаётся с настройками по умолчанию (ENABLE_POST_CHECK
+                и лимиты обычно передаются из конфига через main.py).
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -206,6 +225,17 @@ class DeepSeekAgent:
         )
         self.temperature = temperature if temperature is not None else 0.7
         self.max_tokens = max_tokens if max_tokens is not None else 1000
+
+        # Хранилище и подсистемы данных, нужные уже при сборке первого
+        # system-промпта (инварианты читаются из БД наравне с профилем).
+        self._mock_mode: bool = bool(mock_mode)
+        self._storage: Optional[ContextStore] = storage
+        self._invariant_repo: Optional[InvariantRepository] = \
+            invariant_repository
+        self._invariant_validator: InvariantValidator = (
+            invariant_validator if invariant_validator is not None
+            else InvariantValidator()
+        )
 
         # Персонализация: репозиторий профилей, активный профиль и его
         # настройки. Параметры из конструктора перекрываются настройками
@@ -233,17 +263,16 @@ class DeepSeekAgent:
                 )
                 self._apply_profile_settings()
                 self.system_prompt = build_system_prompt(
-                    self._profile, self._profile_settings
+                    self._profile, self._profile_settings,
+                    invariants_block=self._build_invariants_block(),
                 )
 
         # Проверяем параметры ДО создания клиента
         self._validate_parameters()
 
         self._api_key: str = api_key or ""
-        self._mock_mode: bool = bool(mock_mode)
         self._max_history: int = int(max_history_messages)
         self._lock = threading.RLock()
-        self._storage: Optional[ContextStore] = storage
         self._closed: bool = False
 
         # Учёт токенов: счётчик, цены, статистика сессии и последний обмен
@@ -364,7 +393,10 @@ class DeepSeekAgent:
         # источник истины для модели/промпта — настройки активного профиля.
         if self._profile_repo is not None and self._profile is not None:
             self._apply_profile_settings()
-            prompt = build_system_prompt(self._profile, self._profile_settings)
+            prompt = build_system_prompt(
+                self._profile, self._profile_settings,
+                invariants_block=self._build_invariants_block(),
+            )
             self.system_prompt = prompt
             if (self._message_history
                     and self._message_history[0].get("role") == "system"):
@@ -404,7 +436,11 @@ class DeepSeekAgent:
             - response_time: время запроса в секундах;
             - finish_reason: причина завершения (stop, length и т.п.);
             - error: None либо текст ошибки;
-            - timestamp: локальное время ответа (строка).
+            - timestamp: локальное время ответа (строка);
+            - regenerations: число перегенераций пост-проверки инвариантов
+              (ключ появляется, только если проверка выполнялась);
+            - invariant_warning: True — лимит перегенераций исчерпан,
+              нарушение могло остаться (предупреждение для UI).
 
             При ошибке запроса поле tokens = None, а счётчики сессии
             не изменяются.
@@ -443,6 +479,12 @@ class DeepSeekAgent:
                 # window отбрасывает сообщения только в самом запросе.
                 if self._trimming_active():
                     self._trim_history()
+                # Пост-проверка инвариантов (второй LLM-вызов): при
+                # нарушении ответ перегенерируется (лимит попыток из
+                # конфига), финальный текст заменяет ответ в истории.
+                invariant_info = self._post_check_invariants(
+                    user_input.strip(), payload
+                )
                 # Стратегия обновляет свои артефакты после хода
                 # (для sticky_facts — служебный запрос обновления фактов).
                 facts_info = self._after_turn(
@@ -464,7 +506,7 @@ class DeepSeekAgent:
                 # Сохраняем контекст после каждого успешного обмена
                 self._persist()
 
-                return {
+                result = {
                     "text": payload["content"],
                     "model": payload.get("model", self.model),
                     "tokens": token_info,
@@ -473,6 +515,11 @@ class DeepSeekAgent:
                     "error": None,
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                 }
+                if invariant_info is not None:
+                    result["regenerations"] = invariant_info["regenerations"]
+                    result["invariant_warning"] = \
+                        invariant_info["warning"]
+                return result
             except ApiError as exc:
                 # При ошибке откатываем сообщение пользователя из истории,
                 # чтобы повторная отправка того же текста не дублировала его.
@@ -680,6 +727,17 @@ class DeepSeekAgent:
                 0, {"role": "system", "content": prompt}
             )
 
+    def _replace_last_assistant_message(self, content: str) -> None:
+        """Заменяет текст последнего ответа ассистента (пост-проверка).
+
+        Вызывается, когда валидатор инвариантов перегенерировал ответ:
+        в истории (и в БД при следующем персисте) остаётся финальный текст.
+        """
+        for index in range(len(self._message_history) - 1, -1, -1):
+            if self._message_history[index].get("role") == "assistant":
+                self._message_history[index]["content"] = content
+                return
+
     def _refresh_profile_locked(self) -> None:
         """Перечитывает профиль из БД и обновляет промпт (вызов под lock).
 
@@ -700,7 +758,10 @@ class DeepSeekAgent:
         self._profile = profile
         self._profile_settings = self._profile_repo.get_settings(profile.id)
         self._apply_profile_settings()
-        prompt = build_system_prompt(self._profile, self._profile_settings)
+        prompt = build_system_prompt(
+            self._profile, self._profile_settings,
+            invariants_block=self._build_invariants_block(),
+        )
         self.system_prompt = prompt
         self._replace_system_message(prompt)
 
@@ -795,7 +856,10 @@ class DeepSeekAgent:
             # Активный профиль фиксируется в БД: при следующем запуске
             # приложение восстановит последний использованный профиль.
             self._profile_repo.set_active(profile.id)
-            prompt = build_system_prompt(self._profile, self._profile_settings)
+            prompt = build_system_prompt(
+                self._profile, self._profile_settings,
+                invariants_block=self._build_invariants_block(),
+            )
             self.system_prompt = prompt
 
             # Артефакты диалога (конспект, факты, закрепления) относятся
@@ -857,6 +921,224 @@ class DeepSeekAgent:
                 "settings": self._profile_settings,
                 "error": None,
             }
+
+    # ------------------------------------------------------------------
+    # Инварианты: жёсткие правила в промпте и пост-проверка ответов
+    # ------------------------------------------------------------------
+
+    @property
+    def invariant_repository(self) -> Optional[InvariantRepository]:
+        """Репозиторий инвариантов (None — подсистема выключена).
+
+        Создаётся лениво при первом обращении, если подключено хранилище
+        контекста (миграция схемы выполняется в конструкторе репозитория).
+        В mock-режиме репозиторий НЕ создаётся автоматически: инварианты
+        работают только с явно переданным репозиторием (БД не создаётся).
+        """
+        if (self._invariant_repo is None and self._storage is not None
+                and not self._mock_mode):
+            self._invariant_repo = InvariantRepository(self._storage.db_path)
+        return self._invariant_repo
+
+    @property
+    def invariant_validator(self) -> Optional[InvariantValidator]:
+        """Валидатор пост-проверки ответов (всегда доступен)."""
+        return self._invariant_validator
+
+    def _build_invariants_block(self) -> str:
+        """Собирает блок инвариантов для system-промпта (или "").
+
+        Читает global + инварианты активного профиля из репозитория.
+        Любая ошибка не должна ломать диалог: возвращается пустая строка.
+        """
+        repo = self.invariant_repository
+        if repo is None or not repo.enabled:
+            return ""
+        try:
+            invariants = repo.get_invariants_for_profile(
+                self._active_profile_id()
+            )
+            if not invariants:
+                return ""
+            categories = repo.get_all_categories()
+            return build_invariants_block(invariants, categories)
+        except Exception as exc:  # подсистема не должна ронять агента
+            logger.warning("Не удалось собрать блок инвариантов: %s", exc)
+            return ""
+
+    def _get_active_invariants(self) -> List[Invariant]:
+        """Действующие инварианты (global + активный профиль)."""
+        repo = self.invariant_repository
+        if repo is None or not repo.enabled:
+            return []
+        try:
+            return repo.get_invariants_for_profile(self._active_profile_id())
+        except Exception as exc:
+            logger.warning("Не удалось прочитать инварианты: %s", exc)
+            return []
+
+    def _invariant_call_api(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Служебный запрос пост-проверки инвариантов.
+
+        Подставляет модель диалога, если у валидатора не задана своя
+        (``model = ""`` означает «модель диалога»).
+        """
+        if not request.get("model"):
+            request = dict(request, model=self.model)
+        return self._call_service_api(request)
+
+    def regenerate_last_response(self, user_query: str,
+                                 violated_rule: str) -> str:
+        """Перегенерирует последний ответ с напоминанием про инвариант.
+
+        Используется пост-проверкой (:meth:`InvariantValidator.
+        validate_and_regenerate`). Запрос строится из текущего контекста,
+        но без нарушившего ответа; в конец добавляется явное напоминание.
+
+        Args:
+            user_query: исходный запрос пользователя.
+            violated_rule: формулировка нарушенного инварианта.
+
+        Returns:
+            Новый текст ответа.
+
+        Raises:
+            ApiError: при ошибке запроса (в mock-режиме — всегда:
+                клиента API нет, перегенерация невозможна).
+        """
+        with self._lock:
+            messages = [dict(m) for m in self._build_context_messages()]
+        # Убираем нарушивший ответ: перегенерация должна выдать текст заново
+        while messages and messages[-1].get("role") == "assistant":
+            messages.pop()
+        reminder = (
+            f"Предыдущий ответ нарушил инвариант: {violated_rule}.\n"
+            "Сгенерируй ответ заново, строго соблюдая инварианты.\n"
+            f"Пользовательский запрос: {user_query}"
+        )
+        messages.append({"role": "user", "content": reminder})
+        request = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        payload = self._call_service_api(request)
+        return str(payload.get("content") or "")
+
+    def _post_check_invariants(self, user_query: str,
+                               payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Пост-проверка ответа на нарушение инвариантов (после генерации).
+
+        Условия запуска (по ТЗ): проверка включена (ENABLE_POST_CHECK),
+        ответ достаточно длинный (MIN_RESPONSE_LENGTH) и есть действующие
+        инварианты. При нарушении ответ перегенерируется валидатором;
+        финальный текст заменяет ответ в истории, отказы и перегенерации
+        пишутся в лог нарушений. Ошибки валидатора не ломают ответ.
+
+        Returns:
+            ``{"text", "regenerations", "warning"}`` — если проверка
+            выполнялась, иначе None.
+        """
+        validator = self._invariant_validator
+        text = str(payload.get("content") or "")
+        if validator is None or not validator.enabled:
+            return None
+        if len(text) < validator.min_response_length:
+            return None
+        invariants = self._get_active_invariants()
+        if not invariants:
+            return None
+
+        try:
+            final_text, regenerations = validator.validate_and_regenerate(
+                agent=self,
+                user_query=user_query,
+                first_response=text,
+                invariants=invariants,
+                call_api=self._invariant_call_api,
+            )
+        except Exception as exc:  # проверка не должна ломать диалог
+            logger.warning("Пост-проверка инвариантов не удалась: %s", exc)
+            return None
+
+        final_text = str(final_text or text)
+        if final_text != text:
+            payload["content"] = final_text
+            self._replace_last_assistant_message(final_text)
+
+        warning = regenerations >= validator.max_regenerations
+        self._log_invariant_outcome(user_query, final_text,
+                                    regenerations, invariants)
+        return {
+            "text": final_text,
+            "regenerations": regenerations,
+            "warning": warning,
+        }
+
+    def _log_invariant_outcome(self, user_query: str, final_text: str,
+                               regenerations: int,
+                               invariants: List[Invariant]) -> None:
+        """Пишет отказ/перегенерацию в лог нарушений (invariant_violations).
+
+        - отказ по инварианту (без нарушения) → запись resolved=1;
+        - нарушение с перегенерацией → запись regenerated=1, resolved
+          по итогу (устранено/осталось после лимита попыток).
+        """
+        validator = self._invariant_validator
+        repo = self.invariant_repository
+        if validator is None or repo is None or not repo.enabled:
+            return
+        result = validator.last_result
+        if result is None:
+            return
+        fallback_id = int(invariants[0].id or 0) if invariants else 0
+        invariant_id = (result.invariant_id
+                        if result.invariant_id is not None else fallback_id)
+        if invariant_id <= 0:
+            return
+        profile_id = self._active_profile_id()
+        try:
+            if result.refusal and regenerations == 0:
+                repo.log_violation(
+                    invariant_id, profile_id, user_query, final_text,
+                    regenerated=False, resolved=True,
+                )
+            elif regenerations > 0:
+                repo.log_violation(
+                    invariant_id, profile_id, user_query, final_text,
+                    regenerated=True, resolved=not result.violates,
+                )
+        except Exception as exc:  # лог не должен ломать диалог
+            logger.warning("Не удалось записать нарушение инварианта: %s", exc)
+
+    def check_invariant_conflicts(self, new_invariant: Invariant,
+                                  existing: List[Invariant],
+                                  categories: List[InvariantCategory]
+                                  ) -> List[Conflict]:
+        """LLM-проверка противоречий инварианта (для UI при сохранении).
+
+        Возвращает список :class:`~src.invariant_validator.Conflict`;
+        ошибки дают пустой список — сохранение не блокируется.
+
+        Args:
+            new_invariant: сохраняемый инвариант.
+            existing: существующие инварианты для сравнения (без самого
+                сохраняемого).
+            categories: категории (для подписей в промпте).
+        """
+        validator = self._invariant_validator
+        if validator is None or not existing:
+            return []
+        try:
+            return validator.find_conflicts(
+                new_invariant, existing, categories,
+                call_api=self._invariant_call_api,
+            )
+        except Exception as exc:
+            logger.warning("Проверка конфликтов инвариантов не удалась: %s",
+                           exc)
+            return []
 
     def close(self) -> None:
         """Закрывает агента: финальный flush контекста и хранилища.

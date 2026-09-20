@@ -20,6 +20,7 @@ from src import utils
 from src.agent import DeepSeekAgent
 from src.config import (
     PROJECT_ROOT,
+    get_invariant_settings,
     get_memory_settings,
     get_prices,
     get_strategy_settings,
@@ -28,6 +29,8 @@ from src.config import (
 )
 from src.storage import ContextStore
 from src.profile_repository import ProfileRepository
+from src.invariant_repository import InvariantRepository
+from src.invariant_validator import InvariantValidator
 from src.task_repository import TaskRepository
 from src.tokens import create_counter
 from src.utils import AgentConfigError, get_logger
@@ -91,6 +94,17 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
             config=config,
         )
 
+    # Инварианты: жёсткие правила «что можно делать» (SQLite, тот же файл
+    # БД). Миграция в конструкторе создаёт таблицы, предустановленные
+    # категории и 1–2 инварианта-примера (лог — migration.log). Валидатор
+    # пост-проверки настраивается из .env (ENABLE_POST_CHECK и лимиты).
+    invariant_repository = None
+    if storage is not None:
+        invariant_repository = InvariantRepository(db_path=storage.db_path)
+    invariant_validator = InvariantValidator(
+        **get_invariant_settings(config)
+    )
+
     # Подсистема задач (FSM): отдельная БД SQLite, состояние задачи
     # переживает перезапуск приложения. В mock-режиме задачи тоже работают
     # (LLM-этапы имитируются) — это удобно для тестов и демонстрации.
@@ -131,6 +145,10 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         # Персонализация: активный профиль подставляется в каждый запрос,
         # а его настройки перекрывают DEFAULT_* из .env
         profile_repository=profile_repository,
+        # Инварианты: блок в system-промпте + пост-проверка ответов
+        # (репозиторий создаётся лениво из хранилища, если не передан)
+        invariant_repository=invariant_repository,
+        invariant_validator=invariant_validator,
         # Подсистема задач (FSM): план → шаги → проверка, пауза/восстановление
         task_repository=task_repository,
     )

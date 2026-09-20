@@ -23,6 +23,12 @@ from tkinter import messagebox, simpledialog, ttk
 from . import utils
 from .agent import DeepSeekAgent
 from .config import get_config
+from .invariant_models import (
+    SCOPE_GLOBAL,
+    SCOPE_PROFILE,
+    Invariant,
+    InvariantCategory,
+)
 from .models import ProfileAgentSettings, UserProfile
 from .task_models import (
     AWAITING_STAGES,
@@ -150,6 +156,15 @@ class ChatApplication:
         self._memory_window: Optional[tk.Toplevel] = None
         self._save_dialog: Optional[tk.Toplevel] = None
 
+        # Инварианты: модалка «Показать инварианты» в панели задачи,
+        # форма инварианта, форма категории и данные ожидающего сохранения
+        # (пока идёт LLM-проверка конфликтов).
+        self._invariants_window: Optional[tk.Toplevel] = None
+        self._invariant_dialog: Optional[tk.Toplevel] = None
+        self._category_dialog: Optional[tk.Toplevel] = None
+        self._pending_invariant_save: Optional[Dict[str, Any]] = None
+        self._invariant_conflict_dialog: Optional[tk.Toplevel] = None
+
         # Подсистема задач (FSM): очередь результатов и флаг занятости.
         # Тяжёлые LLM-этапы задачи выполняются в фоновом потоке, UI
         # опрашивает очередь через root.after (как и обычные запросы).
@@ -175,6 +190,9 @@ class ChatApplication:
         self._set_initial_status()
         # Персонализация: заполняем переключатель профиля и статус-бар
         self._update_profile_status()
+        # Инварианты: счётчики в статус-баре и вкладка (активный профиль)
+        self._update_invariant_status()
+        self._refresh_invariants_tab()
         # Показываем статистику токенов (в т.ч. восстановленную сессию)
         self._update_token_stats()
         self._set_info(self._token_context_text())
@@ -304,8 +322,9 @@ class ChatApplication:
             command=self._on_menu_show_saved,
         )
 
-        # ---- 2б. Вкладки «Профиль» и «Настройки агента» ----
+        # ---- 2б. Вкладки «Профиль», «Инварианты», «Настройки агента» ----
         self._build_profile_tab()
+        self._build_invariants_tab()
         self._build_agent_settings_tab()
 
         # ---- 3. Панель параметров (186 px: модель/темп/токены, промпт, стратегия, статистика) ----
@@ -435,6 +454,13 @@ class ChatApplication:
         )
         self.profile_info_label.pack(side="right", padx=10)
 
+        # Инварианты: счётчик активных правил (global + активный профиль)
+        self.invariant_info_label = tk.Label(
+            self.status_bar, text="", bg=COLORS["status_bg"],
+            fg=COLORS["status_fg"], font=FONTS["status"], anchor="e",
+        )
+        self.invariant_info_label.pack(side="right", padx=10)
+
     # ------------------------------------------------------------------
     # Панель задачи (FSM): этап, шаги, кнопки управления
     # ------------------------------------------------------------------
@@ -526,12 +552,18 @@ class ChatApplication:
         self.task_reject_btn = self._make_button(
             row4, "✗ Отклонить", self._on_task_reject, small=True
         )
+        # Инварианты: модальное окно с активными правилами (global +
+        # профиль активной задачи). Доступна всегда при открытой панели.
+        self.task_invariants_btn = self._make_button(
+            row4, "📋 Инварианты", self._on_show_invariants, small=True
+        )
         self.task_delete_btn = self._make_button(
             row4, "✕ Удалить", self._on_task_delete, small=True
         )
         for button in (self.task_pause_btn, self.task_resume_btn,
                        self.task_stop_btn, self.task_approve_btn,
-                       self.task_reject_btn, self.task_delete_btn):
+                       self.task_reject_btn, self.task_invariants_btn,
+                       self.task_delete_btn):
             button.pack(side="left", padx=(0, 6), pady=2)
 
         # --- Список шагов (раскрывается кнопкой «Шаги») ---
@@ -1569,6 +1601,9 @@ class ChatApplication:
         self._refresh_context_dialog()
         self._refresh_memory_dialog()
         self._update_profile_status()
+        # Инварианты: счётчики и вкладка следуют за активным профилем
+        self._update_invariant_status()
+        self._refresh_invariants_tab()
 
     def _update_profile_status(self) -> None:
         """Показывает в статус-баре активный профиль, модель и temperature."""
@@ -1593,6 +1628,982 @@ class ChatApplication:
             self.profile_info_label.config(text="")
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Инварианты: вкладка, формы, модалка в панели задачи
+    # ------------------------------------------------------------------
+
+    def _invariant_repo(self):
+        """Репозиторий инвариантов агента (None — подсистема выключена)."""
+        return getattr(self.agent, "invariant_repository", None)
+
+    def _build_invariants_tab(self) -> None:
+        """Строит вкладку «Инварианты»: две панели — категории/инварианты.
+
+        Слева — список категорий с приоритетами и кнопками управления;
+        справа — инварианты выбранной категории, действующие для выбранного
+        профиля + глобальные (маркеры ``[G]``/``[P]``), с кнопками
+        создания/редактирования/удаления.
+        """
+        tab = tk.Frame(self.notebook, bg=COLORS["bg"])
+        self.notebook.add(tab, text="Инварианты")
+        self.invariants_tab = tab
+
+        # --- Верхняя строка: целевой профиль + новая категория ---
+        top = tk.Frame(tab, bg=COLORS["bg"])
+        top.pack(fill="x", padx=10, pady=(8, 4))
+
+        tk.Label(
+            top, text="Профиль:", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"],
+        ).pack(side="left")
+        self.invariants_profile_var = tk.StringVar()
+        self.invariants_profile_combo = ttk.Combobox(
+            top, textvariable=self.invariants_profile_var,
+            state="readonly", width=18,
+        )
+        self.invariants_profile_combo.pack(side="left", padx=(4, 10))
+        self.invariants_profile_combo.bind(
+            "<<ComboboxSelected>>", self._on_invariants_profile_change
+        )
+        self.category_new_btn = self._make_button(
+            top, "[+] Новая категория", self._on_new_category, small=True
+        )
+        self.category_new_btn.pack(side="right")
+
+        # --- Основная область: две панели ---
+        main = tk.Frame(tab, bg=COLORS["bg"])
+        main.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Левая панель: категории
+        left = tk.Frame(main, bg=COLORS["bg"])
+        left.pack(side="left", fill="y", padx=(0, 8))
+        tk.Label(
+            left, text="КАТЕГОРИИ", bg=COLORS["bg"],
+            font=FONTS["small"], fg=COLORS["muted"], anchor="w",
+        ).pack(fill="x")
+        list_wrap = tk.Frame(left, bg=COLORS["bg"])
+        list_wrap.pack(fill="y", expand=True)
+        self.invariants_category_list = tk.Listbox(
+            list_wrap, width=26, exportselection=False,
+            bg=COLORS["input_bg"], fg=COLORS["text"], font=FONTS["small"],
+            relief="solid", bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+            activestyle="dotbox",
+        )
+        category_scroll = ttk.Scrollbar(
+            list_wrap, orient="vertical",
+            command=self.invariants_category_list.yview,
+        )
+        self.invariants_category_list.configure(
+            yscrollcommand=category_scroll.set
+        )
+        category_scroll.pack(side="right", fill="y")
+        self.invariants_category_list.pack(
+            side="left", fill="y", expand=True
+        )
+        self.invariants_category_list.bind(
+            "<<ListboxSelect>>", self._on_invariants_category_select
+        )
+        category_btns = tk.Frame(left, bg=COLORS["bg"])
+        category_btns.pack(fill="x", pady=(6, 0))
+        self.category_edit_btn = self._make_button(
+            category_btns, "Редактировать", self._on_edit_category, small=True
+        )
+        self.category_edit_btn.pack(side="left", padx=(0, 6))
+        self.category_delete_btn = self._make_button(
+            category_btns, "Удалить", self._on_delete_category, small=True
+        )
+        self.category_delete_btn.pack(side="left")
+
+        # Правая панель: инварианты выбранной категории
+        right = tk.Frame(main, bg=COLORS["bg"])
+        right.pack(side="left", fill="both", expand=True)
+        self.invariants_header_label = tk.Label(
+            right, text="", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"], anchor="w",
+        )
+        self.invariants_header_label.pack(fill="x")
+        inv_wrap = tk.Frame(right, bg=COLORS["bg"])
+        inv_wrap.pack(fill="both", expand=True)
+        self.invariants_list = tk.Listbox(
+            inv_wrap, exportselection=False,
+            bg=COLORS["input_bg"], fg=COLORS["text"], font=FONTS["small"],
+            relief="solid", bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+            activestyle="dotbox",
+        )
+        invariant_scroll = ttk.Scrollbar(
+            inv_wrap, orient="vertical", command=self.invariants_list.yview
+        )
+        self.invariants_list.configure(yscrollcommand=invariant_scroll.set)
+        invariant_scroll.pack(side="right", fill="y")
+        self.invariants_list.pack(side="left", fill="both", expand=True)
+        invariant_btns = tk.Frame(right, bg=COLORS["bg"])
+        invariant_btns.pack(fill="x", pady=(6, 0))
+        self.invariant_new_btn = self._make_button(
+            invariant_btns, "[+] Новый инвариант", self._on_new_invariant,
+            small=True,
+        )
+        self.invariant_new_btn.pack(side="left", padx=(0, 6))
+        self.invariant_edit_btn = self._make_button(
+            invariant_btns, "Редактировать", self._on_edit_invariant,
+            small=True,
+        )
+        self.invariant_edit_btn.pack(side="left", padx=(0, 6))
+        self.invariant_delete_btn = self._make_button(
+            invariant_btns, "Удалить", self._on_delete_invariant, small=True
+        )
+        self.invariant_delete_btn.pack(side="left")
+
+        # Состояние выбора вкладки (категория/инварианты перечитываются)
+        self._invariant_categories: List[InvariantCategory] = []
+        self._invariants_profiles: Dict[str, UserProfile] = {}
+        self._invariants_selected_category_id: Optional[int] = None
+        self._invariant_rows: List[Invariant] = []
+        self._refresh_invariants_tab()
+
+    def _refresh_invariants_tab(self) -> None:
+        """Перечитывает категории/инварианты из БД и перерисовывает вкладку."""
+        repo = self._invariant_repo()
+        profile_repo = self._profile_repo()
+        if repo is None or not repo.enabled:
+            self.invariants_category_list.delete(0, "end")
+            self.invariants_list.delete(0, "end")
+            self.invariants_header_label.config(
+                text="Инварианты недоступны (нет хранилища)."
+            )
+            return
+
+        # Переключатель целевого профиля: имена профилей из репозитория
+        profiles = (profile_repo.get_all()
+                    if profile_repo is not None else [])
+        self._invariants_profiles = {
+            profile.name: profile for profile in profiles
+        }
+        names = list(self._invariants_profiles)
+        current = self.invariants_profile_var.get()
+        if current not in names:
+            active = self.agent.profile
+            current = (active.name if active is not None
+                       and active.name in names else "")
+        self.invariants_profile_combo.configure(values=names)
+        self.invariants_profile_var.set(current)
+
+        # Категории по приоритету; выделение сохраняется между обновлениями
+        self._invariant_categories = repo.get_all_categories()
+        category_list = self.invariants_category_list
+        category_list.delete(0, "end")
+        selected_id = self._invariants_selected_category_id
+        restore_index = 0 if selected_id is None else None
+        for index, category in enumerate(self._invariant_categories):
+            category_list.insert(
+                "end", f"{category.display_name} ({category.priority})"
+            )
+            if selected_id is not None and category.id == selected_id:
+                restore_index = index
+        if restore_index is not None and self._invariant_categories:
+            category_list.selection_set(restore_index)
+        elif not self._invariant_categories:
+            self._invariants_selected_category_id = None
+        self._refresh_invariants_list()
+
+    def _selected_invariant_category(self) -> Optional[InvariantCategory]:
+        """Категория, выделенная в списке (None — выбор не определён)."""
+        selection = self.invariants_category_list.curselection()
+        if not selection:
+            return None
+        index = int(selection[0])
+        if 0 <= index < len(self._invariant_categories):
+            category = self._invariant_categories[index]
+            self._invariants_selected_category_id = category.id
+            return category
+        return None
+
+    def _invariants_target_profile_id(self) -> Optional[int]:
+        """Профиль, для которого показываются инварианты (None — без профилей)."""
+        profile = self._invariants_profiles.get(
+            self.invariants_profile_var.get()
+        )
+        return profile.id if profile is not None else None
+
+    def _refresh_invariants_list(self) -> None:
+        """Перерисовывает список инвариантов выбранной категории."""
+        repo = self._invariant_repo()
+        if repo is None or not repo.enabled:
+            return
+        category = self._selected_invariant_category()
+        profile_id = self._invariants_target_profile_id()
+        profile_name = self.invariants_profile_var.get() or "—"
+        if category is not None:
+            header = (f"ИНВАРИАНТЫ ({profile_name} + Global) · "
+                      f"{category.display_name}")
+            invariants = repo.get_invariants_by_category(
+                profile_id, category.id
+            )
+        else:
+            header = f"ИНВАРИАНТЫ ({profile_name} + Global)"
+            invariants = repo.get_invariants_for_profile(profile_id)
+        self.invariants_header_label.config(text=header)
+
+        invariants_list = self.invariants_list
+        invariants_list.delete(0, "end")
+        self._invariant_rows = list(invariants)
+        for invariant in self._invariant_rows:
+            marker = "[G]" if invariant.scope == SCOPE_GLOBAL else "[P]"
+            details = invariant.description.strip() or invariant.rule.strip()
+            if len(details) > 60:
+                details = details[:57] + "…"
+            invariants_list.insert(
+                "end", f"{marker} {invariant.title} — {details}"
+            )
+
+    def _on_invariants_category_select(self, _event=None) -> None:
+        """Выбор категории в левой панели — обновить список инвариантов."""
+        self._refresh_invariants_list()
+
+    def _on_invariants_profile_change(self, _event=None) -> None:
+        """Смена целевого профиля — обновить список инвариантов."""
+        self._refresh_invariants_list()
+
+    def _selected_invariant(self) -> Optional[Invariant]:
+        """Инвариант, выделенный в правой панели (None — ничего не выбрано)."""
+        selection = self.invariants_list.curselection()
+        if not selection:
+            return None
+        index = int(selection[0])
+        if 0 <= index < len(self._invariant_rows):
+            return self._invariant_rows[index]
+        return None
+
+    # ------------------------------------------------------------------
+    # Инварианты: форма инварианта + LLM-проверка конфликтов
+    # ------------------------------------------------------------------
+
+    def _on_new_invariant(self) -> None:
+        """«[+] Новый инвариант»: открывает пустую форму."""
+        self._open_invariant_dialog(None)
+
+    def _on_edit_invariant(self) -> None:
+        """«Редактировать»: форма с данными выделенного инварианта."""
+        invariant = self._selected_invariant()
+        if invariant is None:
+            self._set_status("Выберите инвариант в списке.")
+            return
+        self._open_invariant_dialog(invariant)
+
+    def _on_delete_invariant(self) -> None:
+        """«Удалить»: подтверждение и удаление выделенного инварианта."""
+        invariant = self._selected_invariant()
+        if invariant is None:
+            self._set_status("Выберите инвариант в списке.")
+            return
+        if not messagebox.askyesno(
+            "Удаление инварианта",
+            f"Удалить инвариант «{invariant.title}»?",
+            parent=self.root,
+        ):
+            return
+        repo = self._invariant_repo()
+        if repo is None or not repo.delete_invariant(invariant.id or 0):
+            self._set_status("Не удалось удалить инвариант.")
+            return
+        self._refresh_invariants_tab()
+        self._update_invariant_status()
+        self._set_status(f"Инвариант удалён: {invariant.title}.")
+
+    def _open_invariant_dialog(self, invariant: Optional[Invariant]) -> None:
+        """Открывает модальную форму инварианта (создание/редактирование).
+
+        Поля: категория (Combobox), название (Entry), описание (Text),
+        правило для LLM (Text), область действия Global/Profile (Radio),
+        профиль (Combobox, активен только для scope='profile').
+        При сохранении запускается LLM-проверка конфликтов (не блокирует:
+        при конфликте показывается предупреждение с выбором).
+        """
+        repo = self._invariant_repo()
+        if repo is None:
+            self._set_status("Инварианты недоступны (нет хранилища).")
+            return
+        if self._invariant_dialog is not None:
+            self._invariant_dialog.lift()
+            return
+
+        dialog = tk.Toplevel(self.root)
+        self._invariant_dialog = dialog
+        dialog.title(
+            "Редактирование инварианта" if invariant is not None
+            else "Новый инвариант"
+        )
+        dialog.transient(self.root)
+        dialog.configure(bg=COLORS["bg"])
+        dialog.resizable(False, False)
+
+        categories = self._invariant_categories or repo.get_all_categories()
+        if not categories:
+            self._close_invariant_dialog()
+            self._set_status("Сначала создайте категорию.")
+            return
+
+        row = tk.Frame(dialog, bg=COLORS["bg"])
+        row.pack(fill="x", padx=12, pady=(10, 2))
+        tk.Label(
+            row, text="Категория:", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"],
+        ).pack(side="left")
+        category_var = tk.StringVar()
+        category_combo = ttk.Combobox(
+            row, textvariable=category_var, state="readonly", width=28,
+            values=[category.display_name for category in categories],
+        )
+        category_combo.pack(side="left", padx=(4, 0))
+
+        tk.Label(
+            dialog, text="Название:", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"],
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        title_entry = tk.Entry(
+            dialog, bg=COLORS["input_bg"], fg=COLORS["text"],
+            font=FONTS["default"], relief="solid", bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+        )
+        title_entry.pack(fill="x", padx=12)
+
+        tk.Label(
+            dialog, text="Описание:", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"],
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        description_text = tk.Text(
+            dialog, height=3, wrap="word", bg=COLORS["input_bg"],
+            fg=COLORS["text"], font=FONTS["default"], relief="solid", bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+        )
+        description_text.pack(fill="x", padx=12)
+
+        tk.Label(
+            dialog, text="Правило для LLM:", bg=COLORS["bg"],
+            font=FONTS["small"], fg=COLORS["muted"],
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        rule_text = tk.Text(
+            dialog, height=4, wrap="word", bg=COLORS["input_bg"],
+            fg=COLORS["text"], font=FONTS["default"], relief="solid", bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+        )
+        rule_text.pack(fill="x", padx=12)
+
+        scope_row = tk.Frame(dialog, bg=COLORS["bg"])
+        scope_row.pack(fill="x", padx=12, pady=(10, 0))
+        scope_var = tk.StringVar(value=SCOPE_PROFILE)
+        tk.Radiobutton(
+            scope_row, text="Глобальный (для всех профилей)",
+            variable=scope_var, value=SCOPE_GLOBAL, bg=COLORS["bg"],
+            font=FONTS["small"], command=lambda: _toggle_scope(),
+        ).pack(side="left")
+        tk.Radiobutton(
+            scope_row, text="Профильный",
+            variable=scope_var, value=SCOPE_PROFILE, bg=COLORS["bg"],
+            font=FONTS["small"], command=lambda: _toggle_scope(),
+        ).pack(side="left", padx=(10, 0))
+
+        profile_row = tk.Frame(dialog, bg=COLORS["bg"])
+        profile_row.pack(fill="x", padx=12, pady=(6, 0))
+        tk.Label(
+            profile_row, text="Профиль:", bg=COLORS["bg"],
+            font=FONTS["small"], fg=COLORS["muted"],
+        ).pack(side="left")
+        profile_var = tk.StringVar()
+        profile_combo = ttk.Combobox(
+            profile_row, textvariable=profile_var, state="readonly",
+            width=22, values=list(self._invariants_profiles),
+        )
+        profile_combo.pack(side="left", padx=(4, 0))
+        if self.invariants_profile_var.get() in self._invariants_profiles:
+            profile_var.set(self.invariants_profile_var.get())
+
+        def _toggle_scope() -> None:
+            """Профильный Combobox активен только для scope='profile'."""
+            if scope_var.get() == SCOPE_PROFILE:
+                profile_combo.configure(state="readonly")
+            else:
+                profile_combo.configure(state="disabled")
+
+        buttons = tk.Frame(dialog, bg=COLORS["bg"])
+        buttons.pack(fill="x", padx=12, pady=(12, 10))
+        save_btn = self._make_button(buttons, "Сохранить",
+                                     self._on_invariant_dialog_save)
+        save_btn.pack(side="right")
+        cancel_btn = self._make_button(buttons, "Отмена",
+                                       self._close_invariant_dialog)
+        cancel_btn.pack(side="right", padx=(0, 8))
+
+        dialog.invariant_id = invariant.id if invariant is not None else None
+        dialog.invariant_category_combo = category_combo  # type: ignore
+        dialog.invariant_category_var = category_var  # type: ignore
+        dialog.invariant_title_entry = title_entry  # type: ignore
+        dialog.invariant_description_text = description_text  # type: ignore
+        dialog.invariant_rule_text = rule_text  # type: ignore
+        dialog.invariant_scope_var = scope_var  # type: ignore
+        dialog.invariant_profile_var = profile_var  # type: ignore
+        dialog.invariant_save_btn = save_btn  # type: ignore
+        dialog.invariant_categories = categories  # type: ignore
+
+        if invariant is not None:
+            for index, category in enumerate(categories):
+                if category.id == invariant.category_id:
+                    category_var.set(category.display_name)
+                    break
+            title_entry.insert(0, invariant.title)
+            description_text.insert("1.0", invariant.description)
+            rule_text.insert("1.0", invariant.rule)
+            scope_var.set(invariant.scope)
+            if invariant.profile_id is not None:
+                for name, profile in self._invariants_profiles.items():
+                    if profile.id == invariant.profile_id:
+                        profile_var.set(name)
+                        break
+        elif categories:
+            category_var.set(categories[0].display_name)
+        _toggle_scope()
+
+        dialog.protocol("WM_DELETE_WINDOW", self._close_invariant_dialog)
+        dialog.grab_set()
+        title_entry.focus_set()
+
+    def _close_invariant_dialog(self) -> None:
+        """Закрывает форму инварианта и сбрасывает ожидающее сохранение."""
+        self._pending_invariant_save = None
+        dialog = self._invariant_dialog
+        self._invariant_dialog = None
+        if dialog is not None:
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+    def _invariant_from_dialog(self) -> Optional[Invariant]:
+        """Собирает Invariant из формы (None — ошибка в статус-баре)."""
+        dialog = self._invariant_dialog
+        if dialog is None:
+            return None
+        categories: List[InvariantCategory] = dialog.invariant_categories
+        category_name = dialog.invariant_category_var.get()
+        category = next(
+            (item for item in categories
+             if item.display_name == category_name),
+            None,
+        )
+        title = dialog.invariant_title_entry.get().strip()
+        description = dialog.invariant_description_text.get(
+            "1.0", "end"
+        ).strip()
+        rule = dialog.invariant_rule_text.get("1.0", "end").strip()
+        scope = dialog.invariant_scope_var.get()
+        if category is None:
+            self._set_status("Выберите категорию инварианта.")
+            return None
+        if not title:
+            self._set_status("Укажите название инварианта.")
+            return None
+        if not rule:
+            self._set_status("Укажите правило для LLM.")
+            return None
+        profile_id: Optional[int] = None
+        if scope == SCOPE_PROFILE:
+            profile = self._invariants_profiles.get(
+                dialog.invariant_profile_var.get()
+            )
+            if profile is None:
+                self._set_status("Выберите профиль для профильного инварианта.")
+                return None
+            profile_id = profile.id
+        return Invariant(
+            id=dialog.invariant_id,
+            category_id=int(category.id or 0),
+            title=title,
+            description=description,
+            rule=rule,
+            scope=scope,
+            profile_id=profile_id,
+        )
+
+    def _on_invariant_dialog_save(self) -> None:
+        """«Сохранить»: собирает данные и запускает LLM-проверку конфликтов.
+
+        Проверка идёт в фоновом потоке (_run_action): при найденных
+        конфликтах показывается предупреждение с выбором, иначе инвариант
+        сохраняется сразу. Проверка НЕ блокирует сохранение.
+        """
+        dialog = self._invariant_dialog
+        repo = self._invariant_repo()
+        if dialog is None or repo is None:
+            return
+        invariant = self._invariant_from_dialog()
+        if invariant is None:
+            return
+        dialog.invariant_save_btn.configure(state="disabled")
+
+        target_profile_id = (invariant.profile_id
+                             if invariant.scope == SCOPE_PROFILE else None)
+        existing = [
+            item for item in repo.get_invariants_for_profile(target_profile_id)
+            if item.id != invariant.id
+        ]
+        categories = repo.get_all_categories()
+        self._pending_invariant_save = {
+            "invariant": invariant,
+            "existing": existing,
+            "categories": categories,
+        }
+        self._set_status("Проверка конфликтов инварианта…")
+        self._run_action(
+            lambda: self.agent.check_invariant_conflicts(
+                invariant, existing, categories
+            ),
+            self._on_invariant_conflict_check_done,
+        )
+
+    def _on_invariant_conflict_check_done(self, conflicts: Any) -> None:
+        """Результат LLM-проверки конфликтов (вызывается в главном потоке).
+
+        Ошибка фоновой операции (``{"error": ...}`` от _run_action) не
+        блокирует сохранение: LLM-проверка — только предупреждение.
+        """
+        if self._invariant_dialog is None:
+            return  # форма закрыта, пока шла проверка
+        if isinstance(conflicts, dict) and conflicts.get("error"):
+            self._set_status(
+                "Проверка конфликтов не удалась — сохраняю без проверки."
+            )
+            self._finish_invariant_save()
+            return
+        if conflicts:
+            self._show_invariant_conflict_dialog(list(conflicts))
+        else:
+            self._finish_invariant_save()
+
+    def _show_invariant_conflict_dialog(self, conflicts: list) -> None:
+        """Предупреждение о конфликте: «[Всё равно сохранить] [Отменить]»."""
+        dialog = self._invariant_dialog
+        if dialog is None:
+            return
+        lines = ["⚠️ Обнаружен конфликт:"]
+        categories = {
+            int(category.id): category.display_name
+            for category in self._invariant_categories
+        }
+        repo = self._invariant_repo()
+        for conflict in conflicts[:5]:
+            existing = None
+            if repo is not None and conflict.invariant_id is not None:
+                existing = repo.get_invariant_by_id(conflict.invariant_id)
+            if existing is not None:
+                category_name = categories.get(
+                    int(existing.category_id), ""
+                )
+                lines.append(
+                    f"   С инвариантом «{existing.title}» ({category_name})"
+                )
+            else:
+                lines.append(f"   С инвариантом id={conflict.invariant_id}")
+            if conflict.reason:
+                lines.append(f"   Причина: {conflict.reason}")
+        lines.append("")
+        lines.append("Сохранить всё равно? (правила не блокируют сохранение)")
+
+        window = tk.Toplevel(self.root)
+        self._invariant_conflict_dialog = window
+        window.title("Конфликт инвариантов")
+        window.transient(dialog)
+        window.configure(bg=COLORS["bg"])
+        window.resizable(False, False)
+        text = tk.Label(
+            window, text="\n".join(lines), bg=COLORS["bg"],
+            fg=COLORS["text"], font=FONTS["small"], justify="left",
+            anchor="w",
+        )
+        text.pack(fill="both", expand=True, padx=14, pady=(12, 4))
+        buttons = tk.Frame(window, bg=COLORS["bg"])
+        buttons.pack(fill="x", padx=14, pady=(4, 12))
+        self._make_button(
+            buttons, "Всё равно сохранить",
+            self._on_invariant_conflict_save_anyway,
+        ).pack(side="right")
+        self._make_button(
+            buttons, "Отменить", self._on_invariant_conflict_cancel
+        ).pack(side="right", padx=(0, 8))
+        window.protocol(
+            "WM_DELETE_WINDOW", self._on_invariant_conflict_cancel
+        )
+        window.grab_set()
+
+    def _on_invariant_conflict_save_anyway(self) -> None:
+        """«Всё равно сохранить»: конфликт не блокирует сохранение."""
+        self._close_invariant_conflict_dialog()
+        self._finish_invariant_save()
+
+    def _on_invariant_conflict_cancel(self) -> None:
+        """«Отменить»: конфликт найден, сохранение отложено (форма открыта)."""
+        self._close_invariant_conflict_dialog()
+        self._pending_invariant_save = None
+        dialog = self._invariant_dialog
+        if dialog is not None:
+            dialog.invariant_save_btn.configure(state="normal")
+        self._set_status("Сохранение инварианта отменено (конфликт).")
+
+    def _close_invariant_conflict_dialog(self) -> None:
+        """Закрывает окно предупреждения о конфликте."""
+        window = self._invariant_conflict_dialog
+        self._invariant_conflict_dialog = None
+        if window is not None:
+            try:
+                window.grab_release()
+                window.destroy()
+            except tk.TclError:
+                pass
+
+    def _finish_invariant_save(self) -> None:
+        """Записывает инвариант в БД и обновляет UI (главный поток)."""
+        data = self._pending_invariant_save
+        self._pending_invariant_save = None
+        repo = self._invariant_repo()
+        if data is None or repo is None:
+            self._close_invariant_dialog()
+            return
+        invariant: Invariant = data["invariant"]
+        try:
+            if invariant.id:
+                repo.update_invariant(invariant)
+                message = f"Инвариант обновлён: {invariant.title}."
+            else:
+                repo.create_invariant(invariant)
+                message = f"Инвариант сохранён: {invariant.title}."
+        except ValueError as exc:
+            self._set_status(f"Ошибка: {exc}")
+            self._close_invariant_dialog()
+            return
+        self._close_invariant_dialog()
+        self._refresh_invariants_tab()
+        self._update_invariant_status()
+        self._set_status(message)
+
+    # ------------------------------------------------------------------
+    # Инварианты: форма категории
+    # ------------------------------------------------------------------
+
+    def _on_new_category(self) -> None:
+        """«[+] Новая категория»: пустая форма категории."""
+        self._open_category_dialog(None)
+
+    def _on_edit_category(self) -> None:
+        """«Редактировать» (категория): форма с данными выделенной."""
+        category = self._selected_invariant_category()
+        if category is None:
+            self._set_status("Выберите категорию в списке.")
+            return
+        self._open_category_dialog(category)
+
+    def _on_delete_category(self) -> None:
+        """«Удалить» (категория): системные категории удалить нельзя."""
+        category = self._selected_invariant_category()
+        if category is None:
+            self._set_status("Выберите категорию в списке.")
+            return
+        if category.is_system:
+            self._set_status(
+                f"Категорию «{category.display_name}» удалить нельзя "
+                "(системная)."
+            )
+            return
+        if not messagebox.askyesno(
+            "Удаление категории",
+            f"Удалить категорию «{category.display_name}» "
+            "вместе с её инвариантами?",
+            parent=self.root,
+        ):
+            return
+        repo = self._invariant_repo()
+        if repo is None or not repo.delete_category(category.id or 0):
+            self._set_status("Не удалось удалить категорию.")
+            return
+        self._invariants_selected_category_id = None
+        self._refresh_invariants_tab()
+        self._update_invariant_status()
+        self._set_status(f"Категория удалена: {category.display_name}.")
+
+    def _open_category_dialog(self, category: Optional[InvariantCategory]) -> None:
+        """Открывает модальную форму категории (name/display_name/desc/priority)."""
+        if self._category_dialog is not None:
+            self._category_dialog.lift()
+            return
+        dialog = tk.Toplevel(self.root)
+        self._category_dialog = dialog
+        dialog.title(
+            "Редактирование категории" if category is not None
+            else "Новая категория"
+        )
+        dialog.transient(self.root)
+        dialog.configure(bg=COLORS["bg"])
+        dialog.resizable(False, False)
+
+        tk.Label(
+            dialog, text="Имя (латиница, уникальное):", bg=COLORS["bg"],
+            font=FONTS["small"], fg=COLORS["muted"],
+        ).pack(fill="x", padx=12, pady=(10, 0))
+        name_entry = tk.Entry(
+            dialog, bg=COLORS["input_bg"], fg=COLORS["text"],
+            font=FONTS["default"], relief="solid", bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+        )
+        name_entry.pack(fill="x", padx=12)
+
+        tk.Label(
+            dialog, text="Отображаемое имя:", bg=COLORS["bg"],
+            font=FONTS["small"], fg=COLORS["muted"],
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        display_entry = tk.Entry(
+            dialog, bg=COLORS["input_bg"], fg=COLORS["text"],
+            font=FONTS["default"], relief="solid", bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+        )
+        display_entry.pack(fill="x", padx=12)
+
+        tk.Label(
+            dialog, text="Описание:", bg=COLORS["bg"], font=FONTS["small"],
+            fg=COLORS["muted"],
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        description_entry = tk.Entry(
+            dialog, bg=COLORS["input_bg"], fg=COLORS["text"],
+            font=FONTS["default"], relief="solid", bd=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["input_border"],
+        )
+        description_entry.pack(fill="x", padx=12)
+
+        priority_row = tk.Frame(dialog, bg=COLORS["bg"])
+        priority_row.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(
+            priority_row, text="Приоритет (меньше = важнее):",
+            bg=COLORS["bg"], font=FONTS["small"], fg=COLORS["muted"],
+        ).pack(side="left")
+        priority_var = tk.StringVar(value="100")
+        priority_spin = ttk.Spinbox(
+            priority_row, from_=1, to=1000, width=6,
+            textvariable=priority_var,
+        )
+        priority_spin.pack(side="left", padx=(8, 0))
+
+        buttons = tk.Frame(dialog, bg=COLORS["bg"])
+        buttons.pack(fill="x", padx=12, pady=(12, 10))
+        self._make_button(
+            buttons, "Сохранить", self._on_category_dialog_save
+        ).pack(side="right")
+        self._make_button(
+            buttons, "Отмена", self._close_category_dialog
+        ).pack(side="right", padx=(0, 8))
+
+        dialog.category_name_entry = name_entry  # type: ignore
+        dialog.category_display_entry = display_entry  # type: ignore
+        dialog.category_description_entry = description_entry  # type: ignore
+        dialog.category_priority_var = priority_var  # type: ignore
+        dialog.category_id = category.id if category is not None else None
+
+        if category is not None:
+            name_entry.insert(0, category.name)
+            display_entry.insert(0, category.display_name)
+            description_entry.insert(0, category.description)
+            priority_var.set(str(category.priority))
+
+        dialog.protocol("WM_DELETE_WINDOW", self._close_category_dialog)
+        dialog.grab_set()
+        name_entry.focus_set()
+
+    def _close_category_dialog(self) -> None:
+        """Закрывает форму категории."""
+        dialog = self._category_dialog
+        self._category_dialog = None
+        if dialog is not None:
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+    def _on_category_dialog_save(self) -> None:
+        """«Сохранить» (категория): валидация и запись в БД."""
+        dialog = self._category_dialog
+        repo = self._invariant_repo()
+        if dialog is None or repo is None:
+            return
+        name = dialog.category_name_entry.get().strip()
+        display_name = dialog.category_display_entry.get().strip()
+        description = dialog.category_description_entry.get().strip()
+        try:
+            priority = int(dialog.category_priority_var.get())
+        except (TypeError, ValueError):
+            priority = 100
+        if not name:
+            self._set_status("Укажите имя категории (латиница).")
+            return
+        if not display_name:
+            self._set_status("Укажите отображаемое имя категории.")
+            return
+        category = InvariantCategory(
+            id=dialog.category_id,
+            name=name,
+            display_name=display_name,
+            description=description,
+            priority=priority,
+            is_system=False,
+        )
+        try:
+            if category.id:
+                repo.update_category(category)
+                message = f"Категория обновлена: {category.display_name}."
+            else:
+                repo.create_category(category)
+                message = f"Категория создана: {category.display_name}."
+        except ValueError as exc:
+            self._set_status(f"Ошибка: {exc}")
+            return
+        self._close_category_dialog()
+        self._refresh_invariants_tab()
+        self._update_invariant_status()
+        self._set_status(message)
+
+    # ------------------------------------------------------------------
+    # Инварианты: модалка «Показать инварианты» в панели задачи
+    # ------------------------------------------------------------------
+
+    def _on_show_invariants(self) -> None:
+        """«📋 Инварианты»: модальное окно с активными правилами.
+
+        Показываются инварианты активного профиля + глобальные,
+        сгруппированные по категориям (маркеры ``[G]``/``[P]``).
+        «Перейти к редактированию» открывает вкладку «Инварианты».
+        """
+        if self._invariants_window is not None:
+            self._invariants_window.lift()
+            return
+        repo = self._invariant_repo()
+        if repo is None or not repo.enabled:
+            self._set_status("Инварианты недоступны (нет хранилища).")
+            return
+
+        profile = self.agent.profile
+        profile_id = profile.id if profile is not None else None
+        profile_name = profile.name if profile is not None else "—"
+        invariants = repo.get_invariants_for_profile(profile_id)
+        categories = repo.get_all_categories()
+
+        window = tk.Toplevel(self.root)
+        self._invariants_window = window
+        window.title("Активные инварианты")
+        window.transient(self.root)
+        window.configure(bg=COLORS["bg"])
+        header = tk.Label(
+            window,
+            text=f"Активные инварианты ({profile_name} + Global)",
+            bg=COLORS["bg"], font=FONTS["header"], fg=COLORS["text"],
+            anchor="w",
+        )
+        header.pack(fill="x", padx=14, pady=(10, 4))
+
+        body = tk.Text(
+            window, width=62, height=16, wrap="word", state="disabled",
+            bg=COLORS["assistant_bg"], fg=COLORS["text"],
+            font=FONTS["small"], relief="flat", padx=10, pady=8,
+            highlightthickness=1,
+            highlightbackground=COLORS["assistant_border"],
+        )
+        body.pack(fill="both", expand=True, padx=14)
+
+        # Группировка по категориям в порядке приоритета (важные выше)
+        by_id = {int(c.id): c for c in categories if c.id is not None}
+        grouped: Dict[int, List[Invariant]] = {}
+        for invariant in invariants:
+            grouped.setdefault(int(invariant.category_id), []).append(
+                invariant
+            )
+        ordered = sorted(
+            grouped,
+            key=lambda cid: (by_id[cid].priority if cid in by_id else 10_000,
+                             cid),
+        )
+        lines: List[str] = []
+        for category_id in ordered:
+            category = by_id.get(category_id)
+            display = (category.display_name if category is not None
+                       else "Без категории")
+            lines.append(display)
+            for invariant in grouped[category_id]:
+                marker = "[G]" if invariant.scope == SCOPE_GLOBAL else "[P]"
+                lines.append(f"  {marker} {invariant.title}")
+            lines.append("")
+        body.configure(state="normal")
+        body.delete("1.0", "end")
+        body.insert(
+            "1.0", "\n".join(lines).strip()
+            or "Инвариантов нет — добавьте их на вкладке «Инварианты»."
+        )
+        body.configure(state="disabled")
+
+        buttons = tk.Frame(window, bg=COLORS["bg"])
+        buttons.pack(fill="x", padx=14, pady=(4, 12))
+        self._make_button(
+            buttons, "Перейти к редактированию",
+            self._on_invariants_goto_edit,
+        ).pack(side="right")
+        self._make_button(
+            buttons, "Закрыть", self._close_invariants_window
+        ).pack(side="right", padx=(0, 8))
+        window.protocol("WM_DELETE_WINDOW", self._close_invariants_window)
+        window.grab_set()
+
+    def _on_invariants_goto_edit(self) -> None:
+        """«Перейти к редактированию»: закрыть модалку, открыть вкладку."""
+        self._close_invariants_window()
+        try:
+            self.notebook.select(self.invariants_tab)
+        except tk.TclError:
+            pass
+
+    def _close_invariants_window(self) -> None:
+        """Закрывает модальное окно активных инвариантов."""
+        window = self._invariants_window
+        self._invariants_window = None
+        if window is not None:
+            try:
+                window.grab_release()
+                window.destroy()
+            except tk.TclError:
+                pass
+
+    def _update_invariant_status(self) -> None:
+        """Показывает в статус-баре: Инвариантов: N (глобальных: X, профильных: Y)."""
+        repo = self._invariant_repo()
+        if repo is None or not repo.enabled:
+            self.invariant_info_label.config(text="")
+            return
+        profile = self.agent.profile
+        profile_id = profile.id if profile is not None else None
+        try:
+            counts = repo.count_invariants(profile_id)
+        except Exception:
+            self.invariant_info_label.config(text="")
+            return
+        self.invariant_info_label.config(text=(
+            f"Инвариантов: {counts['total']} "
+            f"(глобальных: {counts['global']}, "
+            f"профильных: {counts['profile']})"
+        ))
+
     # Персонализация: вкладка «Настройки агента» (обработчики)
     # ------------------------------------------------------------------
 
@@ -4183,13 +5194,22 @@ class ChatApplication:
             self.profile_tokens_spin,
             self.profile_prompt_text,
             self.profile_settings_save_btn,
+            # Инварианты: вкладка «Инварианты»
+            self.invariant_new_btn,
+            self.invariant_edit_btn,
+            self.invariant_delete_btn,
+            self.category_new_btn,
+            self.category_edit_btn,
+            self.category_delete_btn,
+            self.invariants_category_list,
+            self.invariants_list,
         ):
             widget.configure(state="normal" if enabled else "disabled")
 
         # ttk.Combobox: обычное состояние — "readonly", а не "normal"
         for combo in (self.model_combo, self.strategy_combo,
                       self.profile_combo, self.profile_model_combo,
-                      self.profile_switch):
+                      self.profile_switch, self.invariants_profile_combo):
             combo.configure(state="readonly" if enabled else "disabled")
 
         # Подсказка не должна висеть поверх заблокированного поля

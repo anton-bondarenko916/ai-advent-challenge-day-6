@@ -123,6 +123,12 @@ DEFAULTS: Dict[str, Any] = {
     # ------------------------------------------------------------------
     "TASKS_ENABLED": True,           # False — задачи недоступны в UI
     "TASKS_PATH": "data/tasks.db",   # путь к БД задач (относительно корня)
+    # ------------------------------------------------------------------
+    # Инварианты: пост-проверка ответов агента (второй LLM-вызов)
+    # ------------------------------------------------------------------
+    "ENABLE_POST_CHECK": True,       # False — без пост-проверки ответов
+    "MAX_REGENERATIONS": 2,          # лимит перегенераций при нарушении
+    "MIN_RESPONSE_LENGTH": 100,      # ответы короче не проверяются
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
@@ -131,6 +137,7 @@ _BOOL_KEYS = (
     "FACTS_ENABLED", "TASKS_ENABLED",
     "MEMORY_ENABLED", "MEMORY_WORKING_ENABLED", "MEMORY_LONG_ENABLED",
     "MEMORY_PROPOSE_LLM", "MEMORY_AUTO_APPLY",
+    "ENABLE_POST_CHECK",
 )
 
 # Переменные, значения которых нужно приводить к числу
@@ -140,6 +147,7 @@ _INT_KEYS = (
     "WINDOW_KEEP_LAST_N", "FACTS_MAX_TOKENS", "FACTS_MAX_ITEMS", "BRANCH_MAX",
     "MEMORY_LONG_MAX_ITEMS", "MEMORY_MAX_TOKENS", "MEMORY_LONG_MAX_TOKENS",
     "MEMORY_WORKING_MAX_TOKENS", "MEMORY_PIN_MAX",
+    "MAX_REGENERATIONS", "MIN_RESPONSE_LENGTH",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
@@ -530,4 +538,41 @@ def get_memory_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, An
         "auto_apply": bool(cfg.get("MEMORY_AUTO_APPLY", False)),
         "export_path": str(cfg.get("MEMORY_EXPORT_PATH")
                            or "data/memory_export.md").strip(),
+    }
+
+
+def get_invariant_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки пост-проверки инвариантов.
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "max_regenerations", "min_response_length"}.
+    """
+    cfg = config if config is not None else get_config()
+    logger = get_logger("deepseek-chat.config")
+
+    def _int(key: str, default: int, low: int, high: int) -> int:
+        raw = cfg.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Некорректное значение %s=%r — беру %d.", key, raw, default)
+            return default
+        if not (low <= value <= high):
+            logger.warning(
+                "%s=%d вне диапазона [%d, %d] — беру %d.",
+                key, value, low, high, default,
+            )
+            return default
+        return value
+
+    return {
+        "enabled": bool(cfg.get("ENABLE_POST_CHECK", True)),
+        "max_regenerations": _int("MAX_REGENERATIONS", 2, 0, 10),
+        "min_response_length": _int("MIN_RESPONSE_LENGTH", 100, 0, 100000),
     }
