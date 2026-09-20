@@ -259,7 +259,9 @@ class ManualModeStagesTest(TaskFSMTestBase):
             self.agent._mock_mode = True
         self.assertEqual(result["task"].stage, TaskStage.FAILED)
         self.assertIn("лимит повторов", result["task"].error)
-        self.assertGreater(result["task"].retry_count, TASK_RETRY_LIMIT)
+        # Семантика явной матрицы (ai_1_15): retry_count растёт в FSM,
+        # после TASK_RETRY_LIMIT откатов следующий запрещён → FAILED
+        self.assertEqual(result["task"].retry_count, TASK_RETRY_LIMIT)
 
 
 # ---------------------------------------------------------------------------

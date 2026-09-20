@@ -76,8 +76,9 @@ from .invariant_validator import Conflict, InvariantValidator
 from .profile_prompt_builder import build_system_prompt
 from .profile_repository import ProfileRepository
 from .storage import ContextStore
-from .task_fsm import TaskFSM
+from .task_fsm import TASK_RETRY_LIMIT, TaskFSM, get_allowed_transitions
 from .task_models import (
+    ACTIVE_STAGES,
     WORKING_STAGES,
     ActiveTaskExistsError,
     InvalidTransitionError,
@@ -87,6 +88,7 @@ from .task_models import (
     TaskStep,
 )
 from .task_repository import TaskRepository
+from .task_response_parser import TaskResponseParser
 from .strategies import (
     AVAILABLE_STRATEGIES,
     BRANCHING,
@@ -161,6 +163,7 @@ class DeepSeekAgent:
         task_repository: Optional["TaskRepository"] = None,
         invariant_repository: Optional[InvariantRepository] = None,
         invariant_validator: Optional[InvariantValidator] = None,
+        task_max_retries: Optional[int] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -214,6 +217,8 @@ class DeepSeekAgent:
             invariant_validator: валидатор пост-проверки ответов; None —
                 создаётся с настройками по умолчанию (ENABLE_POST_CHECK
                 и лимиты обычно передаются из конфига через main.py).
+            task_max_retries: лимит откатов validation → execution для FSM
+                задач (конфиг TASKS_MAX_RETRIES); None — ``TASK_RETRY_LIMIT``.
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -365,6 +370,11 @@ class DeepSeekAgent:
         # операции с задачами (или передаётся явно), fsm привязывается к
         # конкретной задаче в start_task/continue_task/restore_task.
         self._task_repo: Optional[TaskRepository] = task_repository
+        self._task_max_retries: int = (
+            int(task_max_retries) if task_max_retries is not None
+            else TASK_RETRY_LIMIT
+        )
+        self._task_parser = TaskResponseParser()
         self._fsm: Optional[TaskFSM] = None
 
         # Клиент создаётся только вне mock-режима
@@ -440,7 +450,13 @@ class DeepSeekAgent:
             - regenerations: число перегенераций пост-проверки инвариантов
               (ключ появляется, только если проверка выполнялась);
             - invariant_warning: True — лимит перегенераций исчерпан,
-              нарушение могло остаться (предупреждение для UI).
+              нарушение могло остаться (предупреждение для UI);
+            - task_transition: результат разбора маркеров задачи
+              ``{"intent", "transitioned_to"?, "transition_error"?, "hint"?}``
+              (ключ появляется, только когда есть активная задача);
+            - transition_error: LLM предложила переход, запрещённый
+              матрицей FSM (текст ошибки — для статус-бара);
+            - transition_hint: LLM не дала маркер задачи (fail-safe).
 
             При ошибке запроса поле tokens = None, а счётчики сессии
             не изменяются.
@@ -472,6 +488,17 @@ class DeepSeekAgent:
                     payload = self._call_api()
 
                 elapsed = round(time.perf_counter() - start, 2)
+                # Явные переходы FSM (по ТЗ): LLM предлагает переход маркером
+                # в конце ответа, решение принимает TaskFSM по матрице.
+                # Маркеры — служебные: из текста, уходящего в историю и чат,
+                # они убираются.
+                transition_info = self._apply_task_response_transition(
+                    user_input.strip(), str(payload.get("content") or "")
+                )
+                if transition_info is not None:
+                    payload["content"] = TaskResponseParser.strip_markers(
+                        str(payload.get("content") or "")
+                    )
                 self._append_message(
                     {"role": "assistant", "content": payload["content"]}
                 )
@@ -519,6 +546,13 @@ class DeepSeekAgent:
                     result["regenerations"] = invariant_info["regenerations"]
                     result["invariant_warning"] = \
                         invariant_info["warning"]
+                if transition_info is not None:
+                    result["task_transition"] = transition_info
+                    if transition_info.get("transition_error"):
+                        result["transition_error"] = \
+                            transition_info["transition_error"]
+                    if transition_info.get("hint"):
+                        result["transition_hint"] = transition_info["hint"]
                 return result
             except ApiError as exc:
                 # При ошибке откатываем сообщение пользователя из истории,
@@ -1361,17 +1395,152 @@ class DeepSeekAgent:
     def _build_request(self) -> Dict[str, Any]:
         """Формирует структуру запроса к API.
 
+        Если есть активная задача, к system-сообщению добавляется блок
+        маркеров состояния (LLM сообщает о смене этапа, решение о
+        переходе принимает FSM по матрице).
+
         Returns:
-            Словарь с параметрами chat.completions.create: модель,
+            Словарь параметров для chat.completions.create: модель,
             контекст (system + конспект + непокрытая часть истории),
             температура, max_tokens.
         """
+        messages = self._build_context_messages()
+        markers_block = self._task_markers_block()
+        if markers_block and messages:
+            # Копируем system-сообщение: не мутируем историю диалога
+            first = dict(messages[0])
+            first["content"] = (
+                str(first.get("content") or "") + "\n\n" + markers_block
+            )
+            messages = [first] + list(messages[1:])
         return {
             "model": self.model,
-            "messages": self._build_context_messages(),
+            "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+
+    def _task_markers_block(self) -> str:
+        """Блок «[МАРКЕРЫ СОСТОЯНИЯ ЗАДАЧИ]» для system-промпта (или "").
+
+        Уровень 1 защиты (по ТЗ): объясняет LLM, какой маркер поставить
+        в конце ответа, и сообщает текущую стадию с допустимыми
+        переходами. Решение о переходе всё равно принимает FSM — маркер
+        лишь предложение.
+        """
+        task = self.active_task
+        if task is None or task.stage not in ACTIVE_STAGES:
+            return ""
+        allowed = get_allowed_transitions(task.stage, task.mode)
+        allowed_text = ", ".join(
+            sorted(stage.value for stage in allowed)
+        ) or "нет (стадия без выходов)"
+        return (
+            "[МАРКЕРЫ СОСТОЯНИЯ ЗАДАЧИ]\n\n"
+            "В конце каждого ответа, относящегося к задаче, добавь ОДИН "
+            "из маркеров:\n\n"
+            "[PLAN_READY]        — план сформирован и готов к утверждению\n"
+            "[STEP_DONE]         — текущий шаг выполнен\n"
+            "[ALL_STEPS_DONE]    — все шаги выполнены, пора валидировать\n"
+            "[VALIDATION_OK]     — валидация пройдена\n"
+            "[VALIDATION_FAIL]   — валидация не пройдена, нужна переделка\n"
+            "[NEED_INPUT]        — нужен ввод пользователя\n\n"
+            "Маркер ставится на отдельной строке в самом конце ответа.\n\n"
+            f"Текущее состояние задачи: {task.stage.value}\n"
+            f"Допустимые следующие состояния: {allowed_text}"
+        )
+
+    def _apply_task_response_transition(
+        self, user_query: str, response_text: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Определяет намерение перехода из ответа LLM и применяет его.
+
+        Вызывается из :meth:`send_message`, когда есть активная задача.
+        Парсер: маркер → эвристика → None (fail-safe). None — перехода
+        нет, в журнал пишется ``unresolved_transition`` (по ТЗ это сигнал,
+        что LLM не дала маркер). Намерение применяется только через
+        FSM: недопустимые переходы отклоняются матрицей.
+
+        Args:
+            user_query: запрос пользователя (для журнала).
+            response_text: текст ответа ассистента.
+
+        Returns:
+            None — активной задачи нет (проверка не выполнялась); иначе
+            словарь с ключами ``intent``, и по обстоятельствам:
+            ``transitioned_to``, ``transition_error``, ``hint``.
+        """
+        task = self.active_task
+        if task is None or task.stage not in ACTIVE_STAGES:
+            return None
+        intent = self._task_parser.parse(response_text)
+        if intent is None:
+            # Fail-safe: не переходим никуда, логируем сигнал для анализа
+            self.repo_log_task_event(
+                task.id, task.stage, None, "unresolved_transition",
+                {"query": user_query[:200]},
+            )
+            return {
+                "intent": None,
+                "hint": ("LLM не указала явный маркер задачи — "
+                         "переход не выполнен."),
+            }
+
+        target = self._transition_target_for(intent)
+        if target is None:
+            # need_input и прочие намерения без смены стадии
+            return {"intent": intent}
+        if target == task.stage:
+            # Самопереход (например, step_done остаётся в execution):
+            # событие фиксируем, стадию не трогаем
+            self.repo_log_task_event(
+                task.id, task.stage, target, f"llm_{intent}",
+                {"allowed": True, "reason": "самопереход — стадия не меняется"},
+            )
+            return {"intent": intent}
+
+        assert self._fsm is not None
+        try:
+            self._fsm.transition_to(target, f"llm_{intent}")
+        except InvalidTransitionError as exc:
+            return {
+                "intent": intent,
+                "transition_error": str(exc),
+            }
+        return {"intent": intent, "transitioned_to": target.value}
+
+    def _transition_target_for(self, intent: str) -> Optional[TaskStage]:
+        """Маппинг намерения LLM → целевая стадия (None — без перехода).
+
+        Учёт режима: в manual план и итог проходят через подтверждения
+        (AWAITING_*), в auto — напрямую; step_done остаётся в EXECUTION
+        (шаги идут автоматически в обоих режимах).
+        """
+        manual = (self._fsm is not None
+                  and self._fsm.task.mode == TaskMode.MANUAL)
+        if intent == "plan_ready":
+            return (TaskStage.AWAITING_PLAN_APPROVAL if manual
+                    else TaskStage.EXECUTION)
+        if intent == "step_done":
+            return TaskStage.EXECUTION
+        if intent == "all_steps_done":
+            return TaskStage.VALIDATION
+        if intent == "validation_ok":
+            return (TaskStage.AWAITING_FINAL_APPROVAL if manual
+                    else TaskStage.DONE)
+        if intent == "validation_fail":
+            return TaskStage.EXECUTION
+        return None  # need_input и неизвестные намерения
+
+    def repo_log_task_event(self, task_id: int,
+                            from_stage: Optional[TaskStage],
+                            to_stage: Optional[TaskStage],
+                            event_type: str,
+                            payload: Optional[Dict[str, Any]] = None) -> None:
+        """Пишет событие в журнал задач (обёртка для служебных записей)."""
+        repo = self.task_repository
+        if repo is not None:
+            repo.log_event(task_id, from_stage, to_stage, event_type, payload)
 
     def _call_api(self) -> Dict[str, Any]:
         """Выполняет реальный запрос к DeepSeek API и разбирает ответ.
@@ -3325,7 +3494,8 @@ class DeepSeekAgent:
                 )
             except ActiveTaskExistsError as exc:
                 return self._task_result(None, error=str(exc))
-            self._fsm = TaskFSM(task, repo)
+            self._fsm = TaskFSM(task, repo,
+                                 max_retries=self._task_max_retries)
             self._fsm.transition(TaskStage.PLANNING, "start_task")
             result = self._advance_task(task)
             return self._task_result(task, **result)
@@ -3580,7 +3750,8 @@ class DeepSeekAgent:
             if task is None:
                 self._fsm = None
                 return {"task": None, "interrupted": False, "error": None}
-            self._fsm = TaskFSM(task, repo)
+            self._fsm = TaskFSM(task, repo,
+                                 max_retries=self._task_max_retries)
             interrupted = task.stage in WORKING_STAGES
             if interrupted:
                 # Не запускаем автоматически: ждём явного «Продолжить».
@@ -3620,7 +3791,8 @@ class DeepSeekAgent:
         if (self._fsm is None
                 or self._fsm.task.id != task.id
                 or task_id is not None):
-            self._fsm = TaskFSM(task, repo)
+            self._fsm = TaskFSM(task, repo,
+                                 max_retries=self._task_max_retries)
         else:
             self._fsm.task = task  # свежая копия из БД
         return task, None
@@ -3764,7 +3936,9 @@ class DeepSeekAgent:
 
         Вердикт JSON: {"verdict": "pass"|"fail", "comment": "..."}.
         pass: manual → ожидание финального подтверждения, auto → DONE.
-        fail: возврат в EXECUTION (retry_count растёт; > лимита — FAILED).
+        fail: откат в EXECUTION через FSM (retry_count растёт в контроллере;
+        когда откатов сделано TASKS_MAX_RETRIES, матрица запрещает следующий —
+        задача переводится в FAILED).
         """
         assert self._fsm is not None
         steps_report = "\n".join(
@@ -3791,27 +3965,27 @@ class DeepSeekAgent:
         self.task_repository.set_task_result(task.id, task.result)
         if verdict == "pass":
             if task.mode == TaskMode.MANUAL:
-                self._fsm.transition(TaskStage.AWAITING_FINAL_APPROVAL,
-                                     "validation_passed")
+                self._fsm.transition_to(TaskStage.AWAITING_FINAL_APPROVAL,
+                                        "validation_passed")
             else:
-                self._fsm.transition(TaskStage.DONE, "validation_passed")
+                self._fsm.transition_to(TaskStage.DONE, "validation_passed")
             return
-        # Валидация не пройдена: переделка с ростом retry_count
-        retries = self.task_repository.increment_retry_count(task.id)
-        task.retry_count = max(0, retries)
-        self._fsm.transition(TaskStage.EXECUTION, "validation_failed",
-                             payload={"comment": comment,
-                                      "retry_count": task.retry_count})
-        if task.retry_count > self._task_retry_limit():
+        # Валидация не пройдена: откат в EXECUTION. retry_count растёт
+        # централизованно в FSM (_commit_transition); когда лимит откатов
+        # исчерпан (по ТЗ: «3 отката — можно, 4-й — FAILED»), матрица
+        # запрещает переход — задача переводится в FAILED.
+        try:
+            self._fsm.transition_to(TaskStage.EXECUTION, "validation_failed",
+                                    payload={"comment": comment})
+        except InvalidTransitionError as exc:
             self._fsm.fail(
                 f"Превышен лимит повторов валидации "
-                f"({self._task_retry_limit()}): {comment}"
+                f"({self._task_retry_limit()}): {comment} ({exc.reason})"
             )
 
     def _task_retry_limit(self) -> int:
-        """Лимит повторов (единый с FSM)."""
-        from .task_fsm import TASK_RETRY_LIMIT
-        return TASK_RETRY_LIMIT
+        """Лимит откатов валидации (конфиг TASKS_MAX_RETRIES, единый с FSM)."""
+        return self._task_max_retries
 
     def _task_llm_call(self, system: str, user: str) -> str:
         """Служебный LLM-вызов для задач (мимо истории диалога).

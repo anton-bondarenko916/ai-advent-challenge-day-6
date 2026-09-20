@@ -24,6 +24,7 @@ from src.config import (
     get_memory_settings,
     get_prices,
     get_strategy_settings,
+    get_task_settings,
     load_config,
     validate_api_key,
 )
@@ -151,6 +152,8 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         invariant_validator=invariant_validator,
         # Подсистема задач (FSM): план → шаги → проверка, пауза/восстановление
         task_repository=task_repository,
+        # Лимит откатов валидации для FSM задач (TASKS_MAX_RETRIES)
+        task_max_retries=get_task_settings(config)["max_retries"],
     )
 
 

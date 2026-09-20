@@ -123,6 +123,7 @@ DEFAULTS: Dict[str, Any] = {
     # ------------------------------------------------------------------
     "TASKS_ENABLED": True,           # False — задачи недоступны в UI
     "TASKS_PATH": "data/tasks.db",   # путь к БД задач (относительно корня)
+    "TASKS_MAX_RETRIES": 3,          # лимит откатов validation → execution
     # ------------------------------------------------------------------
     # Инварианты: пост-проверка ответов агента (второй LLM-вызов)
     # ------------------------------------------------------------------
@@ -148,6 +149,7 @@ _INT_KEYS = (
     "MEMORY_LONG_MAX_ITEMS", "MEMORY_MAX_TOKENS", "MEMORY_LONG_MAX_TOKENS",
     "MEMORY_WORKING_MAX_TOKENS", "MEMORY_PIN_MAX",
     "MAX_REGENERATIONS", "MIN_RESPONSE_LENGTH",
+    "TASKS_MAX_RETRIES",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
@@ -576,3 +578,34 @@ def get_invariant_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str,
         "max_regenerations": _int("MAX_REGENERATIONS", 2, 0, 10),
         "min_response_length": _int("MIN_RESPONSE_LENGTH", 100, 0, 100000),
     }
+
+
+def get_task_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки подсистемы задач (FSM).
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"max_retries"} — лимит откатов validation → execution.
+    """
+    cfg = config if config is not None else get_config()
+    logger = get_logger("deepseek-chat.config")
+
+    raw = cfg.get("TASKS_MAX_RETRIES", 3)
+    try:
+        max_retries = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Некорректное значение TASKS_MAX_RETRIES=%r — беру 3.", raw)
+        max_retries = 3
+    if not (0 <= max_retries <= 100):
+        logger.warning(
+            "TASKS_MAX_RETRIES=%d вне диапазона [0, 100] — беру 3.",
+            max_retries,
+        )
+        max_retries = 3
+
+    return {"max_retries": max_retries}

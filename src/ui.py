@@ -30,6 +30,7 @@ from .invariant_models import (
     InvariantCategory,
 )
 from .models import ProfileAgentSettings, UserProfile
+from .task_fsm import get_allowed_transitions
 from .task_models import (
     AWAITING_STAGES,
     MODE_TITLES,
@@ -523,6 +524,24 @@ class ChatApplication:
         )
         self.task_expected_label.pack(side="left", padx=(16, 0))
 
+        # --- Ряд 2б: граф состояний FSM (Canvas) + допустимые переходы ---
+        # Текущая стадия — зелёный кружок, пройденные — серые, будущие —
+        # белые с серой рамкой; PAUSED/FAILED/CANCELLED показаны сбоку.
+        self.task_fsm_canvas = tk.Canvas(
+            self.task_panel, height=64, bg=COLORS["params_bg"],
+            highlightthickness=0,
+        )
+        self.task_fsm_canvas.pack(fill="x", padx=10, pady=(0, 0))
+        self.task_fsm_canvas.bind(
+            "<Configure>", lambda _event: self._draw_task_fsm_graph()
+        )
+        self.task_fsm_allowed_label = tk.Label(
+            self.task_panel, text="", bg=COLORS["params_bg"],
+            font=FONTS["small"], fg=COLORS["muted"], anchor="w",
+            justify="left",
+        )
+        self.task_fsm_allowed_label.pack(fill="x", padx=10, pady=(0, 2))
+
         # --- Ряд 3: прогресс-бар по шагам ---
         row3 = tk.Frame(self.task_panel, bg=COLORS["params_bg"])
         row3.pack(fill="x", padx=10, pady=(2, 4))
@@ -624,6 +643,8 @@ class ChatApplication:
             self.task_steps_text.pack_forget()
             self._task_steps_visible = False
             self._set_task_status_text("")
+            self.task_fsm_canvas.delete("all")
+            self.task_fsm_allowed_label.config(text="")
             return
 
         self.task_title_label.config(
@@ -696,6 +717,153 @@ class ChatApplication:
                        TaskStage.FAILED):
             status += " (новая — «/задача …» в чате, убрать — «✕ Удалить»)"
         self._set_task_status_text(status)
+
+        # Граф состояний FSM: подсветка текущей стадии + допустимые переходы
+        self._draw_task_fsm_graph(task)
+        self._update_task_fsm_allowed_label(task)
+
+    # ------------------------------------------------------------------
+    # Граф состояний FSM (Canvas в панели задачи)
+    # ------------------------------------------------------------------
+
+    #: Главная «дорожка» состояний (слева направо)
+    TASK_FSM_TRACK = (
+        (TaskStage.IDLE, "IDLE"),
+        (TaskStage.PLANNING, "ПЛАН"),
+        (TaskStage.AWAITING_PLAN_APPROVAL, "[ОЖИД. ПЛАНА]"),
+        (TaskStage.EXECUTION, "ВЫПОЛНЕНИЕ"),
+        (TaskStage.VALIDATION, "ПРОВЕРКА"),
+        (TaskStage.AWAITING_FINAL_APPROVAL, "[ОЖИД. ИТОГА]"),
+        (TaskStage.DONE, "ГОТОВО"),
+    )
+    #: Отдельные (сбоку) состояния: пауза и терминальные исходы
+    TASK_FSM_ASIDE = (
+        (TaskStage.PAUSED, "ПАУЗА"),
+        (TaskStage.FAILED, "ОШИБКА"),
+        (TaskStage.CANCELLED, "ОТМЕНА"),
+    )
+    #: Цвета узлов графа
+    TASK_FSM_COLORS = {
+        "current": ("#34C759", "#1E9E44"),   # заливка, обводка — текущий
+        "visited": ("#C7C7CC", "#AEAEB2"),   # пройденные — серые
+        "future": ("#FFFFFF", "#C7C7CC"),    # будущие — белые с серой рамкой
+        "paused": ("#FFCC00", "#E6B800"),    # PAUSED — жёлтый
+        "done": ("#007AFF", "#0062CC"),      # DONE — синий (терминальный)
+        "failed": ("#FF3B30", "#D92C22"),    # FAILED — красный
+        "cancelled": ("#8E8E93", "#707075"),  # CANCELLED — серый
+    }
+
+    def _draw_task_fsm_graph(self, task: Optional[Task] = None) -> None:
+        """Рисует граф состояний задачи на Canvas (текущая — подсвечена).
+
+        Главная дорожка: IDLE → ПЛАН → [ОЖИД. ПЛАНА] → ВЫПОЛНЕНИЕ →
+        ПРОВЕРКА → [ОЖИД. ИТОГА] → ГОТОВО; сбоку — ПАУЗА, ОШИБКА, ОТМЕНА
+        (свои цвета). Пройденные стадии — серые, будущие — белые. Без
+        аргумента берётся активная задача агента (перерисовка по
+        ``<Configure>`` при изменении размеров).
+        """
+        canvas = self.task_fsm_canvas
+        if not self._widgets_alive():
+            return
+        canvas.delete("all")
+        if task is None:
+            task = self.agent.active_task
+        if task is None:
+            return
+
+        width = max(int(canvas.winfo_width() or 0), 640)
+        radius = 7
+        track_y, aside_y = 18, 50
+        stage_colors = self.TASK_FSM_COLORS
+
+        def node_style(stage: TaskStage) -> tuple:
+            """Цвет узла: текущий → пройденный/терминальный → будущий."""
+            if stage == task.stage:
+                if stage == TaskStage.PAUSED:
+                    return stage_colors["paused"]
+                if stage == TaskStage.DONE:
+                    return stage_colors["done"]
+                if stage == TaskStage.FAILED:
+                    return stage_colors["failed"]
+                if stage == TaskStage.CANCELLED:
+                    return stage_colors["cancelled"]
+                return stage_colors["current"]
+            track_order = [s for s, _ in self.TASK_FSM_TRACK]
+            if stage in track_order and task.stage in track_order:
+                if track_order.index(stage) < track_order.index(task.stage):
+                    return stage_colors["visited"]
+            return stage_colors["future"]
+
+        # --- Главная дорожка ---
+        margin = 20
+        count = len(self.TASK_FSM_TRACK)
+        spacing = (width - 2 * margin) / max(1, count - 1)
+        positions = {}
+        for index, (stage, label) in enumerate(self.TASK_FSM_TRACK):
+            x = margin + index * spacing
+            positions[stage] = (x, track_y)
+        # Стрелки между соседними узлами дорожки
+        for index in range(count - 1):
+            source = self.TASK_FSM_TRACK[index][0]
+            target = self.TASK_FSM_TRACK[index + 1][0]
+            x1 = positions[source][0] + radius + 2
+            x2 = positions[target][0] - radius - 4
+            canvas.create_line(x1, track_y, x2, track_y,
+                               fill="#AEAEB2", width=1, arrow="last")
+        # Узлы дорожки
+        for stage, label in self.TASK_FSM_TRACK:
+            x, y = positions[stage]
+            fill, outline = node_style(stage)
+            is_current = stage == task.stage
+            canvas.create_oval(
+                x - radius, y - radius, x + radius, y + radius,
+                fill=fill, outline=outline,
+                width=2 if is_current else 1,
+                tags=("node", "current") if is_current else ("node",),
+            )
+            canvas.create_text(
+                x, y + radius + 8, text=label, justify="center",
+                font=("Segoe UI", 7),
+                fill=COLORS["text"] if is_current else COLORS["muted"],
+            )
+
+        # --- Сбоку: пауза и терминальные исходы ---
+        aside_start = width * 0.55
+        aside_spacing = (width - margin - aside_start) \
+            / max(1, len(self.TASK_FSM_ASIDE) - 1)
+        for index, (stage, label) in enumerate(self.TASK_FSM_ASIDE):
+            x = aside_start + index * aside_spacing
+            fill, outline = node_style(stage)
+            is_current = stage == task.stage
+            canvas.create_oval(
+                x - radius, aside_y - radius, x + radius, aside_y + radius,
+                fill=fill, outline=outline,
+                width=2 if is_current else 1,
+                tags=("node", "current") if is_current else ("node",),
+            )
+            canvas.create_text(
+                x + radius + 6, aside_y, text=label, anchor="w",
+                font=("Segoe UI", 7),
+                fill=COLORS["text"] if is_current else COLORS["muted"],
+            )
+
+    def _update_task_fsm_allowed_label(self, task: Task) -> None:
+        """Показывает под графом допустимые переходы текущей стадии.
+
+        AWAITING_STEP_APPROVAL не показывается: он есть в матрице только
+        как исходная стадия старых записей в БД, в новой логике
+        подтверждения шагов нет (решение пользователя из прошлой итерации).
+        """
+        allowed = get_allowed_transitions(task.stage, task.mode)
+        allowed -= {TaskStage.AWAITING_STEP_APPROVAL}
+        order = list(TaskStage)
+        titles = [
+            STAGE_TITLES.get(stage, stage.value)
+            for stage in sorted(allowed, key=order.index)
+        ]
+        text = "Допустимые переходы: " + (", ".join(titles)
+                                          if titles else "нет (стадия без выходов)")
+        self.task_fsm_allowed_label.config(text=text)
 
     def _set_task_status_text(self, text: str) -> None:
         """Обновляет задачный хвост статус-бара и перерисовывает бар."""
@@ -5485,6 +5653,24 @@ class ChatApplication:
         self._set_info(
             f"{model} · {token_str} · {context_str} · {time_str} · {reason_str}"
         )
+
+        # Явные переходы FSM: ответ LLM мог изменить стадию задачи —
+        # обновляем панель и информируем пользователя
+        if result.get("task_transition") is not None:
+            self._refresh_task_panel(self.agent.active_task)
+            transition = result["task_transition"]
+            if transition.get("transition_error"):
+                self._set_status(
+                    f"Переход отклонён: "
+                    f"{transition['transition_error']}"
+                )
+            elif transition.get("transitioned_to"):
+                self._set_status(
+                    f"Задача: переход по маркеру → "
+                    f"{transition['transitioned_to']}."
+                )
+            elif transition.get("hint"):
+                self._set_status(transition["hint"])
 
     def _handle_error(self, result: Dict[str, Any]) -> None:
         """Показывает ошибку: статус-бар + диалог с кнопкой «Повторить».

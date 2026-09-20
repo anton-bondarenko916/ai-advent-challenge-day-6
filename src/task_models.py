@@ -43,6 +43,10 @@ class TaskMode(str, Enum):
     MANUAL = "manual"   # каждый переход требует подтверждения пользователя
 
 
+# Строковые значения стадий (для безопасного разбора payload в журнале)
+TASK_STAGE_VALUES = frozenset(stage.value for stage in TaskStage)
+
+
 # Стадии, в которых задача считается активной (требует внимания/работы).
 # Задачи в остальных стадиях восстанавливать при запуске не нужно.
 ACTIVE_STAGES = frozenset({
@@ -113,7 +117,36 @@ STEP_STATUSES = ("pending", "in_progress", "done", "rejected", "failed")
 
 
 class InvalidTransitionError(Exception):
-    """Попытка запрещённого матрицей перехода FSM."""
+    """Попытка запрещённого матрицей перехода FSM.
+
+    Attributes:
+        from_stage: стадия, из которой выполнялся переход (TaskStage|str).
+        to_stage: целевая стадия (TaskStage|str|None).
+        reason: причина отказа (текст для пользователя и журнала).
+    """
+
+    def __init__(self, from_stage, to_stage=None, reason: str = "") -> None:
+        self.from_stage = from_stage
+        self.to_stage = to_stage
+        self.reason = str(reason or "")
+        if to_stage is None:
+            # Одноаргументная форма (легаси): передан готовый текст ошибки
+            message = str(from_stage)
+        elif self.reason:
+            message = (f"Нельзя перейти {from_stage} → {to_stage}: "
+                       f"{self.reason}")
+        else:
+            message = f"Нельзя перейти {from_stage} → {to_stage}"
+        super().__init__(message)
+
+
+class TerminalStateError(InvalidTransitionError):
+    """Попытка перехода из терминального состояния (done/cancelled).
+
+    Задачи в конечных состояниях не меняются: изменить можно только
+    удалив задачу. Явный подкласс :class:`InvalidTransitionError`, поэтому
+    существующие обработчики ловят и его.
+    """
 
 
 class ActiveTaskExistsError(Exception):
