@@ -130,6 +130,17 @@ DEFAULTS: Dict[str, Any] = {
     "ENABLE_POST_CHECK": True,       # False — без пост-проверки ответов
     "MAX_REGENERATIONS": 2,          # лимит перегенераций при нарушении
     "MIN_RESPONSE_LENGTH": 100,      # ответы короче не проверяются
+    # ------------------------------------------------------------------
+    # MCP-клиент: список инструментов сервера (stdio-транспорт)
+    # ------------------------------------------------------------------
+    "MCP_ENABLED": True,             # False — панель MCP не создаётся
+    "MCP_SERVER_COMMAND": "npx -y open-internet-mcp",  # команда запуска
+    "MCP_TIMEOUT": 30,               # таймаут handshake/tools/list, сек
+    "MCP_LOG_PATH": "mcp.log",       # журнал клиента и stderr сервера
+    # ------------------------------------------------------------------
+    # Состояние UI (сворачивание панели MCP и т.п.): SQLite key-value
+    # ------------------------------------------------------------------
+    "APP_STATE_PATH": "data/app_state.db",  # путь к БД (относительно корня)
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
@@ -154,7 +165,7 @@ _INT_KEYS = (
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
     "SUMMARY_TEMPERATURE", "FACTS_TEMPERATURE", "MEMORY_TEMPERATURE",
-    "MEMORY_MIN_CONFIDENCE",
+    "MEMORY_MIN_CONFIDENCE", "MCP_TIMEOUT",
 )
 
 # Суффиксы переменных окружения с ценами по конкретной модели:
@@ -609,3 +620,84 @@ def get_task_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         max_retries = 3
 
     return {"max_retries": max_retries}
+
+
+def get_project_path(config: Dict[str, Any], key: str) -> Path:
+    """Разрешает путь из конфигурации относительно корня проекта.
+
+    Args:
+        config: словарь конфигурации.
+        key: ключ конфигурации со строкой-путём (например, APP_STATE_PATH).
+
+    Returns:
+        Path: абсолютный путь. Относительные значения отсчитываются от
+        PROJECT_ROOT (как это делает main.py для STORAGE_PATH/TASKS_PATH).
+    """
+    raw = str(config.get(key) or DEFAULTS.get(key) or "")
+    path = Path(raw) if raw else Path(DEFAULTS.get(key, ""))
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def get_mcp_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки MCP-клиента (панель инструментов).
+
+    Команда сервера разбирается через shlex: ``MCP_SERVER_COMMAND`` —
+    одна строка вида ``npx -y open-internet-mcp``. Некорректные значения
+    заменяются значениями по умолчанию с записью предупреждения в лог
+    (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "server_command" (список аргументов),
+        "timeout" (сек), "log_path" (абсолютный Path)}.
+    """
+    import shlex
+
+    cfg = config if config is not None else get_config()
+    logger = get_logger("deepseek-chat.config")
+
+    default_command = str(DEFAULTS["MCP_SERVER_COMMAND"])
+    raw_command = str(cfg.get("MCP_SERVER_COMMAND") or "").strip()
+    if not raw_command:
+        raw_command = default_command
+    # На Windows posix-режим shlex «съедает» обратные слэши в путях,
+    # поэтому там разбор в не-posix режиме; он оставляет кавычки в токенах —
+    # срезаем их (пути вида "C:\Program Files\x.exe" должны сохраниться).
+    try:
+        parts = shlex.split(raw_command, posix=(os.name != "nt"))
+    except ValueError:
+        logger.warning(
+            "Некорректная команда MCP_SERVER_COMMAND=%r — беру %r.",
+            raw_command, default_command,
+        )
+        parts = default_command.split()
+    parts = [part.strip('"').strip("'") for part in parts]
+    if not parts or not parts[0]:
+        logger.warning(
+            "Пустая команда MCP_SERVER_COMMAND=%r — беру %r.",
+            raw_command, default_command,
+        )
+        parts = default_command.split()
+
+    raw_timeout = cfg.get("MCP_TIMEOUT", DEFAULTS["MCP_TIMEOUT"])
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Некорректное значение MCP_TIMEOUT=%r — беру 30.", raw_timeout
+        )
+        timeout = 30.0
+    if not (1.0 <= timeout <= 600.0):
+        logger.warning(
+            "MCP_TIMEOUT=%.0f вне диапазона [1, 600] — беру 30.", timeout
+        )
+        timeout = 30.0
+
+    return {
+        "enabled": bool(cfg.get("MCP_ENABLED", True)),
+        "server_command": parts,
+        "timeout": timeout,
+        "log_path": get_project_path(cfg, "MCP_LOG_PATH"),
+    }

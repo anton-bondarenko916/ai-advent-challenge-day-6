@@ -22,13 +22,15 @@ from tkinter import messagebox, simpledialog, ttk
 
 from . import utils
 from .agent import DeepSeekAgent
-from .config import get_config
+from .app_state import AppStateStore
+from .config import get_config, get_mcp_settings, get_project_path
 from .invariant_models import (
     SCOPE_GLOBAL,
     SCOPE_PROFILE,
     Invariant,
     InvariantCategory,
 )
+from .mcp_panel import MCPPanel
 from .models import ProfileAgentSettings, UserProfile
 from .task_fsm import get_allowed_transitions
 from .task_models import (
@@ -180,6 +182,11 @@ class ChatApplication:
         self._chat_selected_index: Optional[int] = None
         self._chat_message_count = 0
 
+        # Панель MCP (инструменты сервера) и хранилище состояния UI
+        # (сворачивание панели; таблица app_state, создаётся лениво).
+        self._app_state: Optional[AppStateStore] = None
+        self.mcp_panel: Optional[MCPPanel] = None
+
         self._configure_window()
         self._build_widgets()
         self._bind_events()
@@ -277,6 +284,11 @@ class ChatApplication:
         # Панель задачи (FSM) над областью чата: этап, шаг, кнопки
         # управления. Показывается только при активной задаче.
         self._build_task_panel(chat_wrap)
+
+        # Панель MCP справа от области чата: статус, список инструментов,
+        # кнопка обновления. Упаковывается ДО текста чата и его скроллбара,
+        # чтобы занимать правый край вкладки (pack идёт по порядку).
+        self._build_mcp_panel(chat_wrap)
 
         self.chat = tk.Text(
             chat_wrap,
@@ -461,6 +473,51 @@ class ChatApplication:
             fg=COLORS["status_fg"], font=FONTS["status"], anchor="e",
         )
         self.invariant_info_label.pack(side="right", padx=10)
+
+    # ------------------------------------------------------------------
+    # Панель MCP: инструменты сервера рядом с чатом
+    # ------------------------------------------------------------------
+
+    def _build_mcp_panel(self, parent: tk.Frame) -> None:
+        """Создаёт и упаковывает панель MCP (правый край вкладки «Чат»).
+
+        Панель не создаётся при MCP_ENABLED=false. Запрос списка сам по
+        себе НЕ выполняется: на старте статус «Не подключён», список
+        загружается по кнопке «Обновить» (в фоновом потоке панели).
+        """
+        mcp_settings = get_mcp_settings(self.config)
+        if not mcp_settings["enabled"]:
+            return
+        try:
+            self.mcp_panel = MCPPanel(
+                parent, settings=mcp_settings,
+                app_state=self._get_app_state(),
+            )
+        except Exception as exc:  # панель не должна ломать запуск чата
+            utils.get_logger("deepseek-chat.ui").warning(
+                "Панель MCP не создана: %s", exc)
+            self.mcp_panel = None
+            return
+        self.mcp_panel.pack(side="right", fill="y", padx=(6, 0), pady=(0, 4))
+        # Применяем сохранённое сворачивание ПОСЛЕ упаковки: геометрия
+        # свернутой панели зависит от её pack-опций.
+        self.mcp_panel.apply_collapsed_state()
+
+    def _get_app_state(self) -> Optional[AppStateStore]:
+        """Ленивое создание хранилища состояния UI (SQLite app_state).
+
+        Ошибки (нет прав, занятый файл) не фатальны: панель работает,
+        просто состояние сворачивания не сохраняется.
+        """
+        if self._app_state is None:
+            try:
+                self._app_state = AppStateStore(
+                    get_project_path(self.config, "APP_STATE_PATH")
+                )
+            except Exception as exc:
+                utils.get_logger("deepseek-chat.ui").warning(
+                    "Хранилище app_state недоступно: %s", exc)
+        return self._app_state
 
     # ------------------------------------------------------------------
     # Панель задачи (FSM): этап, шаги, кнопки управления
