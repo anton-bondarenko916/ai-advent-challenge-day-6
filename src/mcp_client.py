@@ -1,11 +1,18 @@
-"""MCP-клиент: подключение к серверу и запрос списка инструментов.
+"""MCP-клиент: подключение к серверу, список инструментов и их вызов.
 
 Обёртка над официальным Python SDK ``mcp`` (ClientSession + stdio_client).
 Поддерживается stdio-транспорт: MCP-сервер запускается подпроцессом
-(по умолчанию ``npx -y open-internet-mcp``), обмен идёт через stdin/stdout.
+(по умолчанию ``npx -y open-internet-mcp``; собственный Git-сервер —
+``python -u my_git_server.py``, см. config.MCP_SERVER_COMMAND), обмен
+идёт через stdin/stdout.
 
-На текущем этапе реализован только ``tools/list`` — получение и разбор
-списка инструментов. Вызов инструментов (tools/call) добавляется позже.
+Реализованы два протокольных запроса:
+
+* ``tools/list`` — :meth:`MCPClient.list_tools` (панель инструментов);
+* ``tools/call`` — :meth:`MCPClient.call_tool` (кнопка «Вызвать» в панели).
+
+Каждый вызов — отдельная сессия (запуск процесса → initialize → запрос →
+завершение): предсказуемо для UI и не оставляет фоновых процессов.
 
 Все ошибки SDK оборачиваются в собственные исключения
 (:class:`MCPError` и наследники), чтобы UI показывал понятные сообщения.
@@ -14,12 +21,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from . import utils
 from .config import PROJECT_ROOT
@@ -189,6 +197,142 @@ class MCPClient:
         finally:
             if errlog is not sys.stderr:
                 errlog.close()
+
+    async def call_tool(
+        self, tool_name: str, arguments: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Подключается к серверу и вызывает инструмент (``tools/call``).
+
+        Сессия та же, что в :meth:`list_tools`: запуск подпроцесса →
+        initialize → call_tool → завершение. Результат — pretty-JSON из
+        ``structuredContent`` (у FastMCP-инструментов значение обёрнуто
+        в ``{"result": ...}``); без structuredContent текстовые блоки
+        content склеиваются переводом строки.
+
+        Args:
+            tool_name: имя инструмента на сервере (например,
+                ``get_git_log``).
+            arguments: словарь аргументов инструмента; None — без
+                аргументов (передаётся пустой словарь).
+
+        Returns:
+            Текст результата. Если сервер пометил ответ как ошибочный
+            (``isError`` — например, неизвестное имя инструмента), текст
+            ошибки возвращается как обычный результат: решение «что с ней
+            делать» принимает вызывающий код/UI, а не транспорт.
+
+        Raises:
+            ValueError: имя инструмента пусто.
+            MCPTimeoutError: сервер не ответил за ``self.timeout``.
+            MCPConnectionError: команда не найдена, сервер упал, вернул
+                некорректный ответ или SDK ``mcp`` не установлен.
+        """
+        if not str(tool_name).strip():
+            raise ValueError("Имя инструмента не задано")
+        if not MCP_SDK_AVAILABLE:
+            raise MCPConnectionError(
+                "Python SDK 'mcp' не установлен. Выполните: "
+                "pip install 'mcp>=1.28,<2'"
+            )
+
+        args = dict(arguments) if arguments else {}
+        started = time.monotonic()
+        deadline = started + self.timeout
+        logger.info(
+            "MCP: вызов инструмента %s (команда: %s, аргументы: %s)",
+            tool_name, " ".join(self.server_command), args,
+        )
+
+        params = StdioServerParameters(
+            command=self.server_command[0],
+            args=self.server_command[1:],
+            env=dict(os.environ),
+        )
+
+        errlog = self._open_errlog()
+        try:
+            async with stdio_client(params, errlog=errlog) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await asyncio.wait_for(
+                        session.initialize(), timeout=self.timeout
+                    )
+                    result = await asyncio.wait_for(
+                        session.call_tool(tool_name, args),
+                        timeout=self.timeout,
+                    )
+            text = self._extract_call_text(result)
+            elapsed = time.monotonic() - started
+            if getattr(result, "isError", False):
+                logger.warning(
+                    "MCP: инструмент %s вернул ошибку за %.1f с: %s",
+                    tool_name, elapsed, text,
+                )
+            else:
+                logger.info(
+                    "MCP: инструмент %s ответил за %.1f с", tool_name, elapsed
+                )
+            return text
+        except asyncio.TimeoutError as exc:
+            logger.error("MCP: таймаут вызова %s (%.0f с)", tool_name, self.timeout)
+            raise MCPTimeoutError(
+                f"Инструмент {tool_name} не ответил за {self.timeout:.0f} секунд"
+            ) from exc
+        except FileNotFoundError as exc:
+            logger.error("MCP: команда не найдена: %s", exc)
+            raise self._connection_error_from(exc) from exc
+        except OSError as exc:
+            logger.error("MCP: не удалось запустить сервер: %s", exc)
+            raise self._connection_error_from(exc) from exc
+        except asyncio.CancelledError:
+            # Отмена (закрытие приложения во время вызова): пробрасываем.
+            raise
+        except MCPError:
+            raise
+        except Exception as exc:
+            # SDK может завернуть ошибку в ExceptionGroup при разборке
+            # сессии; если дедлайн истёк — это наш таймаут.
+            if time.monotonic() >= deadline:
+                raise MCPTimeoutError(
+                    f"Инструмент {tool_name} не ответил за "
+                    f"{self.timeout:.0f} секунд"
+                ) from exc
+            logger.error("MCP: ошибка вызова %s: %s", tool_name, exc)
+            raise MCPConnectionError(
+                f"Ошибка вызова {tool_name}: {exc}"
+            ) from exc
+        finally:
+            if errlog is not sys.stderr:
+                errlog.close()
+
+    def _extract_call_text(self, result: Any) -> str:
+        """Извлекает текст результата из CallToolResult SDK.
+
+        Приоритет: ``structuredContent`` — структурированный ответ MCP,
+        у FastMCP-инструментов это JSON результата (значение обёрнуто в
+        ``{"result": ...}`` по правилам annotated structured content).
+        Если его нет — текстовые блоки ``content``, склеенные переводом
+        строки (у FastMCP список разворачивается в блок на элемент).
+
+        Args:
+            result: объект с полями ``structuredContent`` и ``content``.
+
+        Returns:
+            Текст результата (pretty-JSON либо склеенные блоки);
+            «Пустой результат», если ничего нет.
+        """
+        structured = getattr(result, "structuredContent", None)
+        if isinstance(structured, dict):
+            return json.dumps(structured, ensure_ascii=False, indent=2)
+        content = getattr(result, "content", None)
+        blocks = list(content) if content else []
+        parts = [
+            str(getattr(block, "text", ""))
+            for block in blocks
+            if getattr(block, "text", None)
+        ]
+        if not parts:
+            return "Пустой результат"
+        return "\n".join(parts)
 
     # ------------------------------------------------------------------
     # Вспомогательные методы

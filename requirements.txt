@@ -34,8 +34,10 @@ tiktoken>=0.7.0
 
 # ------------------------------------------------------------------
 # MCP-клиент (mcp_models.py / mcp_client.py / mcp_worker.py /
-# mcp_panel.py): официальный Python SDK Model Context Protocol.
-# Подключение к MCP-серверу по stdio (по умолчанию — open-internet-mcp
-# через npx) и запрос списка инструментов (tools/list).
+# mcp_panel.py) и собственный MCP-сервер Git (my_git_server.py):
+# официальный Python SDK Model Context Protocol. Клиент подключается
+# к серверам по stdio (по умолчанию — open-internet-mcp через npx,
+# либо python -u my_git_server.py) и выполняет tools/list + tools/call.
+# Сервер — FastMCP (mcp.server.fastmcp), запускается подпроцессом.
 # ------------------------------------------------------------------
 mcp>=1.28,<2

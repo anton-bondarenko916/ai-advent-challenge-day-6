@@ -2,17 +2,20 @@
 
 MCPPanel — сворачиваемый Frame, который встраивается в правую часть
 вкладки «Чат»: индикатор состояния, кнопка «Обновить», скроллируемый
-список карточек инструментов. Клик по карточке открывает модальное окно
-с описанием и inputSchema (JSON) инструмента.
+список карточек инструментов. Каждая карточка имеет кнопки:
 
-На данном этапе панель ТОЛЬКО получает и показывает список. Вызов
-инструментов — следующий этап подсистемы.
+* «Вызвать» — открывает диалог вызова (open_call_dialog): поля
+  параметров строятся по inputSchema инструмента, результат выводится
+  в то же окно после выполнения в фоновом потоке;
+* «Параметры» — модальное окно с описанием и inputSchema (JSON);
+  туда же ведёт клик по карточке.
 
-Потокобезопасность: запрос списка выполняет MCPWorker в отдельном
-потоке; его callback'и кладут результат в queue.Queue, а главный поток
-опрашивает очередь через ``root.after`` — тот же паттерн, что у задач
-(FSM) в ui.py, поэтому UI никогда не блокируется и не обновляется из
-чужого потока.
+Потокобезопасность: и запрос списка, и вызов инструмента выполняют
+воркеры в отдельных daemon-потоках (MCPWorker / MCPToolCallWorker);
+их callback'и кладут результат в queue.Queue, а главный поток опрашивает
+очередь через ``root.after`` — тот же паттерн, что у задач (FSM) в
+ui.py, поэтому UI никогда не блокируется и не обновляется из чужого
+потока.
 
 Состояние сворачивания сохраняется в SQLite (AppStateStore, таблица
 app_state) и восстанавливается при следующем запуске.
@@ -27,8 +30,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .app_state import AppStateStore
+from .config import PROJECT_ROOT
 from .mcp_models import MCPTool
-from .mcp_worker import MCPWorker
+from .mcp_worker import MCPToolCallWorker, MCPWorker
 
 # Состояния индикатора панели: цвет точки ● и подпись.
 STATUS_IDLE = "idle"            # серый:  «Не подключён» (старт)
@@ -70,6 +74,7 @@ class MCPPanel(tk.Frame):
         settings: Dict[str, Any],
         app_state: Optional[AppStateStore] = None,
         worker_factory: Optional[Callable[[Any, Any], MCPWorker]] = None,
+        call_worker_factory: Optional[Callable[[str, Dict[str, Any], Any, Any], Any]] = None,
     ) -> None:
         """Строит панель.
 
@@ -77,8 +82,11 @@ class MCPPanel(tk.Frame):
             master: родительский виджет (обёртка вкладки «Чат»).
             settings: словарь настроек MCP (get_mcp_settings).
             app_state: хранилище состояния UI (сворачивание панели).
-            worker_factory: фабрика воркера ``f(on_success, on_error)``;
+            worker_factory: фабрика воркера списка ``f(on_success, on_error)``;
                 None — стандартный MCPWorker. Для тестов подаётся фейк.
+            call_worker_factory: фабрика воркера вызова
+                ``f(tool_name, arguments, on_success, on_error)``; None —
+                стандартный MCPToolCallWorker (настройки из settings).
         """
         super().__init__(master, bg="#ECECEC", width=_WIDTH)
         self.settings = settings
@@ -95,6 +103,11 @@ class MCPPanel(tk.Frame):
             self._make_worker = worker_factory
         else:
             self._make_worker = self._default_worker_factory
+
+        if call_worker_factory is not None:
+            self._make_call_worker = call_worker_factory
+        else:
+            self._make_call_worker = self._default_call_worker_factory
 
         self._build_widgets()
 
@@ -222,6 +235,18 @@ class MCPPanel(tk.Frame):
             log_path=str(self.settings.get("log_path") or ""),
         )
 
+    def _default_call_worker_factory(self, tool_name, arguments, on_success, on_error):
+        """Стандартная фабрика вызова: MCPToolCallWorker на тот же сервер."""
+        return MCPToolCallWorker(
+            tool_name=tool_name,
+            arguments=arguments,
+            on_success=on_success,
+            on_error=on_error,
+            server_command=self.settings.get("server_command"),
+            timeout=self.settings.get("timeout"),
+            log_path=str(self.settings.get("log_path") or ""),
+        )
+
     def refresh(self) -> None:
         """Запускает запрос tools/list в фоновом потоке.
 
@@ -320,7 +345,12 @@ class MCPPanel(tk.Frame):
         label.pack(side="top", fill="x", pady=(8, 0))
 
     def _add_tool_card(self, tool: MCPTool) -> None:
-        """Добавляет карточку инструмента (клик — модалка с inputSchema)."""
+        """Добавляет карточку инструмента с кнопками «Вызвать»/«Параметры».
+
+        Клик по карточке (или меткам) открывает модалку с inputSchema —
+        как и кнопка «Параметры»; кнопка «Вызвать» открывает диалог
+        вызова инструмента.
+        """
         card = tk.Frame(
             self.tools_frame, bg="#FFFFFF", bd=1, relief="solid",
             cursor="hand2",
@@ -342,6 +372,27 @@ class MCPPanel(tk.Frame):
                 wraplength=_WIDTH - 40,
             )
             desc_label.pack(side="top", fill="x", padx=6, pady=(0, 4))
+
+        # Кнопки карточки. Собственные виджеты Button: клик по ним НЕ
+        # попадает в binding карточки (parent не входит в bindtags
+        # кнопки), поэтому «Вызвать» не открывает заодно модалку схемы.
+        buttons = tk.Frame(card, bg="#FFFFFF")
+        buttons.pack(side="top", fill="x", padx=6, pady=(0, 6))
+
+        tk.Button(
+            buttons, text="▶ Вызвать",
+            command=lambda t=tool: self.open_call_dialog(t),
+            bg="#007AFF", fg="#FFFFFF", activebackground="#0066D6",
+            activeforeground="#FFFFFF", relief="flat", cursor="hand2",
+            font=FONTS_SMALL,
+        ).pack(side="left")
+
+        tk.Button(
+            buttons, text="Параметры",
+            command=lambda t=tool: self.open_schema_dialog(t),
+            bg="#FFFFFF", fg="#444444", activebackground="#E8E8E8",
+            relief="flat", cursor="hand2", font=FONTS_SMALL,
+        ).pack(side="left", padx=(6, 0))
 
         # Клик по карточке и по её дочерним меткам — открываем схему
         for widget in (card, name_label, desc_label if desc_text else None):
@@ -422,6 +473,24 @@ class MCPPanel(tk.Frame):
         except tk.TclError:
             pass  # окно ещё не отображено (тесты без update())
         return dialog
+
+    # ------------------------------------------------------------------
+    # Диалог вызова инструмента
+    # ------------------------------------------------------------------
+
+    def open_call_dialog(self, tool: MCPTool) -> "_ToolCallDialog":
+        """Открывает диалог вызова инструмента (кнопка «Вызвать»).
+
+        Форма параметров строится по inputSchema; вызов выполняется в
+        отдельном потоке, результат появляется в том же окне.
+
+        Args:
+            tool: инструмент для вызова.
+
+        Returns:
+            Созданное окно (_ToolCallDialog) — для тестов и вызывателя.
+        """
+        return _ToolCallDialog(self, tool)
 
     # ------------------------------------------------------------------
     # Сворачивание панели
@@ -540,6 +609,323 @@ class MCPPanel(tk.Frame):
         except tk.TclError:
             pass
         super().destroy()
+
+
+class _ToolCallDialog(tk.Toplevel):
+    """Модальное окно вызова инструмента MCP (кнопка «Вызвать»).
+
+    Поля формы строятся по inputSchema инструмента (properties,
+    required, default): string — произвольный текст, integer/number —
+    с проверкой числа, boolean — true/false. Пустые необязательные
+    поля на сервер НЕ передаются (там применится значение по умолчанию).
+
+    Вызов выполняет воркер панели (по умолчанию MCPToolCallWorker) в
+    отдельном daemon-потоке; результат доставляется через собственную
+    queue.Queue и опрашивается ``after``-циклом окна — UI не блокируется.
+    Окно можно закрыть во время выполнения: after-задача отменяется,
+    callback воркера уйдёт в очередь, которую больше никто не читает
+    (это безопасно, поток daemon).
+    """
+
+    def __init__(self, panel: MCPPanel, tool: MCPTool) -> None:
+        """Строит окно вызова.
+
+        Args:
+            panel: панель MCP (источник настроек и фабрики воркера).
+            tool: вызываемый инструмент.
+        """
+        super().__init__(panel)
+        self.panel = panel
+        self.tool = tool
+        self._busy = False
+        self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._poll_job: Optional[str] = None
+        self._fields: List[Dict[str, Any]] = []
+
+        self.title(f"Вызов: {tool.name}")
+        self.transient(panel.winfo_toplevel())
+        self.resizable(True, True)
+        self.geometry("+150+110")
+        self._build_widgets()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass  # окно ещё не отображено (тесты без update())
+
+    # ------------------------------------------------------------------
+    # Построение виджетов
+    # ------------------------------------------------------------------
+
+    def _build_widgets(self) -> None:
+        """Заголовок, форма параметров, статус, кнопки, поле результата."""
+        tk.Label(
+            self, text=f"Инструмент: {self.tool.name}", anchor="w",
+            justify="left", font=FONTS_HEADER,
+        ).pack(side="top", fill="x", padx=10, pady=(10, 2))
+
+        fields_frame = tk.Frame(self)
+        fields_frame.pack(side="top", fill="x", padx=10)
+
+        schema = self.tool.input_schema or {}
+        properties = schema.get("properties") or {}
+        required = set(schema.get("required") or [])
+
+        if not properties:
+            tk.Label(
+                fields_frame, text="Инструмент без параметров.",
+                fg="#888888", font=FONTS_SMALL, anchor="w",
+            ).pack(side="top", fill="x", pady=2)
+
+        for name, spec in properties.items():
+            spec = spec if isinstance(spec, dict) else {}
+            ptype = str(spec.get("type") or "string")
+            is_required = name in required
+            row = tk.Frame(fields_frame)
+            row.pack(side="top", fill="x", pady=2)
+            tk.Label(
+                row, text=self._field_label(name, ptype, is_required),
+                font=FONTS_SMALL, anchor="w", justify="left", width=30,
+            ).pack(side="left")
+            var = tk.StringVar(value=self._prefill(name, ptype, spec))
+            entry = tk.Entry(
+                row, textvariable=var, font=FONTS_MONO, width=34,
+            )
+            entry.pack(side="left", fill="x", expand=True)
+            self._fields.append({
+                "name": name,
+                "type": ptype,
+                "required": is_required,
+                "var": var,
+                "entry": entry,
+            })
+
+        self.status_label = tk.Label(
+            self, text="Заполните параметры и нажмите «Выполнить».",
+            fg="#666666", font=FONTS_SMALL, anchor="w", justify="left",
+            wraplength=440,
+        )
+        self.status_label.pack(side="top", fill="x", padx=10, pady=(6, 2))
+
+        buttons = tk.Frame(self)
+        buttons.pack(side="top", fill="x", padx=10, pady=(2, 6))
+
+        self.run_btn = tk.Button(
+            buttons, text="Выполнить", command=self._execute,
+            bg="#007AFF", fg="#FFFFFF", activebackground="#0066D6",
+            activeforeground="#FFFFFF", relief="flat", cursor="hand2",
+            font=FONTS_SMALL,
+        )
+        self.run_btn.pack(side="left")
+
+        self.copy_btn = tk.Button(
+            buttons, text="Копировать результат", command=self._copy_result,
+            state="disabled", relief="flat", cursor="hand2",
+            font=FONTS_SMALL,
+        )
+        self.copy_btn.pack(side="left", padx=(6, 0))
+
+        tk.Button(
+            buttons, text="Закрыть", command=self.destroy,
+            relief="flat", cursor="hand2", font=FONTS_SMALL,
+        ).pack(side="right")
+
+        tk.Label(
+            self, text="Результат:", font=FONTS_SMALL, anchor="w",
+        ).pack(side="top", fill="x", padx=10)
+
+        result_wrap = tk.Frame(self)
+        result_wrap.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self.result_text = tk.Text(
+            result_wrap, height=14, width=56, wrap="none", relief="solid",
+            bd=1, font=FONTS_MONO, bg="#FFFFFF", state="disabled",
+        )
+        result_scroll = ttk.Scrollbar(
+            result_wrap, orient="vertical", command=self.result_text.yview
+        )
+        self.result_text.configure(yscrollcommand=result_scroll.set)
+        result_scroll.pack(side="right", fill="y")
+        self.result_text.pack(side="left", fill="both", expand=True)
+
+    @staticmethod
+    def _field_label(name: str, ptype: str, is_required: bool) -> str:
+        """Подпись поля: имя, тип и звезда у обязательных."""
+        return f"{name}{' *' if is_required else ''} ({ptype})"
+
+    def _prefill(self, name: str, ptype: str, spec: Dict[str, Any]) -> str:
+        """Начальное значение поля.
+
+        ``repo_path`` подставляется из настроек (MCP_GIT_REPO_PATH,
+        по умолчанию — корень проекта), остальные — из ``default``
+        схемы, иначе пустая строка.
+        """
+        if name == "repo_path" and ptype == "string":
+            return str(self.panel.settings.get("git_repo_path") or PROJECT_ROOT)
+        default = spec.get("default")
+        return "" if default is None else str(default)
+
+    # ------------------------------------------------------------------
+    # Сбор аргументов и запуск
+    # ------------------------------------------------------------------
+
+    def _collect_arguments(self) -> Optional[Dict[str, Any]]:
+        """Собирает и валидирует аргументы из формы.
+
+        Returns:
+            Словарь аргументов либо None (ошибка валидации — предупреждение
+            уже показано).
+        """
+        args: Dict[str, Any] = {}
+        for field in self._fields:
+            raw = field["var"].get().strip()
+            name, ptype = field["name"], field["type"]
+            if field["required"] and not raw:
+                self._warn(f"Заполните обязательное поле: {name}")
+                field["entry"].focus_set()
+                return None
+            if not raw:
+                continue  # необязательное пустое поле — не передаём
+            try:
+                args[name] = _parse_argument(raw, ptype)
+            except ValueError as exc:
+                self._warn(f"Некорректное значение поля {name}: {exc}")
+                field["entry"].focus_set()
+                return None
+        return args
+
+    def _execute(self) -> None:
+        """«Выполнить»: валидация → воркер в отдельном потоке → опрос."""
+        if self._busy:
+            return
+        arguments = self._collect_arguments()
+        if arguments is None:
+            return
+        self._busy = True
+        self.run_btn.config(state="disabled")
+        self._set_status("Выполняется...", "#F9A825")
+        worker = self.panel._make_call_worker(
+            self.tool.name,
+            arguments,
+            on_success=lambda text: self._queue.put({"ok": text}),
+            on_error=lambda message: self._queue.put({"error": message}),
+        )
+        worker.start()
+        self._poll_job = self.after(100, self._poll)
+
+    def _poll(self) -> None:
+        """Опрашивает очередь результата воркера (главный поток)."""
+        self._poll_job = None
+        try:
+            while True:
+                item = self._queue.get_nowait()
+                self._busy = False
+                try:
+                    self.run_btn.config(state="normal")
+                except tk.TclError:
+                    pass
+                if "ok" in item:
+                    text = str(item["ok"])
+                    self._show_result(text)
+                    self._set_status(
+                        f"Готово ({len(text)} символов).", "#2E7D32"
+                    )
+                elif "error" in item:
+                    self._set_status(f"Ошибка: {item['error']}", "#C62828")
+                    try:
+                        messagebox.showerror(
+                            "Ошибка вызова", item["error"], parent=self
+                        )
+                    except tk.TclError:
+                        pass  # окно приложения закрывается
+        except queue.Empty:
+            pass
+        finally:
+            if self._busy:
+                self._poll_job = self.after(100, self._poll)
+
+    # ------------------------------------------------------------------
+    # Отображение результата и служебные
+    # ------------------------------------------------------------------
+
+    def _show_result(self, text: str) -> None:
+        """Кладёт текст в поле результата и включает кнопку копирования."""
+        try:
+            self.result_text.config(state="normal")
+            self.result_text.delete("1.0", "end")
+            self.result_text.insert("1.0", text)
+            self.result_text.config(state="disabled")
+            self.copy_btn.config(state="normal")
+        except tk.TclError:
+            pass  # окно уже закрыто
+
+    def _copy_result(self) -> None:
+        """Копирует текст результата в буфер обмена."""
+        try:
+            text = self.result_text.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except tk.TclError:
+            pass
+
+    def _set_status(self, text: str, color: str) -> None:
+        """Обновляет строку статуса (цвет: жёлтый — идёт, зелёный — ок)."""
+        try:
+            self.status_label.config(text=text, fg=color)
+        except tk.TclError:
+            pass
+
+    def _warn(self, message: str) -> None:
+        """Предупреждение валидации формы (не прерывает приложение)."""
+        try:
+            messagebox.showwarning(
+                "Вызов инструмента", message, parent=self
+            )
+        except tk.TclError:
+            pass
+
+    def get_result_text(self) -> str:
+        """Текст поля результата (для тестов)."""
+        return self.result_text.get("1.0", "end-1c")
+
+    def destroy(self) -> None:
+        """Уничтожение окна: снять отложенный опрос очереди."""
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except tk.TclError:
+                pass
+            self._poll_job = None
+        super().destroy()
+
+
+def _parse_argument(raw: str, ptype: str) -> Any:
+    """Преобразует строку поля к типу из inputSchema.
+
+    Args:
+        raw: непустое значение поля (без краевых пробелов).
+        ptype: значение ``type`` из схемы (string/integer/number/boolean);
+            неизвестный тип трактуется как строка.
+
+    Returns:
+        Значение соответствующего типа.
+
+    Raises:
+        ValueError: значение не приводится к типу (текст ошибки —
+            для показа пользователю).
+    """
+    kind = ptype.lower()
+    if kind in ("integer", "int"):
+        return int(raw)
+    if kind == "number":
+        return float(raw)
+    if kind in ("boolean", "bool"):
+        low = raw.lower()
+        if low in ("1", "true", "yes", "да"):
+            return True
+        if low in ("0", "false", "no", "нет"):
+            return False
+        raise ValueError(f"ожидалось true/false, получено: {raw!r}")
+    return raw
 
 
 # Шрифты панели (отдельный словарь, чтобы не трогать FONTS в ui.py).

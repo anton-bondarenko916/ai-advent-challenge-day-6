@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .utils import AVAILABLE_MODELS, get_logger
 
@@ -137,6 +138,8 @@ DEFAULTS: Dict[str, Any] = {
     "MCP_SERVER_COMMAND": "npx -y open-internet-mcp",  # команда запуска
     "MCP_TIMEOUT": 30,               # таймаут handshake/tools/list, сек
     "MCP_LOG_PATH": "mcp.log",       # журнал клиента и stderr сервера
+    "MCP_GIT_REPO_PATH": "",         # репозиторий по умолчанию для вызова
+                                     # get_git_* ("" — корень проекта)
     # ------------------------------------------------------------------
     # Состояние UI (сворачивание панели MCP и т.п.): SQLite key-value
     # ------------------------------------------------------------------
@@ -150,6 +153,7 @@ _BOOL_KEYS = (
     "MEMORY_ENABLED", "MEMORY_WORKING_ENABLED", "MEMORY_LONG_ENABLED",
     "MEMORY_PROPOSE_LLM", "MEMORY_AUTO_APPLY",
     "ENABLE_POST_CHECK",
+    "MCP_ENABLED",
 )
 
 # Переменные, значения которых нужно приводить к числу
@@ -642,16 +646,28 @@ def get_mcp_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Собирает и валидирует настройки MCP-клиента (панель инструментов).
 
     Команда сервера разбирается через shlex: ``MCP_SERVER_COMMAND`` —
-    одна строка вида ``npx -y open-internet-mcp``. Некорректные значения
-    заменяются значениями по умолчанию с записью предупреждения в лог
-    (приложение не должно падать из-за конфигурации).
+    одна строка вида ``npx -y open-internet-mcp`` или
+    ``python -u my_git_server.py`` (собственный сервер). Для локальных
+    серверов применяются два правила-resolve, чтобы команда работала из
+    любого рабочего каталога и любого интерпретатора:
+
+    * голый ``python``/``python3`` заменяется на ``sys.executable`` —
+      тот интерпретатор, под которым запущено приложение (у него есть
+      все зависимости, включая SDK ``mcp``);
+    * относительный путь к ``*.py``-файлу в последнем аргументе
+      разрешается от корня проекта (PROJECT_ROOT).
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
 
     Args:
         config: словарь конфигурации; None — взять из get_config().
 
     Returns:
         Словарь {"enabled", "server_command" (список аргументов),
-        "timeout" (сек), "log_path" (абсолютный Path)}.
+        "timeout" (сек), "log_path" (абсолютный Path),
+        "git_repo_path" (абсолютный Path — репозиторий по умолчанию
+        для инструментов get_git_*)}.
     """
     import shlex
 
@@ -680,6 +696,7 @@ def get_mcp_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             raw_command, default_command,
         )
         parts = default_command.split()
+    parts = _resolve_local_server_command(parts)
 
     raw_timeout = cfg.get("MCP_TIMEOUT", DEFAULTS["MCP_TIMEOUT"])
     try:
@@ -700,4 +717,30 @@ def get_mcp_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "server_command": parts,
         "timeout": timeout,
         "log_path": get_project_path(cfg, "MCP_LOG_PATH"),
+        "git_repo_path": get_project_path(cfg, "MCP_GIT_REPO_PATH"),
     }
+
+
+def _resolve_local_server_command(parts: List[str]) -> List[str]:
+    """Разрешает локальную команду MCP-сервера (python-скрипт проекта).
+
+    Правила (см. get_mcp_settings): голый ``python``/``python3`` →
+    ``sys.executable``; относительный ``*.py`` в последнем аргументе →
+    абсолютный путь от PROJECT_ROOT. Команды вида ``npx ...`` и пути
+    с разделителями каталогов не трогаются.
+
+    Args:
+        parts: разобранные shlex-токены команды.
+
+    Returns:
+        Список токенов после подстановок (копия).
+    """
+    resolved = list(parts)
+    if resolved[0].lower() in ("python", "python3", "python.exe", "python3.exe"):
+        resolved[0] = sys.executable
+    last = resolved[-1]
+    if last.lower().endswith(".py"):
+        path = Path(last)
+        if not path.is_absolute():
+            resolved[-1] = str(PROJECT_ROOT / path)
+    return resolved
