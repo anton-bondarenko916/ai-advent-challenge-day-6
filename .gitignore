@@ -3,6 +3,7 @@
 
 # --- Данные приложения (история диалога, SQLite) ---
 data/
+reminders.db
 
 # --- Python ---
 __pycache__/

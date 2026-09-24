@@ -41,11 +41,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import random
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -164,6 +166,8 @@ class DeepSeekAgent:
         invariant_repository: Optional[InvariantRepository] = None,
         invariant_validator: Optional[InvariantValidator] = None,
         task_max_retries: Optional[int] = None,
+        reminder_client: Optional[Any] = None,
+        max_tool_rounds: Optional[int] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -219,6 +223,11 @@ class DeepSeekAgent:
                 и лимиты обычно передаются из конфига через main.py).
             task_max_retries: лимит откатов validation → execution для FSM
                 задач (конфиг TASKS_MAX_RETRIES); None — ``TASK_RETRY_LIMIT``.
+            reminder_client: HTTP MCP-клиент напоминаний
+                (:class:`src.reminder_client.ReminderMCPClient`); None —
+                tool calling выключен (обычный диалог без tools).
+            max_tool_rounds: лимит циклов «LLM → tool_calls → результат →
+                LLM» за один ход (REMINDER_TOOLCALL_MAX_ROUNDS); None — 5.
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -377,6 +386,19 @@ class DeepSeekAgent:
         self._task_parser = TaskResponseParser()
         self._fsm: Optional[TaskFSM] = None
 
+        # Tool calling (MCP-сервер напоминаний): список tools запрашивается
+        # у сервера лениво и кэшируется (TTL 60 с) — localhost, но на каждый
+        # ход дергать HTTP не нужно. Ошибка сервера не ломает диалог:
+        # просто уходит запрос без tools.
+        self._reminder_client = reminder_client
+        self._max_tool_rounds: int = (
+            int(max_tool_rounds) if max_tool_rounds is not None
+            else 5
+        )
+        self._reminder_tools_cache: Optional[List[Dict[str, Any]]] = None
+        self._reminder_tools_ts: float = 0.0
+        self._reminder_tools_ttl: float = 60.0
+
         # Клиент создаётся только вне mock-режима
         self._client: Optional[OpenAI] = None
         if not self._mock_mode:
@@ -456,7 +478,11 @@ class DeepSeekAgent:
               (ключ появляется, только когда есть активная задача);
             - transition_error: LLM предложила переход, запрещённый
               матрицей FSM (текст ошибки — для статус-бара);
-            - transition_hint: LLM не дала маркер задачи (fail-safe).
+            - transition_hint: LLM не дала маркер задачи (fail-safe);
+            - tool_calls: список выполненных вызовов инструментов
+              напоминаний ``{"name", "arguments", "result"}`` (ключ
+              появляется, только если LLM запросила tool_calls, а
+              подключён MCP-клиент напоминаний).
 
             При ошибке запроса поле tokens = None, а счётчики сессии
             не изменяются.
@@ -553,6 +579,11 @@ class DeepSeekAgent:
                             transition_info["transition_error"]
                     if transition_info.get("hint"):
                         result["transition_hint"] = transition_info["hint"]
+                # Tool calling: какие инструменты вызвала LLM и что они
+                # вернули (UI показывает это под ответом ассистента)
+                executed_tools = payload.pop("tool_calls_executed", [])
+                if executed_tools:
+                    result["tool_calls"] = executed_tools
                 return result
             except ApiError as exc:
                 # При ошибке откатываем сообщение пользователя из истории,
@@ -1543,10 +1574,22 @@ class DeepSeekAgent:
             repo.log_event(task_id, from_stage, to_stage, event_type, payload)
 
     def _call_api(self) -> Dict[str, Any]:
-        """Выполняет реальный запрос к DeepSeek API и разбирает ответ.
+        """Выполняет запрос к DeepSeek API и обрабатывает tool_calls.
+
+        Если подключён MCP-клиент напоминаний (:attr:`_reminder_client`),
+        в запрос добавляется список tools; ответ с ``tool_calls``
+        обрабатывается циклом: инструменты вызываются через MCP-клиент,
+        результаты (роль ``tool`` с ``tool_call_id``) возвращаются LLM
+        для финального ответа. Цикл ограничен ``_max_tool_rounds``.
+        Промежуточные сообщения (assistant с tool_calls, tool) существуют
+        только внутри этого цикла — в историю диалога попадает финальный
+        текст, поэтому персистентность и стратегии контекста не меняются.
 
         Returns:
-            Словарь с ключами content, model, tokens, finish_reason.
+            Словарь с ключами content, model, tokens, finish_reason;
+            при выполнении инструментов добавляется ``tool_calls_executed``
+            (список ``{"name", "arguments", "result"}``), а при Thinking
+            Mode — ``reasoning_content`` последнего ответа.
 
         Raises:
             ApiError: при ошибке аутентификации, сети, лимитов и т.п.
@@ -1555,12 +1598,251 @@ class DeepSeekAgent:
             raise ApiError("Клиент API не инициализирован (mock-режим?).")
 
         request = self._build_request()
-        try:
-            response = self._client.chat.completions.create(**request)
-        except Exception as exc:
-            raise ApiError(humanize_api_error(exc), original=exc)
+        tools = self._get_tools_for_llm()
+        if tools:
+            request["tools"] = tools
+            request["tool_choice"] = "auto"
 
-        return self._handle_response(response)
+        response = self._send_completion(request)
+        payload = self._handle_response(response)
+
+        # Цикл tool calling: пока LLM просит инструменты и лимит не исчерпан
+        executed: List[Dict[str, Any]] = []
+        tokens_acc: Optional[Dict[str, Any]] = payload.get("tokens")
+        rounds = 0
+        while payload.get("tool_calls") and rounds < self._max_tool_rounds:
+            rounds += 1
+            assistant_msg, tool_msgs, events = self._execute_tool_calls(payload)
+            executed.extend(events)
+            request["messages"] = (
+                list(request.get("messages") or []) + [assistant_msg] + tool_msgs
+            )
+            response = self._send_completion(request)
+            payload = self._handle_response(response)
+            tokens_acc = self._merge_tokens(tokens_acc, payload.get("tokens"))
+
+        payload["tokens"] = tokens_acc
+        payload["tool_calls_executed"] = executed
+        return payload
+
+    # ------------------------------------------------------------------
+    # Tool calling: tools от MCP-сервера напоминаний
+    # ------------------------------------------------------------------
+
+    def _get_tools_for_llm(self) -> List[Dict[str, Any]]:
+        """Возвращает tools напоминаний в формате OpenAI/DeepSeek.
+
+        Список инструментов берётся у MCP-сервера по HTTP (tools/list) и
+        кэшируется на ``_reminder_tools_ttl`` секунд. Любая ошибка (сервер
+        не запущен, таймаут) НЕ ломает диалог: возвращается последний
+        закэшированный список или пустой список (запрос без tools).
+
+        Returns:
+            Список словарей ``{"type": "function", "function": {...}}``.
+        """
+        if self._reminder_client is None or self._mock_mode:
+            return []
+        now = time.monotonic()
+        if (self._reminder_tools_cache is not None
+                and now - self._reminder_tools_ts < self._reminder_tools_ttl):
+            return self._reminder_tools_cache
+        try:
+            mcp_tools = asyncio.run(self._reminder_client.list_tools())
+        except Exception as exc:
+            logger.warning(
+                "Tools напоминаний недоступны (сервер не запущен?): %s", exc,
+            )
+            return self._reminder_tools_cache or []
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema
+                    or {"type": "object", "properties": {}},
+                },
+            }
+            for tool in mcp_tools
+        ]
+        self._reminder_tools_cache = tools
+        self._reminder_tools_ts = now
+        logger.info("Tools напоминаний получены: %d шт.", len(tools))
+        return tools
+
+    def _call_reminder_tool(self, name: str,
+                            arguments: Dict[str, Any]) -> str:
+        """Вызывает MCP-инструмент по HTTP (синхронная обёртка над asyncio).
+
+        Ошибки MCP (сервер недоступен, таймаут, isError) превращаются в
+        JSON-строку с полем ``error`` — она уходит LLM как результат
+        инструмента, чтобы модель могла объяснить проблему пользователю,
+        а ход диалога не прерывался (по ТЗ: «не игнорировать ошибки
+        MCP-вызовов», но и не ронять ответ).
+
+        Args:
+            name: имя инструмента (``add_reminder`` и т.п.).
+            arguments: аргументы из tool_calls.
+
+        Returns:
+            Текст результата (JSON) либо JSON с ошибкой.
+        """
+        if self._reminder_client is None:
+            return json.dumps(
+                {"error": "MCP-клиент напоминаний не подключён"},
+                ensure_ascii=False,
+            )
+        try:
+            return asyncio.run(self._reminder_client.call_tool(name, arguments))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Вызов напоминания %s не удался: %s", name, exc)
+            return json.dumps(
+                {"error": f"Сервер напоминаний недоступен: {exc}"},
+                ensure_ascii=False,
+            )
+
+    def _execute_tool_calls(
+        self, payload: Dict[str, Any]
+    ) -> Tuple[Message, List[Message], List[Dict[str, Any]]]:
+        """Выполняет все tool_calls текущего ответа.
+
+        Args:
+            payload: ответ :meth:`_handle_response` с ключом
+                ``tool_calls`` (список ``{"id", "name", "arguments"}``).
+
+        Returns:
+            Кортеж: сообщение ассистента с tool_calls (добавляется в
+            запрос перед результатами), список сообщений роли ``tool``,
+            события для UI ``{"name", "arguments", "result"}``.
+        """
+        raw_calls = payload.get("tool_calls") or []
+        assistant_msg: Message = {
+            "role": "assistant",
+            "content": str(payload.get("content") or ""),
+        }
+        # Thinking Mode: reasoning_content возвращается вместе с
+        # tool_calls (по ТЗ). Если API отвергает это поле — _send_completion
+        # повторит запрос без него (совместимость с версиями API).
+        reasoning = payload.get("reasoning_content")
+        if reasoning:
+            assistant_msg["reasoning_content"] = str(reasoning)
+
+        tool_msgs: List[Message] = []
+        events: List[Dict[str, Any]] = []
+        for call in raw_calls:
+            name = str(call.get("name") or "")
+            raw_arguments = call.get("arguments") or "{}"
+            try:
+                arguments = json.loads(raw_arguments)  # type: ignore[arg-type]
+                if not isinstance(arguments, dict):
+                    arguments = {}
+            except (TypeError, ValueError):
+                arguments = {}
+            result_text = self._call_reminder_tool(name, arguments)
+            tool_msgs.append({
+                "role": "tool",
+                "tool_call_id": str(call.get("id") or ""),
+                "content": result_text,
+            })
+            events.append({
+                "name": name,
+                "arguments": arguments,
+                "result": result_text,
+            })
+            logger.info("Tool call: %s(%s)", name, arguments)
+        # tool_calls уходит в API в исходном виде (id/type/function)
+        assistant_msg["tool_calls"] = [
+            {
+                "id": str(call.get("id") or ""),
+                "type": "function",
+                "function": {
+                    "name": str(call.get("name") or ""),
+                    "arguments": str(call.get("arguments") or "{}"),
+                },
+            }
+            for call in raw_calls
+        ]
+        return assistant_msg, tool_msgs, events
+
+    def _send_completion(self, request: Dict[str, Any]) -> Any:
+        """Отправляет chat.completions.create с повтором без reasoning_content.
+
+        DeepSeek Thinking Mode: reasoning_content передаётся обратно по ТЗ,
+        но некоторые версии API отвечают на него ошибкой 400 — тогда запрос
+        повторяется один раз без этого поля (совместимость без потери хода).
+
+        Args:
+            request: параметры запроса (модель, messages, tools, ...).
+
+        Returns:
+            Объект ответа OpenAI SDK.
+
+        Raises:
+            ApiError: при ошибке аутентификации, сети, лимитов и т.п.
+        """
+        try:
+            return self._client.chat.completions.create(**request)
+        except Exception as exc:
+            message = humanize_api_error(exc)
+            if "reasoning_content" in message.lower() and any(
+                isinstance(m, dict) and "reasoning_content" in m
+                for m in request.get("messages") or []
+            ):
+                logger.warning(
+                    "API отверг reasoning_content — повтор запроса без него."
+                )
+                retry = dict(request)
+                retry["messages"] = self._strip_reasoning_content(
+                    request["messages"]
+                )
+                try:
+                    return self._client.chat.completions.create(**retry)
+                except Exception as retry_exc:
+                    raise ApiError(
+                        humanize_api_error(retry_exc), original=retry_exc
+                    )
+            raise ApiError(message, original=exc)
+
+    @staticmethod
+    def _strip_reasoning_content(messages: List[Any]) -> List[Any]:
+        """Убирает reasoning_content из сообщений запроса (fallback)."""
+        cleaned: List[Any] = []
+        for message in messages:
+            if isinstance(message, dict) and "reasoning_content" in message:
+                message = {
+                    key: value for key, value in message.items()
+                    if key != "reasoning_content"
+                }
+            cleaned.append(message)
+        return cleaned
+
+    @staticmethod
+    def _merge_tokens(acc: Optional[Dict[str, Any]],
+                      new: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Суммирует usage нескольких вызовов API (цикл tool_calls).
+
+        Args:
+            acc: накопленная статистика (None — ещё не было).
+            new: usage очередного ответа (None — API не вернул).
+
+        Returns:
+            Объединённая статистика: числовые поля суммируются, флаг
+            ``estimated`` остаётся True только если ВСЕ ответы оценочные.
+        """
+        if new is None:
+            return acc
+        if acc is None:
+            return dict(new)
+        merged = dict(acc)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                    "cache_hit_tokens", "cache_miss_tokens"):
+            merged[key] = (merged.get(key) or 0) + (new.get(key) or 0)
+        merged["estimated"] = bool(acc.get("estimated")) and bool(
+            new.get("estimated")
+        )
+        return merged
 
     def _handle_response(self, response: Any) -> Dict[str, Any]:
         """Обрабатывает ответ API и извлекает данные.
@@ -1569,7 +1851,10 @@ class DeepSeekAgent:
             response: объект ответа openai (chat.completions).
 
         Returns:
-            Словарь с ключами content, model, tokens, finish_reason.
+            Словарь с ключами content, model, tokens, finish_reason;
+            при запросе с tools добавляются ``tool_calls`` (список
+            ``{"id", "name", "arguments"}``) и ``reasoning_content``
+            (Thinking Mode), если они присутствуют в ответе.
 
         Raises:
             ApiError: если структура ответа неожиданная (нет choices).
@@ -1600,12 +1885,32 @@ class DeepSeekAgent:
                 "cache_miss_tokens": getattr(usage, "prompt_cache_miss_tokens", None),
             }
 
-        return {
+        # Tool calling: вызовы инструментов, запрошенные LLM. Нормализуем
+        # к словарям (аргументы остаются JSON-строкой — их парсит
+        # _execute_tool_calls, в API уходят как есть).
+        tool_calls: List[Dict[str, Any]] = []
+        raw_tool_calls = getattr(message, "tool_calls", None) if message else None
+        for call in raw_tool_calls or []:
+            function = getattr(call, "function", None)
+            tool_calls.append({
+                "id": str(getattr(call, "id", "") or ""),
+                "name": str(getattr(function, "name", "") or ""),
+                "arguments": str(getattr(function, "arguments", "") or "{}"),
+            })
+
+        reasoning = getattr(message, "reasoning_content", None) if message else None
+
+        payload = {
             "content": content,
             "model": getattr(response, "model", None) or self.model,
             "tokens": tokens,
             "finish_reason": getattr(choice, "finish_reason", None),
         }
+        if tool_calls:
+            payload["tool_calls"] = tool_calls
+        if reasoning:
+            payload["reasoning_content"] = str(reasoning)
+        return payload
 
     def _mock_response(self, user_input: str) -> Dict[str, Any]:
         """Имитирует ответ ассистента без обращения к API (для тестов).

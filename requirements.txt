@@ -34,10 +34,14 @@ tiktoken>=0.7.0
 
 # ------------------------------------------------------------------
 # MCP-клиент (mcp_models.py / mcp_client.py / mcp_worker.py /
-# mcp_panel.py) и собственный MCP-сервер Git (my_git_server.py):
-# официальный Python SDK Model Context Protocol. Клиент подключается
-# к серверам по stdio (по умолчанию — open-internet-mcp через npx,
-# либо python -u my_git_server.py) и выполняет tools/list + tools/call.
-# Сервер — FastMCP (mcp.server.fastmcp), запускается подпроцессом.
+# mcp_panel.py) и собственные MCP-серверы: Git (my_git_server.py,
+# stdio) и напоминаний (reminder_server.py, Streamable HTTP).
+# Официальный Python SDK Model Context Protocol: клиент выполняет
+# tools/list + tools/call; серверы — FastMCP (mcp.server.fastmcp).
 # ------------------------------------------------------------------
 mcp>=1.28,<2
+
+# Планировщик MCP-сервера напоминаний (reminder_server.py):
+# BackgroundScheduler проверяет due-напоминания каждую минуту и
+# рассылает SSE-уведомления подписчикам.
+apscheduler>=3.10,<4

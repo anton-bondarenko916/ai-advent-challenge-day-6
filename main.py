@@ -23,11 +23,13 @@ from src.config import (
     get_invariant_settings,
     get_memory_settings,
     get_prices,
+    get_reminder_settings,
     get_strategy_settings,
     get_task_settings,
     load_config,
     validate_api_key,
 )
+from src.reminder_client import ReminderMCPClient
 from src.storage import ContextStore
 from src.profile_repository import ProfileRepository
 from src.invariant_repository import InvariantRepository
@@ -127,6 +129,17 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
     # Модель памяти (short_term | working | long_term): настройки из конфигурации
     memory_settings = get_memory_settings(config)
 
+    # MCP-сервер напоминаний: HTTP-клиент для tool calling (tools → LLM,
+    # tool_calls → MCP-сервер). Сам сервер запускается лаунчером при старте
+    # UI (ChatApplication); недоступный сервер НЕ ломает диалог — запрос
+    # уходит без tools (см. DeepSeekAgent._get_tools_for_llm).
+    reminder_client = None
+    max_tool_rounds = None
+    reminder_settings = get_reminder_settings(config)
+    if reminder_settings["enabled"]:
+        reminder_client = ReminderMCPClient(server_url=reminder_settings["url"])
+        max_tool_rounds = reminder_settings["max_tool_rounds"]
+
     return DeepSeekAgent(
         api_key=config["DEEPSEEK_API_KEY"],
         model=config["DEFAULT_MODEL"],
@@ -154,6 +167,10 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         task_repository=task_repository,
         # Лимит откатов валидации для FSM задач (TASKS_MAX_RETRIES)
         task_max_retries=get_task_settings(config)["max_retries"],
+        # Tool calling напоминаний: tools reminder-сервера передаются в LLM,
+        # tool_calls выполняются через HTTP MCP-клиент
+        reminder_client=reminder_client,
+        max_tool_rounds=max_tool_rounds,
     )
 
 
@@ -214,6 +231,10 @@ def main(argv: List[str]) -> int:
 
     try:
         app = ChatApplication(root=root, agent=agent, config=config)
+        # Напоминания: автозапуск MCP-сервера (не повторяется, если сервер
+        # уже работает — он живёт 24/7) и слушатель SSE-уведомлений
+        app.launch_reminder_server()
+        app.start_reminder_listener()
         app.root.mainloop()
         return 0
     except Exception:

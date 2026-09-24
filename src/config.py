@@ -141,6 +141,13 @@ DEFAULTS: Dict[str, Any] = {
     "MCP_GIT_REPO_PATH": "",         # репозиторий по умолчанию для вызова
                                      # get_git_* ("" — корень проекта)
     # ------------------------------------------------------------------
+    # MCP-сервер напоминаний (reminder_server.py, HTTP-транспорт 24/7)
+    # ------------------------------------------------------------------
+    "REMINDER_ENABLED": True,        # False — без напоминаний и автозапуска
+    "REMINDER_SERVER_HOST": "127.0.0.1",  # только локально, не хостить!
+    "REMINDER_SERVER_PORT": 8000,    # порт http://127.0.0.1:<порт>/mcp
+    "REMINDER_TOOLCALL_MAX_ROUNDS": 5,  # лимит циклов tool calling за ход
+    # ------------------------------------------------------------------
     # Состояние UI (сворачивание панели MCP и т.п.): SQLite key-value
     # ------------------------------------------------------------------
     "APP_STATE_PATH": "data/app_state.db",  # путь к БД (относительно корня)
@@ -154,6 +161,7 @@ _BOOL_KEYS = (
     "MEMORY_PROPOSE_LLM", "MEMORY_AUTO_APPLY",
     "ENABLE_POST_CHECK",
     "MCP_ENABLED",
+    "REMINDER_ENABLED",
 )
 
 # Переменные, значения которых нужно приводить к числу
@@ -165,6 +173,7 @@ _INT_KEYS = (
     "MEMORY_WORKING_MAX_TOKENS", "MEMORY_PIN_MAX",
     "MAX_REGENERATIONS", "MIN_RESPONSE_LENGTH",
     "TASKS_MAX_RETRIES",
+    "REMINDER_SERVER_PORT", "REMINDER_TOOLCALL_MAX_ROUNDS",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
@@ -744,3 +753,80 @@ def _resolve_local_server_command(parts: List[str]) -> List[str]:
         if not path.is_absolute():
             resolved[-1] = str(PROJECT_ROOT / path)
     return resolved
+
+
+def get_reminder_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки подсистемы напоминаний.
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "host", "port", "url", "max_tool_rounds"}:
+        host — только 127.0.0.1 (хостить в интернете запрещено по ТЗ);
+        url — MCP-эндпоинт ``http://<host>:<port>/mcp``.
+    """
+    cfg = config if config is not None else get_config()
+    logger = get_logger("deepseek-chat.config")
+
+    host = str(cfg.get("REMINDER_SERVER_HOST") or DEFAULTS["REMINDER_SERVER_HOST"])
+    host = host.strip() or str(DEFAULTS["REMINDER_SERVER_HOST"])
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(
+            "REMINDER_SERVER_HOST=%s небезопасен — сервер напоминаний "
+            "не должен быть доступен из сети, беру 127.0.0.1.", host,
+        )
+        host = "127.0.0.1"
+
+    raw_port = cfg.get("REMINDER_SERVER_PORT", DEFAULTS["REMINDER_SERVER_PORT"])
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Некорректное значение REMINDER_SERVER_PORT=%r — беру 8000.",
+            raw_port,
+        )
+        port = 8000
+    if not (1 <= port <= 65535):
+        logger.warning(
+            "REMINDER_SERVER_PORT=%d вне диапазона [1, 65535] — беру 8000.",
+            port,
+        )
+        port = 8000
+
+    raw_rounds = cfg.get(
+        "REMINDER_TOOLCALL_MAX_ROUNDS",
+        DEFAULTS["REMINDER_TOOLCALL_MAX_ROUNDS"],
+    )
+    try:
+        max_rounds = int(raw_rounds)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Некорректное значение REMINDER_TOOLCALL_MAX_ROUNDS=%r — беру 5.",
+            raw_rounds,
+        )
+        max_rounds = 5
+    if not (1 <= max_rounds <= 20):
+        logger.warning(
+            "REMINDER_TOOLCALL_MAX_ROUNDS=%d вне диапазона [1, 20] — беру 5.",
+            max_rounds,
+        )
+        max_rounds = 5
+
+    return {
+        "enabled": _coerce_bool(cfg.get("REMINDER_ENABLED", True)),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}/mcp",
+        "max_tool_rounds": max_rounds,
+    }
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Приводит значение настройки к bool (строки «true»/«false» тоже)."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)

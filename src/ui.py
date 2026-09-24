@@ -23,7 +23,12 @@ from tkinter import messagebox, simpledialog, ttk
 from . import utils
 from .agent import DeepSeekAgent
 from .app_state import AppStateStore
-from .config import get_config, get_mcp_settings, get_project_path
+from .config import (
+    get_config,
+    get_mcp_settings,
+    get_project_path,
+    get_reminder_settings,
+)
 from .invariant_models import (
     SCOPE_GLOBAL,
     SCOPE_PROFILE,
@@ -32,6 +37,8 @@ from .invariant_models import (
 )
 from .mcp_panel import MCPPanel
 from .models import ProfileAgentSettings, UserProfile
+from .reminder_client import ReminderNotificationListener
+from .reminder_launcher import ReminderServerLauncher
 from .task_fsm import get_allowed_transitions
 from .task_models import (
     AWAITING_STAGES,
@@ -187,6 +194,17 @@ class ChatApplication:
         self._app_state: Optional[AppStateStore] = None
         self.mcp_panel: Optional[MCPPanel] = None
 
+        # Подсистема напоминаний (MCP-сервер на HTTP): лаунчер и слушатель
+        # SSE-уведомлений создаются лениво (REMINDER_ENABLED), запуск
+        # сервера — main.py (launch_reminder_server) при старте приложения.
+        self.reminder_launcher: Optional[ReminderServerLauncher] = None
+        self.reminder_listener: Optional[ReminderNotificationListener] = None
+        self._reminder_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._reminder_poll_job: Optional[str] = None
+        # Уведомления «🔔 Напоминание: …» для нижней части чата (UI-слой,
+        # не история диалога агента)
+        self._reminder_notifications: List[str] = []
+
         self._configure_window()
         self._build_widgets()
         self._bind_events()
@@ -267,6 +285,27 @@ class ChatApplication:
             self.top_bar, "Очистить задачи", self._on_clear_tasks
         )
         self.clear_tasks_btn.pack(side="right", pady=6)
+
+        # ---- Напоминания: статус сервера + кнопка перезапуска ----
+        # Индикатор слева от заголовка, кнопка — с остальными кнопками
+        # справа. При REMINDER_ENABLED=false ни того, ни другого нет.
+        self.reminder_status_label: Optional[tk.Label] = None
+        self.restart_reminder_btn: Optional[tk.Button] = None
+        if get_reminder_settings(self.config)["enabled"]:
+            self.reminder_status_label = tk.Label(
+                self.top_bar, text="", bg=COLORS["bg"],
+                font=FONTS["default"], fg="#888888", anchor="w",
+            )
+            self.reminder_status_label.pack(side="left", padx=12)
+            self.restart_reminder_btn = self._make_button(
+                self.top_bar, "🔔 Перезапустить сервер",
+                self._on_restart_reminder_server,
+            )
+            self.restart_reminder_btn.pack(side="right", padx=10, pady=6)
+            # Стартовое состояние: сервер мог быть запущен предыдущей
+            # сессией приложения (живёт 24/7) — проверяем порт.
+            self._set_reminder_status("unknown")
+            self.root.after(500, self._check_reminder_server_once)
 
         # ---- 2. Вкладки: Чат / Профиль / Настройки агента ----
         # Вкладка «Чат» содержит область чата; «Профиль» — управление
@@ -518,6 +557,161 @@ class ChatApplication:
                 utils.get_logger("deepseek-chat.ui").warning(
                     "Хранилище app_state недоступно: %s", exc)
         return self._app_state
+
+    # ------------------------------------------------------------------
+    # Напоминания: сервер (24/7), слушатель SSE и уведомления в чате
+    # ------------------------------------------------------------------
+
+    def _get_reminder_launcher(self) -> Optional[ReminderServerLauncher]:
+        """Ленивое создание лаунчера сервера напоминаний.
+
+        Returns:
+            ReminderServerLauncher из настроек (REMINDER_SERVER_HOST/PORT)
+            или None, если подсистема выключена (REMINDER_ENABLED=false).
+        """
+        if self.reminder_launcher is None:
+            settings = get_reminder_settings(self.config)
+            if not settings["enabled"]:
+                return None
+            self.reminder_launcher = ReminderServerLauncher(
+                host=settings["host"], port=settings["port"],
+            )
+        return self.reminder_launcher
+
+    def launch_reminder_server(self) -> None:
+        """Автозапуск сервера напоминаний (вызывается из main.py).
+
+        Если сервер уже работает (порт занят — например, он остался от
+        предыдущей сессии: сервер живёт 24/7), запуск НЕ повторяется.
+        Результат отражается в индикаторе верхней панели.
+        """
+        launcher = self._get_reminder_launcher()
+        if launcher is None:
+            return
+        started, message = launcher.launch()
+        utils.get_logger("deepseek-chat.ui").info("Reminder: %s", message)
+        if launcher.is_server_running():
+            self._set_reminder_status("running")
+        else:
+            # Процесс стартовал, но HTTP ещё не поднялся — статус уточнит
+            # отложенная проверка и слушатель
+            self._set_reminder_status("unknown")
+            self.root.after(2000, self._check_reminder_server_once)
+
+    def _check_reminder_server_once(self) -> None:
+        """Отложенная TCP-проверка сервера (главный поток, after-callback)."""
+        launcher = self._get_reminder_launcher()
+        if launcher is None:
+            return
+        self._set_reminder_status(
+            "running" if launcher.is_server_running() else "down"
+        )
+
+    def start_reminder_listener(self) -> None:
+        """Запускает слушатель SSE-уведомлений сервера (из main.py).
+
+        Слушатель работает в daemon-потоке: держит постоянную MCP-сессию,
+        уведомления «REMINDER: …» складывает в очередь, которую главный
+        поток опрашивает через root.after. Ошибки соединения (сервер не
+        запущен) отображаются индикатором, reconnect — автоматически.
+        """
+        launcher = self._get_reminder_launcher()
+        if launcher is None or self.reminder_listener is not None:
+            return
+        self.reminder_listener = ReminderNotificationListener(
+            server_url=launcher.server_url,
+            on_notification=lambda text: self._reminder_queue.put(
+                {"notification": text}
+            ),
+            on_status=lambda kind, message: self._reminder_queue.put(
+                {"status": kind, "message": message}
+            ),
+        )
+        self.reminder_listener.start()
+        self._poll_reminder_queue()
+
+    def _poll_reminder_queue(self) -> None:
+        """Опрашивает очередь слушателя уведомлений (главный поток)."""
+        try:
+            while True:
+                item = self._reminder_queue.get_nowait()
+                if "notification" in item:
+                    self._on_reminder_notification(str(item["notification"]))
+                elif item.get("status") == "connected":
+                    self._set_reminder_status("running")
+                elif item.get("status") == "error":
+                    # «Сервер не запущен» — по ТЗ показывается в UI
+                    self._set_reminder_status("down")
+        except queue.Empty:
+            pass
+        finally:
+            self._reminder_poll_job = self.root.after(
+                200, self._poll_reminder_queue
+            )
+
+    def _on_reminder_notification(self, text: str) -> None:
+        """Уведомление «REMINDER: …» от сервера — показать в чате.
+
+        Служебный префикс REMINDER: убирается, текст добавляется в
+        UI-список (нижняя часть чата при следующей перерисовке) со
+        звуковым сигналом. История диалога агента не меняется.
+        """
+        body = text.strip()
+        if body.upper().startswith("REMINDER:"):
+            body = body[len("REMINDER:"):].strip()
+        if not body:
+            return
+        self._reminder_notifications.append(body)
+        # Ограничиваем хвост уведомлений: чат перерисовывается целиком
+        if len(self._reminder_notifications) > 20:
+            self._reminder_notifications = \
+                self._reminder_notifications[-20:]
+        try:
+            self.root.bell()
+        except tk.TclError:
+            pass
+        self._refresh_chat()
+        self._set_status(f"🔔 Напоминание: {body[:80]}")
+
+    def _set_reminder_status(self, kind: str) -> None:
+        """Обновляет индикатор сервера напоминаний в верхней панели.
+
+        Args:
+            kind: ``unknown`` (проверяется) | ``running`` (запущен) |
+                ``down`` (не запущен).
+        """
+        if self.reminder_status_label is None:
+            return
+        texts = {
+            "unknown": ("🔔 напоминания: проверяется…", "#888888"),
+            "running": ("🔔 напоминания: сервер запущен", "#2E7D32"),
+            "down": ("🔔 напоминания: сервер не запущен", "#C62828"),
+        }
+        text, color = texts.get(kind, texts["unknown"])
+        try:
+            self.reminder_status_label.config(text=text, fg=color)
+        except tk.TclError:
+            pass  # окно уже закрыто
+
+    def _on_restart_reminder_server(self) -> None:
+        """Кнопка «🔔 Перезапустить сервер» (на случай падения сервера).
+
+        Работающий сервер НЕ останавливается (сервер живёт 24/7, БД не
+        должна пострадать): кнопка поднимает упавший сервер и сообщает
+        результат в статус-баре.
+        """
+        launcher = self._get_reminder_launcher()
+        if launcher is None:
+            self._set_status("Напоминания выключены (REMINDER_ENABLED=false).")
+            return
+        self._set_reminder_status("unknown")
+        started, message = launcher.restart()
+        self._set_status(message)
+        if started:
+            # HTTP поднимается за секунды — уточняем индикатор отложенно
+            self.root.after(2000, self._check_reminder_server_once)
+        else:
+            self._check_reminder_server_once()
 
     # ------------------------------------------------------------------
     # Панель задачи (FSM): этап, шаги, кнопки управления
@@ -2949,6 +3143,15 @@ class ChatApplication:
             "assistant_hdr", font=FONTS["header"], foreground="#555555",
         )
 
+        # Уведомления напоминаний (🔔): тёплый фон, левое выравнивание
+        chat.tag_configure(
+            "reminder", background="#FFF3E0", foreground=COLORS["text"],
+            justify="left", lmargin2=20,
+        )
+        chat.tag_configure(
+            "reminder_hdr", font=FONTS["header"], foreground="#B26A00",
+        )
+
     def _bind_events(self) -> None:
         """Привязывает события клавиатуры, вставки и фокуса."""
         # Ctrl+Enter — отправка сообщения
@@ -3243,6 +3446,9 @@ class ChatApplication:
         тег ``msg_<индекс>``, где индекс считается без учёта system
         (первый показанный пузырь — ``msg_0``): по этому тегу правая кнопка
         мыши определяет, от какого сообщения создавать ветку.
+
+        После истории диалога выводятся уведомления напоминаний
+        (🔔 «…»): они принадлежат UI-слою и в историю агента не входят.
         """
         self.chat.configure(state="normal")
         dialog_index = 0
@@ -3255,6 +3461,8 @@ class ChatApplication:
                         role, message.get("content", ""), index=dialog_index
                     )
                     dialog_index += 1
+            for note in self._reminder_notifications:
+                self._insert_reminder_note(note)
         finally:
             self.chat.configure(state="disabled")
         self._chat_message_count = dialog_index
@@ -3262,6 +3470,21 @@ class ChatApplication:
                 and self._chat_selected_index >= dialog_index):
             self._chat_selected_index = None
         self._scroll_to_end()
+
+    def _insert_reminder_note(self, text: str) -> None:
+        """Рисует уведомление напоминания в нижней части чата.
+
+        Блок не имеет тега ``msg_N``: это не сообщение диалога, ветки от
+        него не создаются и память его не сохраняет.
+        """
+        self.chat.insert("end", "\n", ("reminder",))
+        self.chat.insert(
+            "end", f"[{utils.format_time()}] 🔔 Напоминание:",
+            ("reminder_hdr",),
+        )
+        self.chat.insert("end", "\n", ("reminder",))
+        self.chat.insert("end", text, ("reminder",))
+        self.chat.insert("end", "\n", ("reminder",))
 
     def _insert_message(self, role: str, content: str,
                         index: Optional[int] = None) -> None:
@@ -5711,6 +5934,37 @@ class ChatApplication:
             f"{model} · {token_str} · {context_str} · {time_str} · {reason_str}"
         )
 
+        # Tool calling напоминаний: показываем, какие инструменты вызвала
+        # LLM и что они вернули (служебные строки под ответом ассистента)
+        executed = result.get("tool_calls") or []
+        for call in executed:
+            name = call.get("name") or "?"
+            arguments = call.get("arguments") or {}
+            try:
+                args_str = json.dumps(
+                    arguments, ensure_ascii=False
+                )
+            except (TypeError, ValueError):
+                args_str = str(arguments)
+            result_str = str(call.get("result") or "")
+            if len(result_str) > 200:
+                result_str = result_str[:197] + "..."
+            self._set_status(f"Вызван инструмент: {name}.")
+            self.chat.configure(state="normal")
+            try:
+                self.chat.insert(
+                    "end", "\n",
+                    ("reminder",),
+                )
+                self.chat.insert(
+                    "end", f"🛠 {name} {args_str}\n", ("reminder_hdr",),
+                )
+                self.chat.insert("end", result_str, ("reminder",))
+                self.chat.insert("end", "\n", ("reminder",))
+            finally:
+                self.chat.configure(state="disabled")
+            self._scroll_to_end()
+
         # Явные переходы FSM: ответ LLM мог изменить стадию задачи —
         # обновляем панель и информируем пользователя
         if result.get("task_transition") is not None:
@@ -5759,11 +6013,21 @@ class ChatApplication:
         Сначала — финальный flush контекста агентом (сохранение истории
         и параметров в хранилище), затем закрытие окна. Метод агента
         close() идемпотентен, повторный вызов из main.py безопасен.
+        Сервер напоминаний НЕ останавливается (живёт 24/7): закрывается
+        только слушатель SSE-уведомлений (daemon-поток).
         """
         self._cancel_autosize()
         self._close_context_dialog()
         self._close_branches_dialog()
         self._close_memory_dialog()
         self._close_save_dialog()
+        if self._reminder_poll_job is not None:
+            try:
+                self.root.after_cancel(self._reminder_poll_job)
+            except tk.TclError:
+                pass
+            self._reminder_poll_job = None
+        if self.reminder_listener is not None:
+            self.reminder_listener.stop()
         self.agent.close()
         self.root.destroy()
