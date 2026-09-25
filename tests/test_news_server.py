@@ -214,6 +214,47 @@ class NewsToolsUnitTest(unittest.TestCase):
         self.assertIn("Не удалось сделать сводку", result)
         self.assertIn("сырые новости", result)
 
+    def test_summarize_text_empty_content_falls_back(self) -> None:
+        """Пустой content API (thinking-модель) — НЕ пустой результат.
+
+        Раньше пустой content возвращался как "" — LLM-агент получал
+        пустой результат и отвечал «Сводка недоступна». Теперь пустой
+        ответ считается сбоем: fallback с сырыми данными.
+        """
+        with mock.patch.object(
+            self.ns, "_summarize_via_api", return_value="   ",
+        ), mock.patch.dict(
+            "os.environ", {"DEEPSEEK_API_KEY": "test-key"}
+        ):
+            result = self.ns.summarize_text("сырые новости")
+        self.assertIn("Не удалось сделать сводку", result)
+        self.assertIn("API вернул пустой ответ", result)
+        self.assertIn("сырые новости", result)
+
+    def test_summarize_via_api_raises_on_empty_content(self) -> None:
+        """_summarize_via_api: content=None от thinking-модели → RuntimeError."""
+        message = SimpleNamespace(content=None, reasoning_content="мысли")
+        choice = SimpleNamespace(message=message, finish_reason="stop")
+        response = SimpleNamespace(choices=[choice])
+        client = mock.Mock()
+        client.chat.completions.create.return_value = response
+        with mock.patch("openai.OpenAI", return_value=client):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.ns._summarize_via_api("новости", "key", "model")
+        self.assertIn("пустой ответ", str(ctx.exception))
+
+    def test_summarize_text_retry_then_success(self) -> None:
+        """Первая попытка пустая, вторая успешная — возвращается сводка."""
+        with mock.patch.object(
+            self.ns, "_summarize_via_api",
+            side_effect=["", "# Сводка\n\nГотово."],
+        ) as api, mock.patch.dict(
+            "os.environ", {"DEEPSEEK_API_KEY": "test-key"}
+        ):
+            result = self.ns.summarize_text("сырые новости")
+        self.assertEqual(result, "# Сводка\n\nГотово.")
+        self.assertEqual(api.call_count, 2)
+
     def test_summarize_text_without_api_key(self) -> None:
         """Без ключа API — понятное сообщение и сырой текст."""
         with mock.patch.dict(

@@ -229,6 +229,11 @@ def _summarize_via_api(text: str, api_key: str, model: str) -> str:
 
     Это ОТДЕЛЬНЫЙ вызов API, не связанный с основным агентом: результат
     возвращается инструментом MCP и в историю чата не попадает.
+
+    Raises:
+        RuntimeError: API вернул пустой content (thinking-модель может
+            потратить лимит токенов на reasoning и не дать текст) —
+            вызывающий код уходит в fallback с сырыми данными.
     """
     from openai import OpenAI
 
@@ -245,8 +250,22 @@ def _summarize_via_api(text: str, api_key: str, model: str) -> str:
         temperature=0.3,
         max_tokens=1500,
     )
-    content = response.choices[0].message.content
-    return str(content or "")
+    choice = response.choices[0]
+    content = str(getattr(choice.message, "content", None) or "").strip()
+    if not content:
+        # Пустой content НЕ возвращаем как результат: LLM-агент получит
+        # пустую строку и сообщит «сводка недоступна». Бросаем ошибку —
+        # summarize_text уйдёт в fallback с сырыми данными.
+        has_reasoning = bool(getattr(choice.message, "reasoning_content", None))
+        logging.getLogger("news.summarize").warning(
+            "Пустой content от API (finish_reason=%s, reasoning=%s)",
+            getattr(choice, "finish_reason", None), has_reasoning,
+        )
+        raise RuntimeError(
+            "API вернул пустой ответ "
+            f"(finish_reason={getattr(choice, 'finish_reason', None)})"
+        )
+    return content
 
 
 @mcp.tool()
@@ -258,9 +277,10 @@ def summarize_text(text: str) -> str:
             из search_news).
 
     Returns:
-        Краткая сводка в Markdown. При ошибке API — fallback: сообщение
-        об ошибке и сырой текст (до 2000 символов), чтобы LLM могла
-        продолжить цепочку без сводки.
+        Краткая сводка в Markdown. При ошибке API (включая пустой ответ
+        thinking-модели) делается один повтор, затем — fallback:
+        сообщение об ошибке и сырой текст (до 2000 символов), чтобы LLM
+        могла продолжить цепочку и свести новости сама.
     """
     body = str(text or "").strip()
     if not body:
@@ -276,14 +296,25 @@ def summarize_text(text: str) -> str:
         str(os.environ.get("NEWS_SUMMARY_MODEL") or "").strip()
         or DEFAULT_SUMMARY_MODEL
     )
-    try:
-        return _summarize_via_api(body, api_key, model)
-    except Exception as exc:
-        # Fallback по ТЗ: при ошибке API возвращаем сырой текст
-        return (
-            f"Не удалось сделать сводку: {exc}\n\n"
-            f"Сырые данные:\n{body[:2000]}"
-        )
+    # Один повтор: пустой ответ/сетевой сбой часто проходят со второй
+    # попытки; после обеих неудач — fallback с сырыми данными
+    last_error: Exception = RuntimeError("вызов не выполнялся")
+    for attempt in (1, 2):
+        try:
+            summary = _summarize_via_api(body, api_key, model)
+            if summary.strip():
+                return summary
+            last_error = RuntimeError("API вернул пустой ответ")
+        except Exception as exc:
+            last_error = exc
+        logging.getLogger("news.summarize").warning(
+            "Попытка %d не удалась: %s", attempt, last_error)
+    # Fallback по ТЗ: при ошибке API возвращаем сырой текст — LLM-агент
+    # сможет свести новости сама и сохранить результат
+    return (
+        f"Не удалось сделать сводку: {last_error}\n\n"
+        f"Сырые данные:\n{body[:2000]}"
+    )
 
 
 @mcp.tool()

@@ -574,11 +574,13 @@ class BranchGuiTest(unittest.TestCase):
         self.app._chat_selected_index = 2
         self.assertEqual(self.app._selected_chat_index(), 2)
 
-        # В контекстном меню чата есть пункт создания ветки
-        labels = [
-            str(self.app.chat_menu.entrycget(index, "label"))
-            for index in range(self.app.chat_menu.index("end") + 1)
-        ]
+        # В контекстном меню чата есть пункт создания ветки (сепараторы
+        # пропускаем — у них нет опции label)
+        labels = []
+        for index in range(self.app.chat_menu.index("end") + 1):
+            if str(self.app.chat_menu.type(index)) == "separator":
+                continue
+            labels.append(str(self.app.chat_menu.entrycget(index, "label")))
         self.assertTrue(any("Создать ветку отсюда" in label for label in labels))
 
         with mock.patch("tkinter.simpledialog.askstring",

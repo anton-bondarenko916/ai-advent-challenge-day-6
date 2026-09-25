@@ -280,5 +280,115 @@ class InputFieldRegressionTest(unittest.TestCase):
         self.assertTrue(self.app.input.tag_ranges("sel"))
 
 
+class ChatCopyTest(unittest.TestCase):
+    """Копирование текста из области чата (выделение, Ctrl+C, меню).
+
+    Чат живёт в Text с state="disabled" — выделение мышью там работает,
+    но Ctrl+C при русской раскладке не срабатывает (keysym «Cyrillic_es»),
+    а в контекстном меню не было пункта «Копировать». Здесь проверяются
+    оба пути копирования и «Выделить всё».
+    """
+
+    root: "tk.Tk"
+    _ChatApplication = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.root = gui_helpers.get_root()
+        if cls.root is None:
+            raise unittest.SkipTest("графическая среда недоступна (tkinter/Tk)")
+        from src.ui import ChatApplication
+
+        cls._ChatApplication = ChatApplication
+
+    def setUp(self) -> None:
+        gui_helpers.reset_children(self.root)
+        self.agent = DeepSeekAgent(
+            api_key="", mock_mode=True, token_counter=HeuristicCounter()
+        )
+        self.app = self._ChatApplication(root=self.root, agent=self.agent)
+        # Наполняем чат сообщениями. ВАЖНО: agent.history возвращает
+        # КОПИЮ списка — сеeding только через внутренний список
+        self.agent._message_history.extend([
+            {"role": "user", "content": "прочитай новости"},
+            {"role": "assistant", "content": "Готово: сводка сохранена."},
+        ])
+        self.app._refresh_chat()
+        self.root.update()
+
+    def _select_assistant_word(self) -> str:
+        """Выделяет «Готово:» в ответе ассистента, возвращает выделенное."""
+        start = self.app.chat.search("Готово:", "1.0", exact=False)
+        self.assertTrue(start, "текст ассистента не найден в чате")
+        self.app.chat.tag_add("sel", start, f"{start}+7c")
+        return self.app.chat.get("sel.first", "sel.last")
+
+    def test_selection_persists_after_release(self) -> None:
+        """Выделение мышью работает и переживает возврат в «только чтение».
+
+        Регрессия «не могу выделить»: Tk не ставит sel в отключённом
+        Text — _on_chat_click включает виджет, _on_chat_release
+        возвращает disabled, выделение остаётся.
+        """
+        self.app._on_chat_click()   # включение (state="normal")
+        selected = self._select_assistant_word()
+        self.app._on_chat_release()  # обратно "disabled"
+        self.assertEqual(str(self.app.chat.cget("state")), "disabled")
+        self.assertEqual(self.app.chat.get("sel.first", "sel.last"), selected)
+
+    def test_copy_selection_to_clipboard(self) -> None:
+        """«Копировать выделенное» кладёт выделенный текст в буфер."""
+        self.app._on_chat_click()
+        selected = self._select_assistant_word()
+        self.app._on_chat_release()
+        self.app._on_chat_copy()
+        self.root.update()  # без этого clipboard_get() может вернуть пусто
+        self.assertEqual(self.app.chat.clipboard_get(), selected)
+        self.assertIn("Скопировано", self.app.status_label.cget("text"))
+
+    def test_copy_without_selection_shows_hint(self) -> None:
+        """Без выделения — подсказка в статус-баре, без исключений."""
+        self.app.chat.tag_remove("sel", "1.0", "end")
+        self.app._on_chat_copy()
+        self.assertIn("Выделите", self.app.status_label.cget("text"))
+
+    def test_select_all_covers_whole_chat(self) -> None:
+        """«Выделить всё» выделяет весь текст чата (и чинит state)."""
+        self.app._on_chat_select_all()
+        selected = self.app.chat.get("sel.first", "sel.last")
+        full_text = self.app.chat.get("1.0", "end-1c")
+        self.assertEqual(selected, full_text)
+        self.assertIn("прочитай новости", selected)
+        # Виджет возвращён в «только чтение»
+        self.assertEqual(str(self.app.chat.cget("state")), "disabled")
+
+    def test_ctrl_c_physical_keycode_copies(self) -> None:
+        """Ctrl+C по физическому коду клавиши (67) копирует выделенное."""
+        self.app._on_chat_click()
+        selected = self._select_assistant_word()
+        self.app._on_chat_release()
+        result = self.app._on_chat_ctrl_key(
+            _FakeKeyEvent(keysym="Cyrillic_es", keycode=67))
+        self.assertEqual(result, "break")
+        self.root.update()
+        self.assertEqual(self.app.chat.clipboard_get(), selected)
+
+    def test_ctrl_a_physical_keycode_selects_all(self) -> None:
+        """Ctrl+A по физическому коду клавиши (65) выделяет весь чат."""
+        result = self.app._on_chat_ctrl_key(
+            _FakeKeyEvent(keysym="Cyrillic_ef", keycode=65))
+        self.assertEqual(result, "break")
+        self.assertTrue(self.app.chat.tag_ranges("sel"))
+
+    def test_chat_menu_has_copy_entries(self) -> None:
+        """Контекстное меню: «Копировать выделенное» — первый пункт."""
+        self.assertEqual(
+            self.app.chat_menu.entrycget(0, "label"), "Копировать выделенное"
+        )
+        self.assertEqual(
+            self.app.chat_menu.entrycget(1, "label"), "Выделить всё"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -362,8 +362,16 @@ class ChatApplication:
 
         self._configure_text_tags()
 
-        # Контекстное меню области чата: создание ветки и сохранение в память
+        # Контекстное меню области чата: копирование (всегда доступно)
+        # и действия над сообщением под курсором (ветка/память)
         self.chat_menu = tk.Menu(self.root, tearoff=0)
+        self.chat_menu.add_command(
+            label="Копировать выделенное", command=self._on_chat_copy
+        )
+        self.chat_menu.add_command(
+            label="Выделить всё", command=self._on_chat_select_all
+        )
+        self.chat_menu.add_separator()
         self.chat_menu.add_command(
             label="Создать ветку отсюда…", command=self._on_create_branch_from_chat
         )
@@ -3217,8 +3225,18 @@ class ChatApplication:
         self.strategy_combo.bind(
             "<<ComboboxSelected>>", self._on_strategy_change
         )
-        # Правая кнопка мыши в области чата — «Создать ветку отсюда…»
+        # Правая кнопка мыши в области чата — контекстное меню (копирование,
+        # ветки, память). Левая кнопка: ВКЛЮЧАЕМ виджет на время выделения —
+        # Tk блокирует выделение (sel) в Text со state="disabled" целиком;
+        # после отпускания кнопки возвращаем «только чтение» (см.
+        # _on_chat_click/_on_chat_release). Выделение переживает возврат.
+        self.chat.bind("<Button-1>", self._on_chat_click)
+        self.chat.bind("<ButtonRelease-1>", self._on_chat_release)
         self.chat.bind("<Button-3>", self._show_chat_menu)
+        # Копирование/выделение по физическому коду клавиши: при русской
+        # раскладке <Control-c> не срабатывает (keysym «Cyrillic_es») —
+        # тот же приём, что и для поля ввода
+        self.chat.bind("<Control-KeyPress>", self._on_chat_ctrl_key)
         # Закрытие окна
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -4507,7 +4525,9 @@ class ChatApplication:
         self._chat_selected_index = message_index
         try:
             enabled = "normal" if message_index is not None else "disabled"
-            for position in (0, 1, 2, 3, 4):
+            # Позиции 0-2 занимает блок копирования (всегда активен),
+            # команды над сообщением идут после разделителя — с 3-й
+            for position in (3, 4, 5, 6, 7):
                 self.chat_menu.entryconfigure(position, state=enabled)
         except tk.TclError:
             pass
@@ -4518,6 +4538,106 @@ class ChatApplication:
                 self.chat_menu.grab_release()
             except tk.TclError:
                 pass
+
+    # ------------------------------------------------------------------
+    # Копирование текста из чата (Ctrl+C / контекстное меню)
+    # ------------------------------------------------------------------
+
+    def _on_chat_click(self, _event=None) -> None:
+        """Левый клик по чату: включаем виджет на время выделения.
+
+        Tk не даёт ставить выделение (sel) в Text со state="disabled" —
+        поэтому на время нажатия/перетаскивания левой кнопки виджет
+        включается, а после отпускания (_on_chat_release) возвращается в
+        «только чтение». Заодно чат получает фокус — иначе Ctrl+C/Ctrl+A
+        не дошли бы до него.
+
+        Возврат None не глушит классическую обработку Tk (drag-выделение).
+        """
+        try:
+            self.chat.configure(state="normal")
+            self.chat.focus_set()
+        except tk.TclError:
+            pass
+        return None
+
+    def _on_chat_release(self, _event=None) -> None:
+        """Отпускание левой кнопки: возврат чата в режим «только чтение».
+
+        Сделанное выделение сохраняется (sel-тег не сбрасывается сменой
+        state) — его копируют Ctrl+C и «Копировать выделенное».
+        """
+        try:
+            self.chat.configure(state="disabled")
+        except tk.TclError:
+            pass
+        return None
+
+    def _get_chat_selection(self) -> str:
+        """Выделенный текст чата ("" — ничего не выделено)."""
+        try:
+            return self.chat.get("sel.first", "sel.last")
+        except tk.TclError:
+            return ""
+
+    def _on_chat_copy(self) -> None:
+        """«Копировать выделенное»: выделенный текст → буфер обмена."""
+        text = self._get_chat_selection()
+        if not text:
+            self._set_status(
+                "Выделите текст мышью (и нажмите Ctrl+C), чтобы скопировать."
+            )
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._set_status("Скопировано в буфер обмена.")
+
+    def _on_chat_select_all(self) -> Optional[str]:
+        """«Выделить всё»: выделяет весь текст области чата.
+
+        sel в отключённом Text не ставится — на мгновение включаем виджет
+        и возвращаем прежний режим.
+        """
+        was_disabled = str(self.chat.cget("state")) == "disabled"
+        try:
+            self.chat.configure(state="normal")
+            self.chat.tag_add("sel", "1.0", "end-1c")
+            self.chat.mark_set("insert", "end-1c")
+        except tk.TclError:
+            pass
+        finally:
+            if was_disabled:
+                try:
+                    self.chat.configure(state="disabled")
+                except tk.TclError:
+                    pass
+        return "break"
+
+    def _on_chat_ctrl_key(self, event) -> Optional[str]:
+        """Ctrl+C / Ctrl+A в области чата независимо от раскладки.
+
+        Клавиша определяется по физическому коду (event.keycode), keysym
+        используется как запасной вариант: при русской раскладке привязка
+        ``<Control-c>`` не срабатывает (см. _on_input_ctrl_key).
+
+        Args:
+            event: событие нажатия клавиши с зажатым Ctrl.
+
+        Returns:
+            "break", если событие обработано, иначе None.
+        """
+        key = (event.keysym or "").lower()
+        code = getattr(event, "keycode", None)
+        if code == VK_COPY or key in _COPY_KEYSYMS:
+            text = self._get_chat_selection()
+            if text:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                self._set_status("Скопировано в буфер обмена.")
+            return "break"
+        if code == VK_SELECT_ALL or key in _SELECT_ALL_KEYSYMS:
+            return self._on_chat_select_all()
+        return None
 
     def _on_create_branch_from_chat(self) -> None:
         """Создаёт ветку от сообщения, выбранного правой кнопкой в чате."""
