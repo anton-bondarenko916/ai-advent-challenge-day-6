@@ -37,7 +37,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import feedparser
 from mcp.server.fastmcp import FastMCP
@@ -108,6 +108,22 @@ _SUMMARY_CHARS = 500
 
 # Таймаут загрузки одной RSS-ленты, сек (недоступная лента пропускается)
 _FEED_TIMEOUT = 10.0
+
+# Лимит токенов сводки: у thinking-моделей (deepseek-v4-flash) в этот
+# бюджет входит и reasoning, поэтому на итоговый текст нужна ёмкость
+# с запасом — иначе ответ обрезается (finish_reason=length).
+DEFAULT_SUMMARY_MAX_TOKENS = 8000
+_SUMMARY_MAX_TOKENS_CAP = 32000
+
+
+def _summary_max_tokens() -> int:
+    """Лимит токенов сводки из NEWS_SUMMARY_MAX_TOKENS (с клэмпом)."""
+    raw = str(os.environ.get("NEWS_SUMMARY_MAX_TOKENS") or "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_SUMMARY_MAX_TOKENS
+    except ValueError:
+        value = DEFAULT_SUMMARY_MAX_TOKENS
+    return max(500, min(value, _SUMMARY_MAX_TOKENS_CAP))
 
 
 def load_project_env() -> None:
@@ -224,19 +240,35 @@ def search_news(topic: str, limit: int = 10) -> str:
     }, ensure_ascii=False, indent=2)
 
 
-def _summarize_via_api(text: str, api_key: str, model: str) -> str:
+def _summarize_via_api(text: str, api_key: str, model: str,
+                       max_tokens: Optional[int] = None) -> str:
     """Служебный вызов DeepSeek для сводки (изолирован для тестов).
 
     Это ОТДЕЛЬНЫЙ вызов API, не связанный с основным агентом: результат
     возвращается инструментом MCP и в историю чата не попадает.
 
+    Thinking-модели тратят часть бюджета max_tokens на reasoning, из-за
+    чего ответ обрезается (``finish_reason=length``) или остаётся пустым.
+    При обрезке/пустом ответе выполняется один повтор с УДВОЕННЫМ
+    лимитом; если обрезано и после него — возвращается частичная сводка
+    (это лучше, чем ничего; в логе подсказка поднять
+    NEWS_SUMMARY_MAX_TOKENS).
+
+    Args:
+        text: текст для суммаризации.
+        api_key: ключ DeepSeek API.
+        model: имя модели.
+        max_tokens: лимит токенов; None — NEWS_SUMMARY_MAX_TOKENS
+            (по умолчанию 8000).
+
     Raises:
-        RuntimeError: API вернул пустой content (thinking-модель может
-            потратить лимит токенов на reasoning и не дать текст) —
+        RuntimeError: после обоих вызовов content остался пустым —
             вызывающий код уходит в fallback с сырыми данными.
     """
     from openai import OpenAI
 
+    if max_tokens is None:
+        max_tokens = _summary_max_tokens()
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     prompt = (
         "Сделай краткую сводку следующих новостей в формате Markdown.\n"
@@ -244,28 +276,39 @@ def _summarize_via_api(text: str, api_key: str, model: str) -> str:
         "В конце добавь общий вывод (2-3 предложения).\n\n"
         f"Новости:\n{text}\n"
     )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=1500,
+    logger = logging.getLogger("news.summarize")
+    budget = int(max_tokens)
+    content, finish = "", None
+    for attempt in (1, 2):
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=budget,
+        )
+        choice = response.choices[0]
+        finish = getattr(choice, "finish_reason", None)
+        content = str(getattr(choice.message, "content", None) or "").strip()
+        if content and finish != "length":
+            return content  # полная сводка
+        logger.warning(
+            "Попытка %d: %s (finish_reason=%s, max_tokens=%d) — "
+            "повтор с удвоенным лимитом",
+            attempt,
+            "ответ обрезан" if content else "пустой content",
+            finish, budget,
+        )
+        budget *= 2
+    if content:
+        # Обрезано и на втором вызове: частичная сводка лучше отсутствия
+        logger.warning(
+            "Сводка обрезана и после повтора — увеличьте "
+            "NEWS_SUMMARY_MAX_TOKENS (сейчас %d).", max_tokens,
+        )
+        return content
+    raise RuntimeError(
+        f"API вернул пустой ответ (finish_reason={finish})"
     )
-    choice = response.choices[0]
-    content = str(getattr(choice.message, "content", None) or "").strip()
-    if not content:
-        # Пустой content НЕ возвращаем как результат: LLM-агент получит
-        # пустую строку и сообщит «сводка недоступна». Бросаем ошибку —
-        # summarize_text уйдёт в fallback с сырыми данными.
-        has_reasoning = bool(getattr(choice.message, "reasoning_content", None))
-        logging.getLogger("news.summarize").warning(
-            "Пустой content от API (finish_reason=%s, reasoning=%s)",
-            getattr(choice, "finish_reason", None), has_reasoning,
-        )
-        raise RuntimeError(
-            "API вернул пустой ответ "
-            f"(finish_reason={getattr(choice, 'finish_reason', None)})"
-        )
-    return content
 
 
 @mcp.tool()

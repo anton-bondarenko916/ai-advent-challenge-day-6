@@ -155,6 +155,9 @@ DEFAULTS: Dict[str, Any] = {
     "NEWS_SERVER_HOST": "127.0.0.1", # только локально, не хостить!
     "NEWS_SERVER_PORT": 8001,        # порт http://127.0.0.1:<порт>/mcp
     "NEWS_SUMMARY_MODEL": "",        # "" — deepseek-v4-flash
+    "NEWS_SUMMARY_MAX_TOKENS": 8000, # thinking-модель тратит бюджет и
+                                     # на reasoning — маленький лимит
+                                     # обрезает сводку (finish=length)
     "NEWS_OUTPUT_DIR": "",           # "" — output/ в корне проекта
     "NEWS_RSS_FEEDS": "",            # "" — lenta+rbc+gazeta (в news_server)
     # ------------------------------------------------------------------
@@ -185,7 +188,7 @@ _INT_KEYS = (
     "MAX_REGENERATIONS", "MIN_RESPONSE_LENGTH",
     "TASKS_MAX_RETRIES",
     "REMINDER_SERVER_PORT", "REMINDER_TOOLCALL_MAX_ROUNDS",
-    "NEWS_SERVER_PORT",
+    "NEWS_SERVER_PORT", "NEWS_SUMMARY_MAX_TOKENS",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
@@ -911,11 +914,23 @@ def get_news_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     summary_model = str(cfg.get("NEWS_SUMMARY_MODEL") or "").strip()
     output_dir = str(cfg.get("NEWS_OUTPUT_DIR") or "").strip()
 
+    raw_max_tokens = cfg.get("NEWS_SUMMARY_MAX_TOKENS")
+    try:
+        summary_max_tokens = int(raw_max_tokens)
+    except (TypeError, ValueError):
+        logger = get_logger("deepseek-chat.config")
+        logger.warning(
+            "Некорректное значение NEWS_SUMMARY_MAX_TOKENS=%r — беру 8000.",
+            raw_max_tokens,
+        )
+        summary_max_tokens = 8000
+
     return {
         "enabled": _coerce_bool(cfg.get("NEWS_ENABLED", True)),
         "host": host,
         "port": port,
         "url": f"http://{host}:{port}/mcp",
         "summary_model": summary_model,
+        "summary_max_tokens": summary_max_tokens,
         "output_dir": output_dir,
     }

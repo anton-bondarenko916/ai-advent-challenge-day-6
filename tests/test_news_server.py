@@ -243,6 +243,72 @@ class NewsToolsUnitTest(unittest.TestCase):
                 self.ns._summarize_via_api("новости", "key", "model")
         self.assertIn("пустой ответ", str(ctx.exception))
 
+    # -- finish_reason=length: обрезка сводки по лимиту токенов --
+
+    def test_truncated_summary_retries_with_doubled_budget(self) -> None:
+        """Обрезка (finish_reason=length) → повтор с удвоенным max_tokens."""
+        # 1-й вызов: частичный текст + length; 2-й: полная сводка + stop
+        client = mock.Mock()
+        client.calls = []
+        responses = ["# Частичная", "# Полная сводка"]
+
+        def create(**kwargs):
+            client.calls.append(kwargs)
+            content = responses.pop(0)
+            finish = "length" if responses else "stop"
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=content, reasoning_content=""),
+                finish_reason=finish)])
+
+        client.chat.completions.create.side_effect = create
+        with mock.patch("openai.OpenAI", return_value=client):
+            result = self.ns._summarize_via_api("новости", "key", "model")
+        self.assertEqual(result, "# Полная сводка")
+        # Первый вызов — дефолтный лимит, второй — удвоенный
+        budgets = [c["max_tokens"] for c in client.calls]
+        self.assertEqual(budgets[1], budgets[0] * 2)
+
+    def test_still_truncated_returns_partial(self) -> None:
+        """Обрезано дважды — возвращается частичная сводка (лучше, чем ничего)."""
+        responses = ["# Частичная 1", "# Частичная 2"]
+        client = mock.Mock()
+        client.calls = []
+
+        def create(**kwargs):
+            client.calls.append(kwargs)
+            content = responses.pop(0)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=content, reasoning_content=""),
+                finish_reason="length")])
+
+        client.chat.completions.create.side_effect = create
+        with mock.patch("openai.OpenAI", return_value=client):
+            result = self.ns._summarize_via_api("новости", "key", "model",
+                                                max_tokens=100)
+        self.assertEqual(result, "# Частичная 2")
+        self.assertEqual([c["max_tokens"] for c in client.calls], [100, 200])
+
+    def test_summary_max_tokens_from_env(self) -> None:
+        """NEWS_SUMMARY_MAX_TOKENS задаёт стартовый бюджет (некорректный → 8000)."""
+        client = mock.Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="# Сводка", reasoning_content=""),
+                finish_reason="stop")])
+        with mock.patch("openai.OpenAI", return_value=client), \
+                mock.patch.dict("os.environ",
+                                {"NEWS_SUMMARY_MAX_TOKENS": "4000"}):
+            self.ns._summarize_via_api("новости", "key", "model")
+        self.assertEqual(client.chat.completions.create.call_args.kwargs
+                         ["max_tokens"], 4000)
+
+        with mock.patch("openai.OpenAI", return_value=client), \
+                mock.patch.dict("os.environ",
+                                {"NEWS_SUMMARY_MAX_TOKENS": "abc"}):
+            self.ns._summarize_via_api("новости", "key", "model")
+        self.assertEqual(client.chat.completions.create.call_args.kwargs
+                         ["max_tokens"], 8000)
+
     def test_summarize_text_retry_then_success(self) -> None:
         """Первая попытка пустая, вторая успешная — возвращается сводка."""
         with mock.patch.object(
