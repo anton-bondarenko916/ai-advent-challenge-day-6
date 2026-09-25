@@ -52,8 +52,15 @@ logger_name = "deepseek-chat.reminder"
 
 DEFAULT_URL = "http://127.0.0.1:8000/mcp"
 
-# Таймаут handshake и tools/call: сервер локальный, долгих ответов нет.
+# Таймаут handshake и tools/list: сервер локальный, handshake быстрый.
 _REQUEST_TIMEOUT = 15.0
+
+# Таймаут tools/call: инструменты бывают долгими (summarize_text гоняет
+# свой вызов DeepSeek с reasoning — 30+ секунд). Сюда же попадает
+# httpx-таймаут SDK: если он меньше реального времени работы
+# инструмента, POST обрывается по read timeout и ошибка выглядит как
+# «сервер не запущен», а не «инструмент ещё отвечает».
+_TOOL_CALL_TIMEOUT = 180.0
 
 # Таймаут простоя SSE-потока слушателя: уведомления могут не приходить
 # часами, поэтому стандартные 5 минут SDK не подходят.
@@ -89,30 +96,45 @@ def extract_call_text(result: Any) -> str:
     return "\n".join(parts)
 
 
-def _connection_error(url: str, exc: Exception) -> MCPConnectionError:
-    """Понятное сообщение об ошибке подключения (подсказка для UI)."""
+def _connection_error(url: str, exc: Exception,
+                      label: str = "MCP-сервер") -> MCPConnectionError:
+    """Понятное сообщение об ошибке подключения (подсказка для UI и LLM).
+
+    Текст уходит агенту как результат инструмента и далее пользователю:
+    подпись должна точно называть сервер (news ≠ напоминания), иначе
+    LLM сообщает не о том сервере.
+    """
     return MCPConnectionError(
-        f"Сервер напоминаний не запущен ({url}). "
-        f"Нажмите «Перезапустить сервер» в окне приложения. "
+        f"{label} не запущен ({url}). "
+        f"Он стартует автоматически вместе с приложением в отдельном "
+        f"окне консоли — проверьте, не закрыто ли оно. "
         f"Детали: {exc}"
     )
 
 
 class ReminderMCPClient:
-    """HTTP-клиент MCP-сервера напоминаний (tools/list, tools/call).
+    """HTTP-клиент MCP-сервера на Streamable HTTP (tools/list, tools/call).
+
+    Используется и для напоминаний, и для новостей — подпись ``label``
+    различает их в сообщениях об ошибках.
 
     Attributes:
         server_url: адрес MCP-эндпоинта (например,
             ``http://127.0.0.1:8000/mcp``).
+        label: человекочитаемое имя сервера для сообщений об ошибках.
     """
 
-    def __init__(self, server_url: str = DEFAULT_URL) -> None:
+    def __init__(self, server_url: str = DEFAULT_URL,
+                 label: str = "MCP-сервер") -> None:
         """Настраивает клиент.
 
         Args:
             server_url: URL MCP-эндпоинта сервера.
+            label: имя сервера для сообщений об ошибках
+                («Сервер напоминаний», «News-сервер»).
         """
         self.server_url = str(server_url or DEFAULT_URL)
+        self.label = str(label or "MCP-сервер")
 
     def _require_sdk(self) -> None:
         """Проверяет доступность SDK (иначе — понятная ошибка)."""
@@ -144,17 +166,17 @@ class ReminderMCPClient:
                     )
         except asyncio.TimeoutError as exc:
             raise MCPTimeoutError(
-                f"Сервер напоминаний не ответил за {_REQUEST_TIMEOUT:.0f} с"
+                f"{self.label} не ответил за {_REQUEST_TIMEOUT:.0f} с"
             ) from exc
         except MCPError:
             raise
         except Exception as exc:
-            raise _connection_error(self.server_url, exc) from exc
+            raise _connection_error(self.server_url, exc, self.label) from exc
 
         raw_tools = getattr(response, "tools", None)
         if raw_tools is None:
             raise MCPConnectionError(
-                "Сервер напоминаний вернул некорректный ответ: "
+                f"{self.label} вернул некорректный ответ: "
                 "отсутствует поле tools"
             )
         tools: List[MCPTool] = []
@@ -171,12 +193,18 @@ class ReminderMCPClient:
         return sort_tools(tools)
 
     async def call_tool(self, tool_name: str,
-                        arguments: Optional[Dict[str, Any]] = None) -> str:
+                        arguments: Optional[Dict[str, Any]] = None,
+                        timeout: Optional[float] = None) -> str:
         """Вызывает инструмент по HTTP (отдельная сессия).
 
         Args:
             tool_name: имя инструмента на сервере (``add_reminder`` и др.).
             arguments: словарь аргументов; None/пустой — без аргументов.
+            timeout: таймаут ожидания ответа, сек; None —
+                ``_TOOL_CALL_TIMEOUT`` (180 с: инструменты бывают долгими,
+                например summarize_text с thinking-моделью). Таймаут
+                передаётся и в httpx SDK — иначе POST обрывается раньше
+                (~30 с по умолчанию) с вводящей в заблуждение ошибкой.
 
         Returns:
             Текст результата (pretty-JSON structuredContent либо склеенные
@@ -184,30 +212,31 @@ class ReminderMCPClient:
             текст — решение принимает вызывающий код (агент/UI).
 
         Raises:
-            MCPTimeoutError: сервер не ответил за таймаут запроса.
+            MCPTimeoutError: инструмент не ответил за таймаут.
             MCPConnectionError: сервер недоступен.
         """
         self._require_sdk()
+        seconds = float(timeout) if timeout else _TOOL_CALL_TIMEOUT
         args = dict(arguments) if arguments else {}
         try:
-            async with streamablehttp_client(self.server_url) as (read, write, _):
+            async with streamablehttp_client(
+                self.server_url, timeout=timedelta(seconds=seconds),
+            ) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await asyncio.wait_for(
                         session.initialize(), timeout=_REQUEST_TIMEOUT
                     )
                     result = await asyncio.wait_for(
-                        session.call_tool(tool_name, args),
-                        timeout=_REQUEST_TIMEOUT,
+                        session.call_tool(tool_name, args), timeout=seconds,
                     )
         except asyncio.TimeoutError as exc:
             raise MCPTimeoutError(
-                f"Инструмент {tool_name} не ответил за "
-                f"{_REQUEST_TIMEOUT:.0f} с"
+                f"Инструмент {tool_name} не ответил за {seconds:.0f} с"
             ) from exc
         except MCPError:
             raise
         except Exception as exc:
-            raise _connection_error(self.server_url, exc) from exc
+            raise _connection_error(self.server_url, exc, self.label) from exc
         return extract_call_text(result)
 
 

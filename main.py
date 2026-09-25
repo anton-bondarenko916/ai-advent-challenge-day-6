@@ -133,11 +133,15 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
     # MCP-сервер напоминаний: HTTP-клиент для tool calling (tools → LLM,
     # tool_calls → MCP-сервер). Сам сервер запускается лаунчером при старте
     # UI (ChatApplication); недоступный сервер НЕ ломает диалог — запрос
-    # уходит без tools (см. DeepSeekAgent._get_tools_for_llm).
+    # уходит без tools (см. DeepSeekAgent._get_tools_for_llm). Подпись
+    # label попадает в тексты ошибок — LLM сообщает верный сервер.
     reminder_client = None
     reminder_settings = get_reminder_settings(config)
     if reminder_settings["enabled"]:
-        reminder_client = ReminderMCPClient(server_url=reminder_settings["url"])
+        reminder_client = ReminderMCPClient(
+            server_url=reminder_settings["url"],
+            label="Сервер напоминаний",
+        )
 
     # MCP-сервер новостей: search_news (RSS) → summarize_text (DeepSeek
     # внутри сервера) → save_to_file (output/). Цепочку строит LLM в
@@ -145,7 +149,10 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
     news_client = None
     news_settings = get_news_settings(config)
     if news_settings["enabled"]:
-        news_client = ReminderMCPClient(server_url=news_settings["url"])
+        news_client = ReminderMCPClient(
+            server_url=news_settings["url"],
+            label="News-сервер",
+        )
     max_tool_rounds = reminder_settings["max_tool_rounds"]
 
     return DeepSeekAgent(

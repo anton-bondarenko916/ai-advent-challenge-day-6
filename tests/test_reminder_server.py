@@ -1044,5 +1044,47 @@ class ReminderClientUtilsTest(unittest.TestCase):
         self.assertEqual(received, [])
 
 
+class ReminderClientTimeoutLabelTest(unittest.TestCase):
+    """Таймауты tools/call и подпись сервера в тексте ошибок HTTP-клиента.
+
+    Регрессия «Суммаризатор не доступен — MCP-сервер напоминаний не
+    запущен»: (1) текст ошибки был зашит «Сервер напоминаний не запущен»
+    в общем для напоминаний и новостей клиенте — LLM сообщала не о том
+    сервере; (2) tools/call ждал 15 с (а httpx SDK ~30 с), хотя
+    summarize_text с thinking-моделью идёт дольше, и обрыв выглядел как
+    «сервер не запущен».
+    """
+
+    def test_tool_call_timeout_is_long(self) -> None:
+        """call_tool ждёт минуты, а не 15 с: summarize_text долгий."""
+        from src.reminder_client import _TOOL_CALL_TIMEOUT
+
+        self.assertGreaterEqual(_TOOL_CALL_TIMEOUT, 120.0)
+
+    def test_dead_server_error_uses_client_label(self) -> None:
+        """Недоступный news-сервер подписывается «News-сервер», не «напоминаний»."""
+        from src.mcp_client import MCPConnectionError
+        from src.reminder_client import ReminderMCPClient
+
+        news = ReminderMCPClient("http://127.0.0.1:9/mcp",
+                                 label="News-сервер")
+        with self.assertRaises(MCPConnectionError) as ctx:
+            asyncio.run(news.call_tool("summarize_text", {"text": "x"}))
+        message = str(ctx.exception)
+        self.assertIn("News-сервер не запущен", message)
+        self.assertNotIn("напоминаний", message.lower())
+        self.assertIn("http://127.0.0.1:9/mcp", message)
+
+    def test_default_label_is_neutral(self) -> None:
+        """Без подписи клиент говорит нейтрально «MCP-сервер»."""
+        from src.mcp_client import MCPConnectionError
+        from src.reminder_client import ReminderMCPClient
+
+        client = ReminderMCPClient("http://127.0.0.1:9/mcp")
+        with self.assertRaises(MCPConnectionError) as ctx:
+            asyncio.run(client.call_tool("x", {}))
+        self.assertIn("MCP-сервер не запущен", str(ctx.exception))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
