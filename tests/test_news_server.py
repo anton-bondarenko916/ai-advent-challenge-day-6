@@ -30,9 +30,11 @@ import asyncio
 import json
 import queue
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -139,6 +141,48 @@ class NewsToolsUnitTest(unittest.TestCase):
         result = json.loads(self.ns.search_news("е", limit=1))
         self.assertEqual(result["count"], 1)
 
+    # -- Поисковые ленты ({topic}-шаблон, например Google News) --
+
+    def test_topic_feed_substitutes_and_encodes_topic(self) -> None:
+        """{topic} подставляется в URL с URL-кодированием (кириллица)."""
+        captured = {}
+
+        def fake_fetch(url: str) -> bytes:
+            captured["url"] = url
+            return RSS_FIXTURE.read_bytes()
+
+        with mock.patch.object(self.ns, "RSS_FEEDS", {
+            "gq": "https://news.test/rss?q={topic}&hl=ru",
+        }), mock.patch.object(self.ns, "_fetch_feed", side_effect=fake_fetch):
+            result = json.loads(self.ns.search_news("технологии"))
+
+        # Кириллица закодирована quote_plus («сырых» букв в URL нет)
+        self.assertTrue(captured["url"].startswith(
+            "https://news.test/rss?q=%D1%82"), captured["url"])
+        # Фильтр не применялся: вернулись ВСЕ записи фикстуры (4), хотя
+        # слово «технологи» есть только в двух
+        self.assertEqual(result["count"], 4)
+
+    def test_topic_feed_returns_results_without_word_match(self) -> None:
+        """Для {topic}-ленты тема не обязана встречаться в тексте записи."""
+        with mock.patch.object(self.ns, "RSS_FEEDS", {
+            "gq": "https://news.test/rss?q={topic}",
+        }), mock.patch.object(self.ns, "_fetch_feed",
+                              return_value=RSS_FIXTURE.read_bytes()):
+            result = json.loads(self.ns.search_news("квантовые сенсоры"))
+        # Статическая лента дала бы 0, поисковая — все свои записи
+        self.assertNotIn("error", result)
+        self.assertEqual(result["count"], 4)
+        self.assertEqual(result["news"][0]["source"], "gq")
+
+    def test_static_feed_still_filters_locally(self) -> None:
+        """Обычная лента (без {topic}) фильтруется как раньше."""
+        with mock.patch.object(self.ns, "RSS_FEEDS", {
+            "test": RSS_FIXTURE.as_uri(),
+        }):
+            result = json.loads(self.ns.search_news("квантовые сенсоры"))
+        self.assertIn("error", result)
+
     # -- ТЗ 4: суммаризация через DeepSeek API --
 
     def test_summarize_text_calls_api(self) -> None:
@@ -214,6 +258,28 @@ class NewsServerHTTPTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tmp_dir = Path(tempfile.mkdtemp(prefix="news_http_"))
         cls.output_dir = cls.tmp_dir / "output"
+        # Локальный HTTP-сервер с фикстурой: имитирует поисковую ленту
+        # ({topic}-шаблон) без обращения к внешним сайтам
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        fixture_bytes = RSS_FIXTURE.read_bytes()
+
+        class _RSSHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 — API http.server
+                self.send_response(200)
+                self.send_header("Content-Type", "application/rss+xml")
+                self.end_headers()
+                self.wfile.write(fixture_bytes)
+
+            def log_message(self, *args):  # тишина в выводе тестов
+                pass
+
+        cls.rss_server = ThreadingHTTPServer(("127.0.0.1", 0), _RSSHandler)
+        cls.rss_port = cls.rss_server.server_address[1]
+        threading.Thread(
+            target=cls.rss_server.serve_forever, daemon=True
+        ).start()
+
         cls.port = _free_port()
         cls.url = f"http://127.0.0.1:{cls.port}/mcp"
         cls.log_file = cls.tmp_dir / "news_server.log"
@@ -222,8 +288,12 @@ class NewsServerHTTPTest(unittest.TestCase):
                 sys.executable, "-u", NEWS_SERVER,
                 "--port", str(cls.port),
                 "--output-dir", str(cls.output_dir),
-                # Локальная фикстура вместо сетевых лент: тест офлайн
-                "--feeds", f"test={RSS_FIXTURE.as_uri()}",
+                # Поисковая лента ({topic}) на локальном HTTP-сервере +
+                # статическая фикстура через file:// — всё офлайн
+                "--feeds",
+                "gq=http://127.0.0.1:%d/rss?q={topic};test=%s" % (
+                    cls.rss_port, RSS_FIXTURE.as_uri(),
+                ),
                 # Пустой ключ — summarize_text уходит в fallback (ТЗ 8)
             ],
             stdout=open(cls.log_file, "a", encoding="utf-8"),
@@ -256,6 +326,8 @@ class NewsServerHTTPTest(unittest.TestCase):
             cls.process.wait(timeout=5)
         except subprocess.TimeoutExpired:  # pragma: no cover
             cls.process.kill()
+        cls.rss_server.shutdown()
+        cls.rss_server.server_close()
         import shutil
 
         shutil.rmtree(cls.tmp_dir, ignore_errors=True)
@@ -285,19 +357,36 @@ class NewsServerHTTPTest(unittest.TestCase):
     # -- ТЗ 3: поиск по HTTP --
 
     def test_search_news_via_http(self) -> None:
-        """search_news по HTTP читает ленту и фильтрует по теме.
+        """search_news по HTTP: поисковая лента + статическая фикстура.
 
         Инструмент возвращает JSON-СТРОКУ — FastMCP оборачивает её в
         structuredContent ``{"result": "<json>"}``, поэтому после
-        unwrap нужен второй json.loads.
+        unwrap нужен второй json.loads. Поисковая лента gq отдаёт все
+        4 записи (фильтр на её стороне), статическая test — 2 совпадения.
         """
         raw = _unwrap(json.loads(self._call(
             "search_news", {"topic": "технологии"},
         )))
         payload = json.loads(raw)
         self.assertNotIn("error", payload)
-        self.assertEqual(payload["count"], 2)
-        self.assertEqual(payload["news"][0]["source"], "test")
+        self.assertEqual(payload["count"], 6)
+        sources = {n["source"] for n in payload["news"]}
+        self.assertEqual(sources, {"gq", "test"})
+
+    def test_query_feed_skips_local_filter_via_http(self) -> None:
+        """{topic}-лента отвечает записями без слова в теме (фильтр — там).
+
+        Тема «квантовый планшет» в фикстуре не встречается: статическая
+        лента не даст совпадений, а поисковая вернёт все свои записи —
+        локальный фильтр к ней не применялся.
+        """
+        raw = _unwrap(json.loads(self._call(
+            "search_news", {"topic": "квантовый планшет"},
+        )))
+        payload = json.loads(raw)
+        self.assertNotIn("error", payload)
+        self.assertEqual(payload["count"], 4)
+        self.assertTrue(all(n["source"] == "gq" for n in payload["news"]))
 
     # -- ТЗ 8: fallback по HTTP --
 

@@ -14,10 +14,11 @@
   возвращает абсолютный путь (UI показывает кнопку «Открыть файл»).
 
 Конфигурация (env или CLI, см. main()): NEWS_RSS_FEEDS — список лент
-``имя=url;имя=url`` (по умолчанию lenta.ru, rssexport.rbc.ru + запасная
-gazeta.ru), NEWS_OUTPUT_DIR — папка результатов (по умолчанию output/
-в корне проекта), DEEPSEEK_API_KEY — ключ для summarize_text (читается
-из .env проекта, если не задан в окружении).
+``имя=url;имя=url`` (по умолчанию Google News с поиском по теме через
+шаблон ``{topic}`` + статические cnews/3dnews/habr/kommersant/lenta),
+NEWS_OUTPUT_DIR — папка результатов (по умолчанию output/ в корне
+проекта), DEEPSEEK_API_KEY — ключ для summarize_text (читается из .env
+проекта, если не задан в окружении).
 
 Запуск вручную::
 
@@ -32,6 +33,7 @@ import argparse
 import json
 import logging
 import os
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -52,12 +54,24 @@ mcp = FastMCP(
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # RSS-ленты по умолчанию (ТЗ: lenta.ru + rssexport.rbc.ru; третья —
-# запасная на случай, когда основные не отвечают — ошибки лент
+# запасные на случай, когда поисковая лента не отвечает — ошибки лент
 # пропускаются, не роняя инструмент).
+#
+# Шаблон ``{topic}``: если URL содержит его, тема подставляется в запрос
+# (URL-кодирование автоматическое) и поиск выполняется НА стороне
+# провайдера — локальный текстовый фильтр для такой ленты не применяется
+# (все её записи уже релевантны теме). Так подключается любой поисковый
+# RSS (Google News и т.п.) одной строкой NEWS_RSS_FEEDS.
 DEFAULT_RSS_FEEDS: Dict[str, str] = {
+    "google": (
+        "https://news.google.com/rss/search?q={topic}"
+        "&hl=ru&gl=RU&ceid=RU:ru"
+    ),
+    "cnews": "https://www.cnews.ru/inc/rss/news.xml",
+    "3dnews": "https://3dnews.ru/news/rss/",
+    "habr": "https://habr.com/ru/rss/news/?fl=ru",
+    "kommersant": "https://www.kommersant.ru/RSS/news.xml",
     "lenta": "https://lenta.ru/rss/news",
-    "rbc": "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
-    "gazeta": "https://www.gazeta.ru/export/rss/lenta.xml",
 }
 
 
@@ -136,9 +150,11 @@ def _fetch_feed(url: str) -> bytes:
 def search_news(topic: str, limit: int = 10) -> str:
     """Найти свежие новости по теме в RSS-лентах.
 
-    Ленты опрашиваются по очереди; недоступная лента пропускается
-    (не прерывает поиск). Фильтр — вхождение темы в заголовок или
-    описание новости без учёта регистра.
+    Поисковые ленты (URL с шаблоном ``{topic}``, например Google News)
+    фильтруют тему НА своей стороне — их записи принимаются как есть.
+    Обычные ленты фильтруются локально: вхождение темы в заголовок или
+    описание без учёта регистра. Ленты опрашиваются по очереди;
+    недоступная лента пропускается (не прерывает поиск).
 
     Args:
         topic: Тема для поиска (например, "технологии", "политика").
@@ -148,7 +164,8 @@ def search_news(topic: str, limit: int = 10) -> str:
         JSON-строка: {"topic", "count", "news": [{title, link, summary,
         source}]}. Если новостей по теме нет — {"error": "..."}.
     """
-    topic_lower = str(topic or "").strip().lower()
+    topic_raw = str(topic or "").strip()
+    topic_lower = topic_raw.lower()
     if not topic_lower:
         return json.dumps(
             {"error": "Укажите тему поиска (topic)"}, ensure_ascii=False
@@ -161,8 +178,15 @@ def search_news(topic: str, limit: int = 10) -> str:
     all_news: List[Dict[str, str]] = []
     errors: List[str] = []
     for source_name, feed_url in RSS_FEEDS.items():
+        # Поисковая лента: подставляем тему в URL (кодирование —
+        # quote_plus: кириллица и пробелы становятся %XX/+)
+        is_query_feed = "{topic}" in feed_url
+        url = (
+            feed_url.replace("{topic}", urllib.parse.quote_plus(topic_raw))
+            if is_query_feed else feed_url
+        )
         try:
-            feed = feedparser.parse(_fetch_feed(feed_url))
+            feed = feedparser.parse(_fetch_feed(url))
         except Exception as exc:
             # Пропускаем недоступную ленту, идём к следующей (по ТЗ)
             errors.append(f"{source_name}: {exc}")
@@ -170,13 +194,18 @@ def search_news(topic: str, limit: int = 10) -> str:
         for entry in feed.entries:
             title = str(getattr(entry, "title", "") or "")
             summary = str(getattr(entry, "summary", "") or "")
-            if topic_lower in title.lower() or topic_lower in summary.lower():
-                all_news.append({
-                    "title": title,
-                    "link": str(getattr(entry, "link", "") or ""),
-                    "summary": summary[:_SUMMARY_CHARS],
-                    "source": source_name,
-                })
+            # У поисковой ленты записи уже релевантны теме — локальный
+            # буквальный фильтр не применяется
+            if (not is_query_feed
+                    and topic_lower not in title.lower()
+                    and topic_lower not in summary.lower()):
+                continue
+            all_news.append({
+                "title": title,
+                "link": str(getattr(entry, "link", "") or ""),
+                "summary": summary[:_SUMMARY_CHARS],
+                "source": source_name,
+            })
             if len(all_news) >= limit:
                 break
         if len(all_news) >= limit:
