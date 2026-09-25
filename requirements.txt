@@ -45,3 +45,8 @@ mcp>=1.28,<2
 # BackgroundScheduler проверяет due-напоминания каждую минуту и
 # рассылает SSE-уведомления подписчикам.
 apscheduler>=3.10,<4
+
+# RSS-парсинг в MCP-сервере новостей (news_server.py):
+# search_news читает ленты lenta.ru / rssexport.rbc.ru и фильтрует
+# записи по теме для agentic loop (поиск → сводка → сохранение).
+feedparser>=6.0,<7

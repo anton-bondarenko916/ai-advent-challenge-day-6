@@ -4,6 +4,7 @@
 # --- Данные приложения (история диалога, SQLite) ---
 data/
 reminders.db
+output/
 
 # --- Python ---
 __pycache__/

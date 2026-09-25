@@ -167,6 +167,7 @@ class DeepSeekAgent:
         invariant_validator: Optional[InvariantValidator] = None,
         task_max_retries: Optional[int] = None,
         reminder_client: Optional[Any] = None,
+        news_client: Optional[Any] = None,
         max_tool_rounds: Optional[int] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
@@ -225,9 +226,12 @@ class DeepSeekAgent:
                 задач (конфиг TASKS_MAX_RETRIES); None — ``TASK_RETRY_LIMIT``.
             reminder_client: HTTP MCP-клиент напоминаний
                 (:class:`src.reminder_client.ReminderMCPClient`); None —
-                tool calling выключен (обычный диалог без tools).
+                напоминания не участвуют в tool calling.
+            news_client: HTTP MCP-клиент новостей
+                (:class:`src.reminder_client.ReminderMCPClient` на
+                news_server.py); None — инструменты новостей выключены.
             max_tool_rounds: лимит циклов «LLM → tool_calls → результат →
-                LLM» за один ход (REMINDER_TOOLCALL_MAX_ROUNDS); None — 5.
+                LLM» за один ход (agentic loop); None — 5.
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
@@ -386,18 +390,27 @@ class DeepSeekAgent:
         self._task_parser = TaskResponseParser()
         self._fsm: Optional[TaskFSM] = None
 
-        # Tool calling (MCP-сервер напоминаний): список tools запрашивается
-        # у сервера лениво и кэшируется (TTL 60 с) — localhost, но на каждый
-        # ход дергать HTTP не нужно. Ошибка сервера не ломает диалог:
-        # просто уходит запрос без tools.
+        # Tool calling (агентный цикл по MCP-серверам: напоминания и
+        # новости). Список tools запрашивается у серверов лениво и
+        # кэшируется по клиенту (TTL 60 с) — localhost, но на каждый ход
+        # дергать HTTP не нужно. Ошибка одного сервера не ломает диалог:
+        # его tools просто не попадают в запрос.
         self._reminder_client = reminder_client
+        self._news_client = news_client
+        self._tool_clients: List[Any] = [
+            client for client in (reminder_client, news_client)
+            if client is not None
+        ]
         self._max_tool_rounds: int = (
             int(max_tool_rounds) if max_tool_rounds is not None
             else 5
         )
-        self._reminder_tools_cache: Optional[List[Dict[str, Any]]] = None
-        self._reminder_tools_ts: float = 0.0
-        self._reminder_tools_ttl: float = 60.0
+        # Кэш tools по клиенту: id(client) → (timestamp, tools в формате LLM)
+        self._tools_cache: Dict[int, Tuple[float, List[Dict[str, Any]]]] = {}
+        self._tools_ttl: float = 60.0
+        # Маршрутизация вызовов: имя инструмента → клиент его сервера
+        # (обновляется при каждом успешном list_tools)
+        self._tool_routes: Dict[str, Any] = {}
 
         # Клиент создаётся только вне mock-режима
         self._client: Optional[OpenAI] = None
@@ -482,7 +495,10 @@ class DeepSeekAgent:
             - tool_calls: список выполненных вызовов инструментов
               напоминаний ``{"name", "arguments", "result"}`` (ключ
               появляется, только если LLM запросила tool_calls, а
-              подключён MCP-клиент напоминаний).
+              подключён MCP-клиент напоминаний);
+            - file_path: абсолютный путь файла, сохранённого инструментом
+              save_to_file news-сервера (ключ появляется, только если
+              вызов состоялся; UI показывает кнопку «📂 Открыть файл»).
 
             При ошибке запроса поле tokens = None, а счётчики сессии
             не изменяются.
@@ -584,6 +600,11 @@ class DeepSeekAgent:
                 executed_tools = payload.pop("tool_calls_executed", [])
                 if executed_tools:
                     result["tool_calls"] = executed_tools
+                # Путь сохранённого файла (save_to_file news-сервера) —
+                # для кнопки «📂 Открыть файл»
+                saved_path = payload.pop("saved_file_path", None)
+                if saved_path:
+                    result["file_path"] = saved_path
                 return result
             except ApiError as exc:
                 # При ошибке откатываем сообщение пользователя из истории,
@@ -1623,56 +1644,106 @@ class DeepSeekAgent:
 
         payload["tokens"] = tokens_acc
         payload["tool_calls_executed"] = executed
+        # Путь сохранённого файла (инструмент save_to_file news-сервера) —
+        # UI показывает по нему кнопку «Открыть файл»
+        payload["saved_file_path"] = self._extract_saved_file_path(executed)
         return payload
 
+    @staticmethod
+    def _extract_saved_file_path(
+        events: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Путь из последнего успешного вызова save_to_file (или None).
+
+        Результат инструмента — текст; у FastMCP это pretty-JSON
+        ``{"result": "<путь>"}``, на всякий случай принимается и «сырой»
+        путь. Строки с ошибками («Ошибка сохранения: …») путём не
+        считаются.
+        """
+        for event in reversed(events):
+            if event.get("name") != "save_to_file":
+                continue
+            result = str(event.get("result") or "")
+            try:
+                parsed = json.loads(result)
+            except (TypeError, ValueError):
+                parsed = None
+            if (isinstance(parsed, dict)
+                    and isinstance(parsed.get("result"), str)):
+                result = parsed["result"]
+            result = result.strip()
+            if result and not result.lower().startswith("ошибка"):
+                return result
+        return None
+
     # ------------------------------------------------------------------
-    # Tool calling: tools от MCP-сервера напоминаний
+    # Tool calling: tools от MCP-серверов (напоминания, новости)
     # ------------------------------------------------------------------
 
     def _get_tools_for_llm(self) -> List[Dict[str, Any]]:
-        """Возвращает tools напоминаний в формате OpenAI/DeepSeek.
+        """Собирает tools всех подключённых MCP-серверов (формат OpenAI).
 
-        Список инструментов берётся у MCP-сервера по HTTP (tools/list) и
-        кэшируется на ``_reminder_tools_ttl`` секунд. Любая ошибка (сервер
-        не запущен, таймаут) НЕ ломает диалог: возвращается последний
-        закэшированный список или пустой список (запрос без tools).
+        Для каждого клиента: кэш на ``_tools_ttl`` секунд, при промахе —
+        tools/list по HTTP; сервер недоступен → его предыдущий кэш или
+        пустой вклад (диалог живёт без его инструментов). Попутно
+        строится маршрут вызовов «имя инструмента → клиент»
+        (:attr:`_tool_routes`); при совпадении имён у разных серверов
+        побеждает первый (предупреждение в логе).
 
         Returns:
             Список словарей ``{"type": "function", "function": {...}}``.
         """
-        if self._reminder_client is None or self._mock_mode:
+        if not self._tool_clients or self._mock_mode:
             return []
         now = time.monotonic()
-        if (self._reminder_tools_cache is not None
-                and now - self._reminder_tools_ts < self._reminder_tools_ttl):
-            return self._reminder_tools_cache
-        try:
-            mcp_tools = asyncio.run(self._reminder_client.list_tools())
-        except Exception as exc:
-            logger.warning(
-                "Tools напоминаний недоступны (сервер не запущен?): %s", exc,
-            )
-            return self._reminder_tools_cache or []
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema
-                    or {"type": "object", "properties": {}},
-                },
-            }
-            for tool in mcp_tools
-        ]
-        self._reminder_tools_cache = tools
-        self._reminder_tools_ts = now
-        logger.info("Tools напоминаний получены: %d шт.", len(tools))
+        tools: List[Dict[str, Any]] = []
+        routes: Dict[str, Any] = {}
+        for client in self._tool_clients:
+            cached = self._tools_cache.get(id(client))
+            if cached is not None and now - cached[0] < self._tools_ttl:
+                client_tools = cached[1]
+            else:
+                try:
+                    mcp_tools = asyncio.run(client.list_tools())
+                except Exception as exc:
+                    logger.warning(
+                        "Tools MCP-сервера недоступны (сервер не запущен?): %s",
+                        exc,
+                    )
+                    client_tools = cached[1] if cached is not None else []
+                else:
+                    client_tools = [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.input_schema
+                                or {"type": "object", "properties": {}},
+                            },
+                        }
+                        for tool in mcp_tools
+                    ]
+                    self._tools_cache[id(client)] = (now, client_tools)
+                    logger.info(
+                        "Tools MCP-сервера получены: %d шт.", len(client_tools)
+                    )
+            for tool in client_tools:
+                name = tool["function"]["name"]
+                if name in routes:
+                    logger.warning(
+                        "Инструмент %r есть у нескольких MCP-серверов — "
+                        "используется первый.", name,
+                    )
+                    continue
+                routes[name] = client
+                tools.append(tool)
+        self._tool_routes = routes
         return tools
 
-    def _call_reminder_tool(self, name: str,
-                            arguments: Dict[str, Any]) -> str:
-        """Вызывает MCP-инструмент по HTTP (синхронная обёртка над asyncio).
+    def _call_tool_via_mcp(self, name: str,
+                           arguments: Dict[str, Any]) -> str:
+        """Вызывает MCP-инструмент по HTTP (маршрут — по имени инструмента).
 
         Ошибки MCP (сервер недоступен, таймаут, isError) превращаются в
         JSON-строку с полем ``error`` — она уходит LLM как результат
@@ -1681,25 +1752,29 @@ class DeepSeekAgent:
         MCP-вызовов», но и не ронять ответ).
 
         Args:
-            name: имя инструмента (``add_reminder`` и т.п.).
+            name: имя инструмента (``add_reminder``, ``save_to_file``, …).
             arguments: аргументы из tool_calls.
 
         Returns:
             Текст результата (JSON) либо JSON с ошибкой.
         """
-        if self._reminder_client is None:
+        client = self._tool_routes.get(name)
+        if client is None:
+            # Маршруты заполняются при сборке tools того же хода; попадание
+            # сюда — LLM выдумала инструмент без tools → ошибка модели
             return json.dumps(
-                {"error": "MCP-клиент напоминаний не подключён"},
+                {"error": f"Инструмент {name!r} не найден ни на одном "
+                          f"MCP-сервере"},
                 ensure_ascii=False,
             )
         try:
-            return asyncio.run(self._reminder_client.call_tool(name, arguments))
+            return asyncio.run(client.call_tool(name, arguments))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Вызов напоминания %s не удался: %s", name, exc)
+            logger.warning("Вызов инструмента %s не удался: %s", name, exc)
             return json.dumps(
-                {"error": f"Сервер напоминаний недоступен: {exc}"},
+                {"error": f"MCP-сервер недоступен: {exc}"},
                 ensure_ascii=False,
             )
 
@@ -1740,7 +1815,7 @@ class DeepSeekAgent:
                     arguments = {}
             except (TypeError, ValueError):
                 arguments = {}
-            result_text = self._call_reminder_tool(name, arguments)
+            result_text = self._call_tool_via_mcp(name, arguments)
             tool_msgs.append({
                 "role": "tool",
                 "tool_call_id": str(call.get("id") or ""),

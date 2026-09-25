@@ -13,7 +13,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .utils import AVAILABLE_MODELS, get_logger
 
@@ -148,6 +148,16 @@ DEFAULTS: Dict[str, Any] = {
     "REMINDER_SERVER_PORT": 8000,    # порт http://127.0.0.1:<порт>/mcp
     "REMINDER_TOOLCALL_MAX_ROUNDS": 5,  # лимит циклов tool calling за ход
     # ------------------------------------------------------------------
+    # MCP-сервер новостей (news_server.py, HTTP-транспорт 24/7):
+    # search_news (RSS) → summarize_text (DeepSeek) → save_to_file
+    # ------------------------------------------------------------------
+    "NEWS_ENABLED": True,            # False — без новостей и автозапуска
+    "NEWS_SERVER_HOST": "127.0.0.1", # только локально, не хостить!
+    "NEWS_SERVER_PORT": 8001,        # порт http://127.0.0.1:<порт>/mcp
+    "NEWS_SUMMARY_MODEL": "",        # "" — deepseek-v4-flash
+    "NEWS_OUTPUT_DIR": "",           # "" — output/ в корне проекта
+    "NEWS_RSS_FEEDS": "",            # "" — lenta+rbc+gazeta (в news_server)
+    # ------------------------------------------------------------------
     # Состояние UI (сворачивание панели MCP и т.п.): SQLite key-value
     # ------------------------------------------------------------------
     "APP_STATE_PATH": "data/app_state.db",  # путь к БД (относительно корня)
@@ -162,6 +172,7 @@ _BOOL_KEYS = (
     "ENABLE_POST_CHECK",
     "MCP_ENABLED",
     "REMINDER_ENABLED",
+    "NEWS_ENABLED",
 )
 
 # Переменные, значения которых нужно приводить к числу
@@ -174,6 +185,7 @@ _INT_KEYS = (
     "MAX_REGENERATIONS", "MIN_RESPONSE_LENGTH",
     "TASKS_MAX_RETRIES",
     "REMINDER_SERVER_PORT", "REMINDER_TOOLCALL_MAX_ROUNDS",
+    "NEWS_SERVER_PORT",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
@@ -830,3 +842,80 @@ def _coerce_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def _local_host_and_port(
+    cfg: Dict[str, Any],
+    host_key: str,
+    port_key: str,
+    default_port: int,
+) -> Tuple[str, int]:
+    """Валидирует host/port локального MCP-сервера (общее для подсистем).
+
+    host принимается только локальным (127.0.0.1/localhost/::1) —
+    хостить серверы в интернете запрещено; некорректный порт → default.
+
+    Returns:
+        Кортеж (host, port) с безопасными значениями.
+    """
+    logger = get_logger("deepseek-chat.config")
+
+    host = str(cfg.get(host_key) or "").strip() or "127.0.0.1"
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(
+            "%s=%s небезопасен — локальный MCP-сервер не должен быть "
+            "доступен из сети, беру 127.0.0.1.", host_key, host,
+        )
+        host = "127.0.0.1"
+
+    raw_port = cfg.get(port_key)
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Некорректное значение %s=%r — беру %d.",
+            port_key, raw_port, default_port,
+        )
+        port = default_port
+    if not (1 <= port <= 65535):
+        logger.warning(
+            "%s=%d вне диапазона [1, 65535] — беру %d.",
+            port_key, port, default_port,
+        )
+        port = default_port
+    return host, port
+
+
+def get_news_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки подсистемы новостей.
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "host", "port", "url", "summary_model",
+        "output_dir"}: url — MCP-эндпоинт news-сервера;
+        summary_model — модель сводки ("" → deepseek-v4-flash);
+        output_dir — папка результатов save_to_file
+        ("" → output/ в корне проекта).
+    """
+    cfg = config if config is not None else get_config()
+
+    host, port = _local_host_and_port(
+        cfg, "NEWS_SERVER_HOST", "NEWS_SERVER_PORT", 8001
+    )
+
+    summary_model = str(cfg.get("NEWS_SUMMARY_MODEL") or "").strip()
+    output_dir = str(cfg.get("NEWS_OUTPUT_DIR") or "").strip()
+
+    return {
+        "enabled": _coerce_bool(cfg.get("NEWS_ENABLED", True)),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}/mcp",
+        "summary_model": summary_model,
+        "output_dir": output_dir,
+    }

@@ -26,6 +26,7 @@ from .app_state import AppStateStore
 from .config import (
     get_config,
     get_mcp_settings,
+    get_news_settings,
     get_project_path,
     get_reminder_settings,
 )
@@ -37,6 +38,7 @@ from .invariant_models import (
 )
 from .mcp_panel import MCPPanel
 from .models import ProfileAgentSettings, UserProfile
+from .news_launcher import NewsServerLauncher
 from .reminder_client import ReminderNotificationListener
 from .reminder_launcher import ReminderServerLauncher
 from .task_fsm import get_allowed_transitions
@@ -199,11 +201,18 @@ class ChatApplication:
         # сервера — main.py (launch_reminder_server) при старте приложения.
         self.reminder_launcher: Optional[ReminderServerLauncher] = None
         self.reminder_listener: Optional[ReminderNotificationListener] = None
+        # News-сервер (search_news → summarize_text → save_to_file):
+        # лаунчер создаётся лениво, запуск — main.py (launch_news_server)
+        self.news_launcher: Optional[NewsServerLauncher] = None
         self._reminder_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._reminder_poll_job: Optional[str] = None
         # Уведомления «🔔 Напоминание: …» для нижней части чата (UI-слой,
         # не история диалога агента)
         self._reminder_notifications: List[str] = []
+        # Файлы, сохранённые инструментом save_to_file (news-сервер):
+        # по ним в чате рисуется кнопка «📂 Открыть файл» (переживает
+        # перерисовку чата, ограничен хвост)
+        self._saved_files: List[str] = []
 
         self._configure_window()
         self._build_widgets()
@@ -606,6 +615,29 @@ class ChatApplication:
         self._set_reminder_status(
             "running" if launcher.is_server_running() else "down"
         )
+
+    def _get_news_launcher(self) -> Optional[NewsServerLauncher]:
+        """Ленивое создание лаунчера news-сервера (NEWS_ENABLED=false → None)."""
+        if self.news_launcher is None:
+            settings = get_news_settings(self.config)
+            if not settings["enabled"]:
+                return None
+            self.news_launcher = NewsServerLauncher(
+                host=settings["host"], port=settings["port"],
+            )
+        return self.news_launcher
+
+    def launch_news_server(self) -> None:
+        """Автозапуск news-сервера (вызывается из main.py).
+
+        Если сервер уже работает (порт занят — например, он остался от
+        предыдущей сессии: сервер живёт 24/7), запуск НЕ повторяется.
+        """
+        launcher = self._get_news_launcher()
+        if launcher is None:
+            return
+        started, message = launcher.launch()
+        utils.get_logger("deepseek-chat.ui").info("News: %s", message)
 
     def start_reminder_listener(self) -> None:
         """Запускает слушатель SSE-уведомлений сервера (из main.py).
@@ -3463,6 +3495,8 @@ class ChatApplication:
                     dialog_index += 1
             for note in self._reminder_notifications:
                 self._insert_reminder_note(note)
+            for saved_path in self._saved_files:
+                self._insert_file_button(saved_path)
         finally:
             self.chat.configure(state="disabled")
         self._chat_message_count = dialog_index
@@ -3485,6 +3519,85 @@ class ChatApplication:
         self.chat.insert("end", "\n", ("reminder",))
         self.chat.insert("end", text, ("reminder",))
         self.chat.insert("end", "\n", ("reminder",))
+
+    def _insert_file_button(self, path: str) -> None:
+        """Рисует блок «сохранённый файл» с кнопкой «📂 Открыть файл».
+
+        Кнопка встраивается в область чата через ``window_create`` —
+        клики работают даже при ``state="disabled"``. Блок — UI-слой
+        (без тега ``msg_N``), перерисовывается из :attr:`_saved_files`.
+        """
+        from pathlib import Path as _Path
+
+        self.chat.insert("end", "\n", ("reminder",))
+        self.chat.insert(
+            "end", f"[{utils.format_time()}] 📂 Файл сохранён:",
+            ("reminder_hdr",),
+        )
+        self.chat.insert("end", "\n", ("reminder",))
+        self.chat.insert("end", str(path), ("reminder",))
+        self.chat.insert("end", "  ", ("reminder",))
+        try:
+            button = tk.Button(
+                self.chat, text="📂 Открыть файл",
+                command=lambda p=str(path): self._open_file(p),
+                bg="#007AFF", fg="#FFFFFF", activebackground="#0066D6",
+                activeforeground="#FFFFFF", relief="flat", cursor="hand2",
+                font=FONTS["small"], bd=0,
+            )
+            self.chat.window_create("end", window=button)
+        except tk.TclError:
+            pass  # окно уже закрывается
+        self.chat.insert("end", "\n", ("reminder",))
+
+    def _open_file(self, path: str) -> None:
+        """Открывает сохранённый файл в ассоциированном приложении.
+
+        Windows — ``os.startfile``; прочие платформы — open/xdg-open.
+        Ошибки (файл удалён, нет ассоциации) показываются пользователю.
+        """
+        import os as _os
+        import subprocess as _subprocess
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        if not _Path(path).exists():
+            messagebox.showerror(
+                "Открыть файл",
+                f"Файл не найден:\n{path}",
+                parent=self.root,
+            )
+            return
+        try:
+            if _sys.platform == "win32":
+                _os.startfile(path)  # noqa: S606 — путь из своего инструмента
+            elif _sys.platform == "darwin":
+                _subprocess.Popen(["open", path])
+            else:
+                _subprocess.Popen(["xdg-open", path])
+            self._set_status("Файл открыт.")
+        except OSError as exc:
+            messagebox.showerror(
+                "Открыть файл",
+                f"Не удалось открыть файл: {exc}",
+                parent=self.root,
+            )
+
+    def _remember_saved_file(self, path: str) -> bool:
+        """Добавляет путь в хвост сохранённых файлов (дедупликация).
+
+        Args:
+            path: абсолютный путь из результата save_to_file.
+
+        Returns:
+            True — путь добавлен, False — уже был в списке.
+        """
+        if path in self._saved_files:
+            return False
+        self._saved_files.append(path)
+        if len(self._saved_files) > 5:
+            self._saved_files = self._saved_files[-5:]
+        return True
 
     def _insert_message(self, role: str, content: str,
                         index: Optional[int] = None) -> None:
@@ -5961,6 +6074,17 @@ class ChatApplication:
                 )
                 self.chat.insert("end", result_str, ("reminder",))
                 self.chat.insert("end", "\n", ("reminder",))
+            finally:
+                self.chat.configure(state="disabled")
+            self._scroll_to_end()
+
+        # Файл, сохранённый news-сервером (save_to_file): кнопка
+        # «📂 Открыть файл» в нижней части чата
+        file_path = result.get("file_path")
+        if file_path and self._remember_saved_file(str(file_path)):
+            self.chat.configure(state="normal")
+            try:
+                self._insert_file_button(str(file_path))
             finally:
                 self.chat.configure(state="disabled")
             self._scroll_to_end()

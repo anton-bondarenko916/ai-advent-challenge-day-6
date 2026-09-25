@@ -1,15 +1,16 @@
-"""Автозапуск MCP-сервера напоминаний в отдельном окне консоли.
+"""Автозапуск MCP-серверов на HTTP в отдельном окне консоли.
 
-Сервер ``reminder_server.py`` живёт 24/7 независимо от приложения:
+Базовый класс :class:`HttpMCPServerLauncher` управляет запуском
+долгоживущего FastMCP-сервера (reminder_server.py, news_server.py):
 
-* :meth:`ReminderServerLauncher.is_server_running` — TCP-проверка порта
+* :meth:`HttpMCPServerLauncher.is_server_running` — TCP-проверка порта
   (сокет, без HTTP-запроса): мгновенно и не требует SDK;
-* :meth:`ReminderServerLauncher.launch` — если порт свободен, стартует
+* :meth:`HttpMCPServerLauncher.launch` — если порт свободен, стартует
   сервер в НОВОМ окне консоли (``CREATE_NEW_CONSOLE``): uvicorn пишет
   туда логи, окно видно пользователю. Если сервер уже работает —
   ничего не делает (повторный запуск приложения не дублирует процесс);
-* :meth:`ReminderServerLauncher.stop` — пустой метод: закрытие
-  приложения сервер НЕ останавливает.
+* :meth:`HttpMCPServerLauncher.stop` — пустой метод: закрытие
+  приложения сервер НЕ останавливает (серверы живут 24/7).
 
 Почему ``CREATE_NEW_CONSOLE`` вместо ``start cmd /k``: дочерний процесс
 получает собственную консоль независимо от родителя и переживает
@@ -28,43 +29,45 @@ from typing import Optional, Tuple
 
 from .config import PROJECT_ROOT
 
-SERVER_SCRIPT = PROJECT_ROOT / "reminder_server.py"
-
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 
 
-class ReminderServerLauncher:
-    """Управляет запуском reminder_server.py (без его остановки).
+class HttpMCPServerLauncher:
+    """Управляет запуском MCP-сервера на HTTP (без его остановки).
 
     Attributes:
         host: адрес сервера (только 127.0.0.1 — хостить в интернете
             запрещено).
         port: порт HTTP-сервера.
-        server_path: путь к reminder_server.py.
+        server_path: путь к скрипту сервера.
+        label: человекочитаемое имя для сообщений («Сервер напоминаний»,
+            «News-сервер»).
     """
 
     def __init__(
         self,
+        server_path: Path,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
-        server_path: Optional[Path] = None,
+        label: str = "MCP-сервер",
     ) -> None:
         """Настраивает лаунчер.
 
         Args:
+            server_path: путь к скрипту сервера.
             host: адрес сервера.
             port: порт сервера.
-            server_path: путь к скрипту сервера; None — reminder_server.py
-                в корне проекта.
+            label: имя сервера для сообщений пользователю.
         """
         self.host = str(host or DEFAULT_HOST)
         self.port = int(port or DEFAULT_PORT)
-        self.server_path = Path(server_path) if server_path else SERVER_SCRIPT
+        self.server_path = Path(server_path)
+        self.label = str(label or "MCP-сервер")
 
     @property
     def server_url(self) -> str:
-        """MCP-эндпоинт сервера (для ReminderMCPClient)."""
+        """MCP-эндпоинт сервера (для HTTP MCP-клиента)."""
         return f"http://{self.host}:{self.port}/mcp"
 
     def is_server_running(self) -> bool:
@@ -86,11 +89,11 @@ class ReminderServerLauncher:
             (started, message): started=True — процесс запущен;
             started=False — сервер уже работает (message объясняет это).
             Ошибки запуска не пробрасываются: (False, текст ошибки) —
-            приложение должно продолжать работать без напоминаний.
+            приложение должно продолжать работать без инструментов.
         """
         if self.is_server_running():
             return False, (
-                f"Сервер напоминаний уже запущен на {self.server_url} — "
+                f"{self.label} уже запущен на {self.server_url} — "
                 f"не перезапускаем."
             )
         if not self.server_path.exists():
@@ -115,16 +118,16 @@ class ReminderServerLauncher:
                     cwd=str(PROJECT_ROOT),
                 )
         except OSError as exc:
-            return False, f"Не удалось запустить сервер напоминаний: {exc}"
+            return False, f"Не удалось запустить {self.label.lower()}: {exc}"
         return True, (
-            f"Сервер напоминаний запущен в новом окне ({self.server_url})."
+            f"{self.label} запущен в новом окне ({self.server_url})."
         )
 
     def restart(self) -> Tuple[bool, str]:
         """«Перезапуск» по кнопке UI: запуск, если сервер не работает.
 
-        Работающий сервер намеренно НЕ убивается (сервер 24/7, данные в
-        SQLite не должны пострадать); кнопка нужна на случай падения.
+        Работающий сервер намеренно НЕ убивается (сервер 24/7, данные не
+        должны пострадать); кнопка нужна на случай падения.
 
         Returns:
             (started, message) — как у :meth:`launch`.
@@ -134,3 +137,28 @@ class ReminderServerLauncher:
     def stop(self) -> None:
         """Ничего не делает: сервер должен жить после закрытия приложения."""
         return None
+
+
+class ReminderServerLauncher(HttpMCPServerLauncher):
+    """Лаунчер reminder_server.py (напоминания, порт 8000 по умолчанию)."""
+
+    def __init__(
+        self,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
+        server_path: Optional[Path] = None,
+    ) -> None:
+        """Настраивает лаунчер напоминаний.
+
+        Args:
+            host: адрес сервера.
+            port: порт сервера.
+            server_path: путь к reminder_server.py; None — корень проекта.
+        """
+        super().__init__(
+            server_path=server_path
+            or (PROJECT_ROOT / "reminder_server.py"),
+            host=host,
+            port=port,
+            label="Сервер напоминаний",
+        )

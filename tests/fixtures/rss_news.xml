@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Тестовая лента новостей</title>
+    <link>https://example.test/news</link>
+    <description>Фикстура для офлайн-тестов news_server</description>
+    <item>
+      <title>Новый прорыв в технологиях искусственного интеллекта</title>
+      <link>https://example.test/news/ai-breakthrough</link>
+      <description>Технологии машинного обучения шагнули вперёд: новая модель обучается быстрее в десять раз.</description>
+      <pubDate>Wed, 24 Sep 2026 10:00:00 +0700</pubDate>
+    </item>
+    <item>
+      <title>Технологии 5G добрались до маленьких городов</title>
+      <link>https://example.test/news/5g-cities</link>
+      <description>Операторы раскатывают сети пятого поколения в регионах.</description>
+      <pubDate>Wed, 24 Sep 2026 09:30:00 +0700</pubDate>
+    </item>
+    <item>
+      <title>Курс валют стабилизировался</title>
+      <link>https://example.test/news/fx</link>
+      <description>Рубль укрепился к основным валютам на торгах.</description>
+      <pubDate>Wed, 24 Sep 2026 09:00:00 +0700</pubDate>
+    </item>
+    <item>
+      <title>Космический аппарат передал первые снимки</title>
+      <link>https://example.test/news/space</link>
+      <description>Миссия получила изображения поверхности спутника.</description>
+      <pubDate>Wed, 24 Sep 2026 08:30:00 +0700</pubDate>
+    </item>
+  </channel>
+</rss>

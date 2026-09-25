@@ -22,6 +22,7 @@ from src.config import (
     PROJECT_ROOT,
     get_invariant_settings,
     get_memory_settings,
+    get_news_settings,
     get_prices,
     get_reminder_settings,
     get_strategy_settings,
@@ -134,11 +135,18 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
     # UI (ChatApplication); недоступный сервер НЕ ломает диалог — запрос
     # уходит без tools (см. DeepSeekAgent._get_tools_for_llm).
     reminder_client = None
-    max_tool_rounds = None
     reminder_settings = get_reminder_settings(config)
     if reminder_settings["enabled"]:
         reminder_client = ReminderMCPClient(server_url=reminder_settings["url"])
-        max_tool_rounds = reminder_settings["max_tool_rounds"]
+
+    # MCP-сервер новостей: search_news (RSS) → summarize_text (DeepSeek
+    # внутри сервера) → save_to_file (output/). Цепочку строит LLM в
+    # agentic loop агента; недоступный сервер тоже не ломает диалог.
+    news_client = None
+    news_settings = get_news_settings(config)
+    if news_settings["enabled"]:
+        news_client = ReminderMCPClient(server_url=news_settings["url"])
+    max_tool_rounds = reminder_settings["max_tool_rounds"]
 
     return DeepSeekAgent(
         api_key=config["DEEPSEEK_API_KEY"],
@@ -170,6 +178,9 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         # Tool calling напоминаний: tools reminder-сервера передаются в LLM,
         # tool_calls выполняются через HTTP MCP-клиент
         reminder_client=reminder_client,
+        # Tool calling новостей: search_news → summarize_text → save_to_file
+        # (цепочку строит LLM в agentic loop)
+        news_client=news_client,
         max_tool_rounds=max_tool_rounds,
     )
 
@@ -235,6 +246,9 @@ def main(argv: List[str]) -> int:
         # уже работает — он живёт 24/7) и слушатель SSE-уведомлений
         app.launch_reminder_server()
         app.start_reminder_listener()
+        # Новости: автозапуск news-сервера (search_news → summarize_text →
+        # save_to_file); цепочку вызовов строит LLM в agentic loop
+        app.launch_news_server()
         app.root.mainloop()
         return 0
     except Exception:
