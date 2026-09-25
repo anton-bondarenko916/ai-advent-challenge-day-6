@@ -754,6 +754,27 @@ class AgenticLoopTest(unittest.TestCase):
         ]
         self.assertIn("не найден", tool_messages[0]["content"])
 
+    def test_tool_usage_rules_in_system_prompt(self) -> None:
+        """С tools в system-промпт добавляются правила (сводка → файл)."""
+        api = _FakeOpenAIClient([
+            _api_response(_api_message(content="Ответ."))
+        ])
+        agent = self._make_agent(api, _FakeNewsClient())
+        agent.send_message("привет")
+        system_text = api.calls[0]["messages"][0]["content"]
+        self.assertIn("[ПРАВИЛА РАБОТЫ С ИНСТРУМЕНТАМИ]", system_text)
+        self.assertIn("save_to_file", system_text)
+
+    def test_no_rules_without_tool_clients(self) -> None:
+        """Без tool-клиентов правил инструментов в промпте нет."""
+        api = _FakeOpenAIClient([
+            _api_response(_api_message(content="Ответ."))
+        ])
+        agent = self._make_agent(api, None)
+        agent.send_message("привет")
+        system_text = api.calls[0]["messages"][0]["content"]
+        self.assertNotIn("[ПРАВИЛА РАБОТЫ С ИНСТРУМЕНТАМИ]", system_text)
+
 
 # ---------------------------------------------------------------------------
 # Конфигурация NEWS_*

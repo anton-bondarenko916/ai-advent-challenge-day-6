@@ -135,6 +135,36 @@ class ReminderMCPClient:
         """
         self.server_url = str(server_url or DEFAULT_URL)
         self.label = str(label or "MCP-сервер")
+        # «Лечебный» хук (Callable[[], bool]): при ошибке подключения
+        # вызывается ОДИН раз — по совместимости поднимает сервер
+        # (HttpMCPServerLauncher.ensure_running) — и вызов повторяется.
+        # None — без самовосстановления (тесты).
+        self.restart_hook: Optional[Callable[[], bool]] = None
+
+    def _retry_after_restart(self, exc: MCPError) -> Optional[MCPError]:
+        """Ошибка подключения → пробуем поднять сервер и повторить.
+
+        Args:
+            exc: исключение первой попытки (только MCPConnectionError
+                считается «сервер недоступен»; таймауты и ошибки
+                протокола повтору не подлежат).
+
+        Returns:
+            None — сервер поднят, вызов нужно ПОВТОРИТЬ; исходное
+            исключение — повтор невозможен/не помог (пробрасывается).
+        """
+        if not isinstance(exc, MCPConnectionError):
+            return exc
+        if self.restart_hook is None:
+            return exc
+        try:
+            restarted = bool(self.restart_hook())
+        except Exception as hook_exc:  # хук не должен ломать поток ошибок
+            _logger().warning("restart_hook не удался: %s", hook_exc)
+            return exc
+        if restarted:
+            return None
+        return exc
 
     def _require_sdk(self) -> None:
         """Проверяет доступность SDK (иначе — понятная ошибка)."""
@@ -147,6 +177,9 @@ class ReminderMCPClient:
     async def list_tools(self) -> List[MCPTool]:
         """Запрашивает tools/list по HTTP (отдельная сессия).
 
+        При ошибке подключения однократно пробует поднять сервер через
+        ``restart_hook`` и повторяет запрос.
+
         Returns:
             Список MCPTool, отсортированный по имени.
 
@@ -155,6 +188,16 @@ class ReminderMCPClient:
             MCPConnectionError: сервер недоступен или ответ некорректен.
         """
         self._require_sdk()
+        try:
+            return await self._list_tools_once()
+        except MCPError as exc:
+            retry_exc = self._retry_after_restart(exc)
+            if retry_exc is None:
+                return await self._list_tools_once()
+            raise retry_exc
+
+    async def _list_tools_once(self) -> List[MCPTool]:
+        """Одна попытка tools/list (тело :meth:`list_tools`)."""
         try:
             async with streamablehttp_client(self.server_url) as (read, write, _):
                 async with ClientSession(read, write) as session:
@@ -197,6 +240,10 @@ class ReminderMCPClient:
                         timeout: Optional[float] = None) -> str:
         """Вызывает инструмент по HTTP (отдельная сессия).
 
+        При ошибке подключения однократно пробует поднять сервер через
+        ``restart_hook`` и повторяет вызов — «пролёт» пользователя в
+        момент, когда сервер ещё не поднялся/упал, лечится на месте.
+
         Args:
             tool_name: имя инструмента на сервере (``add_reminder`` и др.).
             arguments: словарь аргументов; None/пустой — без аргументов.
@@ -217,6 +264,20 @@ class ReminderMCPClient:
         """
         self._require_sdk()
         seconds = float(timeout) if timeout else _TOOL_CALL_TIMEOUT
+        try:
+            return await self._call_tool_once(tool_name, arguments, seconds)
+        except MCPError as exc:
+            retry_exc = self._retry_after_restart(exc)
+            if retry_exc is None:
+                return await self._call_tool_once(
+                    tool_name, arguments, seconds
+                )
+            raise retry_exc
+
+    async def _call_tool_once(self, tool_name: str,
+                              arguments: Optional[Dict[str, Any]],
+                              seconds: float) -> str:
+        """Одна попытка tools/call (тело :meth:`call_tool`)."""
         args = dict(arguments) if arguments else {}
         try:
             async with streamablehttp_client(

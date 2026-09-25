@@ -512,6 +512,10 @@ class ReminderLauncherTest(unittest.TestCase):
         args = popen.call_args[0][0]
         self.assertEqual(args[0], sys.executable)
         self.assertTrue(args[1].endswith("reminder_server.py"))
+        # host/port передаются серверу явно (иначе он поднимется на
+        # дефолтном порту, а не там, где его ждёт клиент)
+        self.assertIn("--port", args)
+        self.assertEqual(str(launcher.port), args[args.index("--port") + 1])
         if sys.platform == "win32":
             self.assertEqual(
                 popen.call_args[1]["creationflags"],
@@ -1084,6 +1088,111 @@ class ReminderClientTimeoutLabelTest(unittest.TestCase):
         with self.assertRaises(MCPConnectionError) as ctx:
             asyncio.run(client.call_tool("x", {}))
         self.assertIn("MCP-сервер не запущен", str(ctx.exception))
+
+    def test_restart_hook_retries_call_tool(self) -> None:
+        """Ошибка подключения → хук поднимает сервер → вызов повторяется."""
+        from src.mcp_client import MCPConnectionError
+        from src.reminder_client import ReminderMCPClient
+
+        calls = {"attempts": 0, "hook": 0}
+
+        async def once(tool_name, arguments, seconds):
+            calls["attempts"] += 1
+            if calls["attempts"] == 1:
+                raise MCPConnectionError("News-сервер не запущен")
+            return "готово"
+
+        client = ReminderMCPClient("http://127.0.0.1:9/mcp")
+        client._call_tool_once = once  # type: ignore[method-assign]
+
+        def hook() -> bool:
+            calls["hook"] += 1
+            return True
+
+        client.restart_hook = hook
+        result = asyncio.run(client.call_tool("summarize_text", {"text": "x"}))
+        self.assertEqual(result, "готово")
+        self.assertEqual(calls["attempts"], 2)
+        self.assertEqual(calls["hook"], 1)
+
+    def test_restart_hook_failure_raises_original(self) -> None:
+        """Хук не помог (сервер не поднялся) — исключение первой попытки."""
+        from src.mcp_client import MCPConnectionError
+        from src.reminder_client import ReminderMCPClient
+
+        async def once(tool_name, arguments, seconds):
+            raise MCPConnectionError("News-сервер не запущен")
+
+        client = ReminderMCPClient("http://127.0.0.1:9/mcp")
+        client._call_tool_once = once  # type: ignore[method-assign]
+        client.restart_hook = lambda: False
+
+        with self.assertRaises(MCPConnectionError):
+            asyncio.run(client.call_tool("summarize_text", {"text": "x"}))
+
+    def test_timeout_error_does_not_trigger_hook(self) -> None:
+        """Таймаут (инструмент ещё работает) — сервер не перезапускаем."""
+        from src.mcp_client import MCPTimeoutError
+        from src.reminder_client import ReminderMCPClient
+
+        async def once(tool_name, arguments, seconds):
+            raise MCPTimeoutError("Инструмент не ответил за 180 с")
+
+        client = ReminderMCPClient("http://127.0.0.1:9/mcp")
+        client._call_tool_once = once  # type: ignore[method-assign]
+        hook_calls = []
+        client.restart_hook = lambda: hook_calls.append(1) or True
+
+        with self.assertRaises(MCPTimeoutError):
+            asyncio.run(client.call_tool("summarize_text", {"text": "x"}))
+        self.assertEqual(hook_calls, [])
+
+
+class LauncherEnsureRunningTest(unittest.TestCase):
+    """HttpMCPServerLauncher.ensure_running: поднять сервер и дождаться порта."""
+
+    def test_running_port_returns_true_immediately(self) -> None:
+        """Порт занят → True без запуска процессов."""
+        from src.reminder_launcher import HttpMCPServerLauncher
+
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen(1)
+            port = blocker.getsockname()[1]
+            launcher = HttpMCPServerLauncher(
+                server_path=Path("whatever.py"), port=port,
+            )
+            with mock.patch.object(subprocess, "Popen") as popen:
+                self.assertTrue(launcher.ensure_running(timeout=1.0))
+            popen.assert_not_called()
+        finally:
+            blocker.close()
+
+    def test_dead_port_starts_server_and_waits(self) -> None:
+        """Мёртвый порт: ensure_running стартует реальный сервер и ждёт."""
+        port = _free_port()
+        from src.reminder_launcher import HttpMCPServerLauncher
+
+        launcher = HttpMCPServerLauncher(
+            server_path=Path(REMINDER_SERVER), port=port,
+        )
+        try:
+            self.assertTrue(launcher.ensure_running(timeout=20.0))
+            self.assertTrue(launcher.is_server_running())
+        finally:
+            # Гасим запущенный сервер даже при провале теста: он держит
+            # наследованный pipe вывода и «висит» в фоне. netstat пишет
+            # кириллицу в CP866 — декодируем отказоустойчиво.
+            out = subprocess.run(
+                ["netstat", "-ano"], capture_output=True,
+                text=True, errors="replace",
+            ).stdout or ""
+            for line in out.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    pid = line.split()[-1]
+                    subprocess.run(["taskkill", "/PID", pid, "/F"],
+                                   capture_output=True)
 
 
 if __name__ == "__main__":  # pragma: no cover

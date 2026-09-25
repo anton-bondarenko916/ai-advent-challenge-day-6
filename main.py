@@ -30,7 +30,9 @@ from src.config import (
     load_config,
     validate_api_key,
 )
+from src.news_launcher import NewsServerLauncher
 from src.reminder_client import ReminderMCPClient
+from src.reminder_launcher import ReminderServerLauncher
 from src.storage import ContextStore
 from src.profile_repository import ProfileRepository
 from src.invariant_repository import InvariantRepository
@@ -142,6 +144,12 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
             server_url=reminder_settings["url"],
             label="Сервер напоминаний",
         )
+        # Самовосстановление: если инструмент упёрся в мёртвый сервер —
+        # поднять его и повторить вызов в рамках того же хода
+        reminder_client.restart_hook = ReminderServerLauncher(
+            host=reminder_settings["host"],
+            port=reminder_settings["port"],
+        ).ensure_running
 
     # MCP-сервер новостей: search_news (RSS) → summarize_text (DeepSeek
     # внутри сервера) → save_to_file (output/). Цепочку строит LLM в
@@ -153,6 +161,10 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
             server_url=news_settings["url"],
             label="News-сервер",
         )
+        news_client.restart_hook = NewsServerLauncher(
+            host=news_settings["host"],
+            port=news_settings["port"],
+        ).ensure_running
     max_tool_rounds = reminder_settings["max_tool_rounds"]
 
     return DeepSeekAgent(

@@ -119,6 +119,26 @@ _MOCK_ANSWERS = [
     "приложение для реальных ответов.",
 ]
 
+# Блок правил инструментов: добавляется в конец system-сообщения запроса,
+# когда у агента есть tools напоминаний/новостей. Без него LLM может
+# ограничиться текстом сводки в чате и не вызвать save_to_file — тогда
+# пользователь не получит файл (и кнопку «Открыть файл»).
+_TOOL_USAGE_RULES = (
+    "[ПРАВИЛА РАБОТЫ С ИНСТРУМЕНТАМИ]\n"
+    "Тебе доступны инструменты напоминаний и новостей — вызывай их сразу, "
+    "без переспрашивания.\n"
+    "- Напоминание: add_reminder(text, interval_minutes, repeat).\n"
+    "- Новости: search_news(topic, limit) — поиск; summarize_text(text) — "
+    "краткая сводка; save_to_file(content) — сохранение текста в файл.\n"
+    "Сценарий «найди новости / сделай сводку (и сохрани)»: search_news → "
+    "summarize_text → save_to_file.\n"
+    "ВАЖНО: полный текст сводки сохраняй в ФАЙЛ через save_to_file; "
+    "в чате после этого отвечай кратко — что сделано, путь к файлу и "
+    "1–2 предложения сути, не дублируя весь текст сводки.\n"
+    "Если инструмент вернул ошибку — кратко сообщи о ней и продолжи без "
+    "этого шага или предложи альтернативу."
+)
+
 
 class DeepSeekAgent:
     """AI-агент, инкапсулирующий диалог и запросы к DeepSeek API.
@@ -1618,11 +1638,20 @@ class DeepSeekAgent:
         if self._client is None:
             raise ApiError("Клиент API не инициализирован (mock-режим?).")
 
-        request = self._build_request()
+        # Сначала tools: от их наличия зависит и system-блок правил
         tools = self._get_tools_for_llm()
+        request = self._build_request()
         if tools:
             request["tools"] = tools
             request["tool_choice"] = "auto"
+            # Правила использования инструментов — в конец system-промпта
+            messages = list(request.get("messages") or [])
+            if messages:
+                first = dict(messages[0])
+                first["content"] = (
+                    str(first.get("content") or "") + "\n\n" + _TOOL_USAGE_RULES
+                )
+                request["messages"] = [first] + list(messages[1:])
 
         response = self._send_completion(request)
         payload = self._handle_response(response)

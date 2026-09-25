@@ -24,8 +24,9 @@ from __future__ import annotations
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from .config import PROJECT_ROOT
 
@@ -99,7 +100,13 @@ class HttpMCPServerLauncher:
         if not self.server_path.exists():
             return False, f"Скрипт сервера не найден: {self.server_path}"
 
-        command = [sys.executable, str(self.server_path)]
+        # ВАЖНО: host/port передаются серверу явно — иначе он поднимется
+        # на дефолтном порту скрипта, а лаунчер будет ждать его здесь
+        command = [
+            sys.executable, str(self.server_path),
+            "--host", self.host,
+            "--port", str(self.port),
+        ]
         try:
             if sys.platform == "win32":
                 # Новое окно консоли с логами сервера; процесс живёт
@@ -137,6 +144,32 @@ class HttpMCPServerLauncher:
     def stop(self) -> None:
         """Ничего не делает: сервер должен жить после закрытия приложения."""
         return None
+
+    def ensure_running(self, timeout: float = 20.0,
+                       poll: float = 0.3) -> bool:
+        """Гарантирует, что сервер работает: проверяет, при необходимости
+        запускает и ждёт выхода на порт.
+
+        Используется как «лечебный» хук HTTP-клиента: когда инструмент
+        упёрся в мёртвый сервер, клиент вызывает хук, сервер поднимается,
+        и вызов повторяется уже в рамках того же хода диалога.
+
+        Args:
+            timeout: сколько секунд ждать выхода сервера на порт.
+            poll: интервал опроса порта.
+
+        Returns:
+            True — сервер отвечает (работал или поднят), False — не удалось.
+        """
+        if self.is_server_running():
+            return True
+        self.launch()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            if self.is_server_running():
+                return True
+            time.sleep(poll)
+        return False
 
 
 class ReminderServerLauncher(HttpMCPServerLauncher):
