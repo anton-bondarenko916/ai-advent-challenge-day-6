@@ -46,6 +46,11 @@ mcp>=1.28,<2
 # рассылает SSE-уведомления подписчикам.
 apscheduler>=3.10,<4
 
+# HTTP-запросы MCP-серверов гео и погоды (geo_server.py / weather_server.py):
+# get_user_city опрашивает ip-api.com, get_weather — Open-Meteo
+# (геокодинг + прогноз). httpx также является зависимостью SDK mcp.
+httpx>=0.27
+
 # RSS-парсинг в MCP-сервере новостей (news_server.py):
 # search_news читает ленты lenta.ru / rssexport.rbc.ru и фильтрует
 # записи по теме для agentic loop (поиск → сводка → сохранение).

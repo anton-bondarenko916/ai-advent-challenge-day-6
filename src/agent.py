@@ -125,13 +125,16 @@ _MOCK_ANSWERS = [
 # пользователь не получит файл (и кнопку «Открыть файл»).
 _TOOL_USAGE_RULES = (
     "[ПРАВИЛА РАБОТЫ С ИНСТРУМЕНТАМИ]\n"
-    "Тебе доступны инструменты напоминаний и новостей — вызывай их сразу, "
-    "без переспрашивания.\n"
+    "Тебе доступны инструменты напоминаний, новостей, геолокации и погоды "
+    "— вызывай их сразу, без переспрашивания.\n"
     "- Напоминание: add_reminder(text, interval_minutes, repeat).\n"
     "- Новости: search_news(topic, limit) — поиск; summarize_text(text) — "
     "краткая сводка; save_to_file(content) — сохранение текста в файл.\n"
+    "- Гео и погода: get_user_city() — город пользователя; "
+    "get_weather(city) — текущая погода в городе.\n"
     "Сценарий «найди новости / сделай сводку (и сохрани)»: search_news → "
     "summarize_text → save_to_file.\n"
+    "Сценарий «какая погода»: get_user_city() → get_weather(city).\n"
     "ВАЖНО: полный текст сводки сохраняй в ФАЙЛ через save_to_file; "
     "в чате после этого отвечай кратко — что сделано, путь к файлу и "
     "1–2 предложения сути, не дублируя весь текст сводки.\n"
@@ -188,6 +191,8 @@ class DeepSeekAgent:
         task_max_retries: Optional[int] = None,
         reminder_client: Optional[Any] = None,
         news_client: Optional[Any] = None,
+        geo_client: Optional[Any] = None,
+        weather_client: Optional[Any] = None,
         max_tool_rounds: Optional[int] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
@@ -250,6 +255,12 @@ class DeepSeekAgent:
             news_client: HTTP MCP-клиент новостей
                 (:class:`src.reminder_client.ReminderMCPClient` на
                 news_server.py); None — инструменты новостей выключены.
+            geo_client: HTTP MCP-клиент геолокации
+                (:class:`src.reminder_client.ReminderMCPClient` на
+                geo_server.py); None — инструмент get_user_city выключен.
+            weather_client: HTTP MCP-клиент погоды
+                (:class:`src.reminder_client.ReminderMCPClient` на
+                weather_server.py); None — инструмент get_weather выключен.
             max_tool_rounds: лимит циклов «LLM → tool_calls → результат →
                 LLM» за один ход (agentic loop); None — 5.
 
@@ -417,8 +428,12 @@ class DeepSeekAgent:
         # его tools просто не попадают в запрос.
         self._reminder_client = reminder_client
         self._news_client = news_client
+        self._geo_client = geo_client
+        self._weather_client = weather_client
         self._tool_clients: List[Any] = [
-            client for client in (reminder_client, news_client)
+            client for client in (
+                reminder_client, news_client, geo_client, weather_client,
+            )
             if client is not None
         ]
         self._max_tool_rounds: int = (

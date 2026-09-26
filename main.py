@@ -20,6 +20,7 @@ from src import utils
 from src.agent import DeepSeekAgent
 from src.config import (
     PROJECT_ROOT,
+    get_geo_settings,
     get_invariant_settings,
     get_memory_settings,
     get_news_settings,
@@ -27,9 +28,11 @@ from src.config import (
     get_reminder_settings,
     get_strategy_settings,
     get_task_settings,
+    get_weather_settings,
     load_config,
     validate_api_key,
 )
+from src.geo_launcher import GeoServerLauncher
 from src.news_launcher import NewsServerLauncher
 from src.reminder_client import ReminderMCPClient
 from src.reminder_launcher import ReminderServerLauncher
@@ -40,6 +43,7 @@ from src.invariant_validator import InvariantValidator
 from src.task_repository import TaskRepository
 from src.tokens import create_counter
 from src.utils import AgentConfigError, get_logger
+from src.weather_launcher import WeatherServerLauncher
 
 logger = get_logger("deepseek-chat")
 
@@ -165,6 +169,33 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
             host=news_settings["host"],
             port=news_settings["port"],
         ).ensure_running
+
+    # MCP-серверы цепочки «гео → погода»: LLM в agentic loop сама строит
+    # цепочку get_user_city (geo, ip-api.com) → get_weather(city)
+    # (weather, Open-Meteo). Недоступный сервер не ломает диалог.
+    geo_client = None
+    geo_settings = get_geo_settings(config)
+    if geo_settings["enabled"]:
+        geo_client = ReminderMCPClient(
+            server_url=geo_settings["url"],
+            label="Geo-сервер",
+        )
+        geo_client.restart_hook = GeoServerLauncher(
+            host=geo_settings["host"],
+            port=geo_settings["port"],
+        ).ensure_running
+
+    weather_client = None
+    weather_settings = get_weather_settings(config)
+    if weather_settings["enabled"]:
+        weather_client = ReminderMCPClient(
+            server_url=weather_settings["url"],
+            label="Weather-сервер",
+        )
+        weather_client.restart_hook = WeatherServerLauncher(
+            host=weather_settings["host"],
+            port=weather_settings["port"],
+        ).ensure_running
     max_tool_rounds = reminder_settings["max_tool_rounds"]
 
     return DeepSeekAgent(
@@ -200,6 +231,10 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         # Tool calling новостей: search_news → summarize_text → save_to_file
         # (цепочку строит LLM в agentic loop)
         news_client=news_client,
+        # Tool calling гео/погоды: get_user_city → get_weather (цепочку
+        # строит LLM в agentic loop, маршрутизация — по имени инструмента)
+        geo_client=geo_client,
+        weather_client=weather_client,
         max_tool_rounds=max_tool_rounds,
     )
 
@@ -268,6 +303,10 @@ def main(argv: List[str]) -> int:
         # Новости: автозапуск news-сервера (search_news → summarize_text →
         # save_to_file); цепочку вызовов строит LLM в agentic loop
         app.launch_news_server()
+        # Гео и погода: автозапуск серверов цепочки
+        # get_user_city (geo, порт 8002) → get_weather (weather, порт 8003)
+        app.launch_geo_server()
+        app.launch_weather_server()
         app.root.mainloop()
         return 0
     except Exception:

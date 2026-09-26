@@ -75,6 +75,14 @@
   (`output/news_YYYYMMDD_HHMMSS.md`); результат каждого шага возвращается
   модели для решения о следующем, лимит циклов — 5; по сохранённому файлу
   в чате появляется кнопка «📂 Открыть файл» (`os.startfile`)
+- ✅ **Цепочка MCP-серверов «гео → погода»**: два собственных сервера —
+  `geo_server.py` (`get_user_city`: город по IP через ip-api.com) и
+  `weather_server.py` (`get_weather`: Open-Meteo, геокодинг + прогноз);
+  на вопрос «Какая сегодня погода?» LLM сама вызывает `get_user_city`,
+  получает город и передаёт его в `get_weather` — вызовы маршрутизируются
+  на разные серверы по имени инструмента; панель MCP показывает все
+  серверы группами с их инструментами и вызывает инструмент на своём
+  сервере
 - ✅ Встроенные офлайн-тесты (`unittest`)
 
 ## Структура проекта
@@ -98,13 +106,15 @@ deepseek-chat-app/
 │   ├── invariant_repository.py    # Слой данных инвариантов (SQLite): категории, правила, лог
 │   ├── invariant_prompt_builder.py # Блок инвариантов для system-промпта
 │   ├── invariant_validator.py     # Пост-проверка ответов, перегенерация, конфликты
-│   ├── mcp_models.py   # Доменная модель инструмента MCP (MCPTool)
+│   ├── mcp_models.py   # Доменная модель: инструмент (MCPTool) и группа сервера (ServerTools)
 │   ├── mcp_client.py   # Клиент MCP: ClientSession + stdio, tools/list + tools/call
-│   ├── mcp_worker.py   # Фоновые потоки: список (MCPWorker) и вызов (MCPToolCallWorker)
-│   ├── mcp_panel.py    # Панель «MCP»: статус, список, кнопки «Вызвать»/«Параметры», диалог вызова
+│   ├── mcp_worker.py   # Фоновые потоки: список (MCPWorker, MultiServerListWorker) и вызов (MCPToolCallWorker, MCPRemoteCallWorker)
+│   ├── mcp_panel.py    # Панель «MCP»: серверы группами, «Вызвать»/«Параметры», диалог вызова
 │   ├── reminder_client.py   # HTTP MCP-клиент напоминаний + слушатель SSE-уведомлений
 │   ├── reminder_launcher.py # Базовый лаунчер HTTP MCP-серверов (новое окно, 24/7)
 │   ├── news_launcher.py     # Лаунчер news_server.py (порт 8001)
+│   ├── geo_launcher.py      # Лаунчер geo_server.py (порт 8002)
+│   ├── weather_launcher.py  # Лаунчер weather_server.py (порт 8003)
 │   ├── app_state.py    # Мелкое состояние UI (SQLite, таблица app_state)
 │   ├── summarizer.py # Сжатие истории в конспект (summary, legacy)
 │   ├── tokens.py     # Счётчик токенов (tiktoken + эвристика)
@@ -128,6 +138,7 @@ deepseek-chat-app/
 │   ├── test_mcp_server.py    # Собственный Git-сервер: инструменты, call_tool, UI-диалог
 │   ├── test_reminder_server.py # Smart Reminder: инструменты, HTTP, SSE, tool calling, UI
 │   ├── test_news_server.py   # News: RSS-поиск, сводка, сохранение, agentic loop, UI
+│   ├── test_geo_weather.py   # Цепочка гео → погода: серверы, лаунчеры, маршрутизация, панель
 │   ├── fixtures/
 │   │   ├── mcp_echo_server.py # FastMCP-сервер для офлайн-тестов клиента (stdio)
 │   │   └── rss_news.xml       # Локальная RSS-лента для офлайн-тестов news_server
@@ -147,6 +158,8 @@ deepseek-chat-app/
 ├── my_git_server.py  # Собственный MCP-сервер Git (FastMCP, stdio-подпроцесс)
 ├── reminder_server.py # MCP-сервер Smart Reminder (FastMCP, HTTP, SSE, APScheduler)
 ├── news_server.py    # MCP-сервер News (FastMCP, HTTP: RSS → DeepSeek → output/)
+├── geo_server.py     # MCP-сервер Geo (FastMCP, HTTP: get_user_city по IP)
+├── weather_server.py # MCP-сервер Weather (FastMCP, HTTP: Open-Meteo по городу)
 ├── output/           # Файлы, сохранённые save_to_file (создаётся автоматически)
 ├── main.py           # Точка входа
 └── README.md
@@ -1475,9 +1488,9 @@ news-сервера (ключ `DEEPSEEK_API_KEY` наследуется от п�
 Реализация — тот же цикл `DeepSeekAgent._call_api`, что и для
 напоминаний, обобщённый на несколько MCP-серверов:
 
-* tools reminder-сервера и news-сервера сливаются в один список
-  (кэш по клиенту, TTL 60 с); маршрут «имя инструмента → сервер»
-  обновляется при каждой сборке, вызовы уходят своему серверу;
+* tools reminder-сервера, news-, geo- и weather-серверов сливаются в
+  один список (кэш по клиенту, TTL 60 с); маршрут «имя инструмента →
+  сервер» обновляется при каждой сборке, вызовы уходят своему серверу;
 * лимит циклов «LLM → tool_calls → результат → LLM» — 5
   (`REMINDER_TOOLCALL_MAX_ROUNDS`), зацикливание обрывается;
 * **правила инструментов** добавляются в system-промпт, когда tools
@@ -1507,6 +1520,71 @@ news-сервера (ключ `DEEPSEEK_API_KEY` наследуется от п�
 loop на фейковом API-клиенте (цепочка из 3 инструментов, маршрутизация
 двух серверов, лимит итераций, неизвестный инструмент), конфиг `NEWS_*`
 и UI (кнопка «Открыть файл», перерисовка, `os.startfile`).
+
+## Цепочка MCP-серверов «гео → погода» (geo_server.py + weather_server.py)
+
+Два собственных MCP-сервера (FastMCP, Streamable HTTP, только 127.0.0.1),
+каждый в своём окне консоли, 24/7 (`GeoServerLauncher` /
+`WeatherServerLauncher` — тот же базовый класс, что у напоминаний и
+новостей). **Порты 8002 и 8003**: порт 8001 уже занят news-сервером.
+
+```dotenv
+GEO_ENABLED=true            # false — без геолокации и автозапуска
+GEO_SERVER_PORT=8002
+WEATHER_ENABLED=true        # false — без погоды и автозапуска
+WEATHER_SERVER_PORT=8003
+```
+
+### Инструменты
+
+| Сервер | Инструмент | Вход | Выход |
+|---|---|---|---|
+| geo (8002) | `get_user_city` | — | название города (`"Berlin"`) или `"Unknown"`; источник — ip-api.com (без ключа, 45 запросов/мин) |
+| weather (8003) | `get_weather` | `city: str` | JSON `{"city", "temperature", "wind_speed", "humidity"}`; город не найден/нет сети → `{"error": ...}`; источник — Open-Meteo (без ключа, два шага: геокодинг → прогноз) |
+
+### Как LLM строит цепочку
+
+```
+Пользователь: «Какая сегодня погода?»
+  → LLM                             → tool_calls: get_user_city        (geo, 8002)
+  → код вызывает MCP: "Berlin"      → возвращается в LLM
+  → LLM                             → tool_calls: get_weather({"city": "Berlin"})  (weather, 8003)
+  → код вызывает MCP: JSON погоды   → возвращается в LLM
+  → LLM: «В Берлине сейчас 15.2°C, ветер 11.9 км/ч, влажность 82%»
+```
+
+Маршрутизация — та же, что и для reminder/news: LLM видит инструменты
+всех серверов одним списком, а код по имени инструмента отправляет
+вызов на его сервер (`_tool_routes`, `max_tool_rounds` = 5 — достаточно
+на цепочку из двух звеньев). В правила инструментов в system-промпте
+добавлен сценарий «какая погода»: `get_user_city` → `get_weather(city)`.
+Если geo-сервер вернул `"Unknown"` или weather — `{"error"}`, LLM
+сообщает об этом и не прерывает ход диалога.
+
+### Панель MCP: список серверов и их инструментов
+
+Кнопка «🔄 Обновить» панели опрашивает **все** серверы — stdio (Git) и
+HTTP (напоминания, news, geo, weather) — и рисует инструменты группами:
+заголовок «● geo», под ним карточки его инструментов. Сервер, не
+ответивший на tools/list, не скрывает остальные: его группа помечается
+красным с текстом ошибки (в статусе — «Подключён | N инструментов ·
+нет связи: …»). Кнопка «▶ Вызвать» у инструмента отправляет вызов на
+сервер этой группы (HTTP — `MCPRemoteCallWorker`), форма параметров
+строится по inputSchema.
+
+### Тесты
+
+`tests/test_geo_weather.py` — 34 теста: инструменты офлайн (сетевые
+функции `_fetch_geo_payload` / `_geocode_city` / `_fetch_current_weather`
+подменяются: успех, «Unknown», «город не найден», сетевая ошибка),
+регистрация инструментов на серверах (`mcp.list_tools()`), конфиг
+`GEO_*`/`WEATHER_*` (дефолты, кривой порт, запрет внешнего хоста),
+лаунчеры (команда запуска, защита от дублей на занятом порту, 24/7),
+agentic loop на фейковых клиентах (цепочка get_user_city → get_weather
+маршрутизируется на разные серверы, результат доходит до LLM и UI,
+в историю tool-сообщения не попадают), `MultiServerListWorker` (группы,
+частичный отказ), панель (заголовки групп, красная пометка упавшего
+сервера, вызов на свой сервер), сборка `main.create_agent` (4 клиента).
 
 ## Известные ограничения
 

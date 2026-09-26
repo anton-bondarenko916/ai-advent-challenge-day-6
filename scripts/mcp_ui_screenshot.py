@@ -72,10 +72,17 @@ def main() -> int:
     # 1. Стартовое состояние: «Не подключён»
     root.after(300, lambda: grab("mcp_1_initial.png"))
 
-    # 2. Нажимаем «Обновить», ждём реальный ответ сервера
+    # 2. Нажимаем «Обновить» и ждём окончания опроса ВСЕХ серверов
+    # (stdio + HTTP; фиксированной паузы недостаточно)
     def do_refresh() -> None:
         panel.refresh()
-        root.after(2500, after_refresh)
+        root.after(200, wait_refresh)
+
+    def wait_refresh() -> None:
+        if panel._busy:
+            root.after(200, wait_refresh)
+            return
+        after_refresh()
 
     def after_refresh() -> None:
         grab("mcp_2_connected.png")

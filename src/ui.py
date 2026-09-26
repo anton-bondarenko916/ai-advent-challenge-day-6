@@ -25,10 +25,12 @@ from .agent import DeepSeekAgent
 from .app_state import AppStateStore
 from .config import (
     get_config,
+    get_geo_settings,
     get_mcp_settings,
     get_news_settings,
     get_project_path,
     get_reminder_settings,
+    get_weather_settings,
 )
 from .invariant_models import (
     SCOPE_GLOBAL,
@@ -36,11 +38,13 @@ from .invariant_models import (
     Invariant,
     InvariantCategory,
 )
+from .geo_launcher import GeoServerLauncher
 from .mcp_panel import MCPPanel
 from .models import ProfileAgentSettings, UserProfile
 from .news_launcher import NewsServerLauncher
 from .reminder_client import ReminderNotificationListener
 from .reminder_launcher import ReminderServerLauncher
+from .weather_launcher import WeatherServerLauncher
 from .task_fsm import get_allowed_transitions
 from .task_models import (
     AWAITING_STAGES,
@@ -204,6 +208,10 @@ class ChatApplication:
         # News-сервер (search_news → summarize_text → save_to_file):
         # лаунчер создаётся лениво, запуск — main.py (launch_news_server)
         self.news_launcher: Optional[NewsServerLauncher] = None
+        # Серверы цепочки «гео → погода» (get_user_city → get_weather):
+        # лаунчеры создаются лениво, запуск — main.py при старте приложения
+        self.geo_launcher: Optional[GeoServerLauncher] = None
+        self.weather_launcher: Optional[WeatherServerLauncher] = None
         self._reminder_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._reminder_poll_job: Optional[str] = None
         # Уведомления «🔔 Напоминание: …» для нижней части чата (UI-слой,
@@ -540,14 +548,21 @@ class ChatApplication:
         Панель не создаётся при MCP_ENABLED=false. Запрос списка сам по
         себе НЕ выполняется: на старте статус «Не подключён», список
         загружается по кнопке «Обновить» (в фоновом потоке панели).
+
+        Помимо stdio-сервера (команда MCP_SERVER_COMMAND, обычно Git)
+        панель показывает HTTP-серверы (напоминания, news, geo, weather):
+        инструменты группируются по серверам, вызов инструмента уходит
+        на свой сервер.
         """
         mcp_settings = get_mcp_settings(self.config)
         if not mcp_settings["enabled"]:
             return
+        http_sources = self._collect_panel_http_sources()
         try:
             self.mcp_panel = MCPPanel(
                 parent, settings=mcp_settings,
                 app_state=self._get_app_state(),
+                http_sources=http_sources,
             )
         except Exception as exc:  # панель не должна ломать запуск чата
             utils.get_logger("deepseek-chat.ui").warning(
@@ -558,6 +573,25 @@ class ChatApplication:
         # Применяем сохранённое сворачивание ПОСЛЕ упаковки: геометрия
         # свернутой панели зависит от её pack-опций.
         self.mcp_panel.apply_collapsed_state()
+
+    def _collect_panel_http_sources(self) -> List[Dict[str, Any]]:
+        """Собирает HTTP-серверы для панели MCP (только включённые).
+
+        Returns:
+            Список {"name", "url"} — имена для заголовков групп панели,
+            url — MCP-эндпоинты (напоминания, news, geo, weather).
+        """
+        sources: List[Dict[str, Any]] = []
+        for getter, name in (
+            (get_reminder_settings, "напоминания"),
+            (get_news_settings, "news"),
+            (get_geo_settings, "geo"),
+            (get_weather_settings, "weather"),
+        ):
+            settings = getter(self.config)
+            if settings.get("enabled"):
+                sources.append({"name": name, "url": settings["url"]})
+        return sources
 
     def _get_app_state(self) -> Optional[AppStateStore]:
         """Ленивое создание хранилища состояния UI (SQLite app_state).
@@ -624,17 +658,6 @@ class ChatApplication:
             "running" if launcher.is_server_running() else "down"
         )
 
-    def _get_news_launcher(self) -> Optional[NewsServerLauncher]:
-        """Ленивое создание лаунчера news-сервера (NEWS_ENABLED=false → None)."""
-        if self.news_launcher is None:
-            settings = get_news_settings(self.config)
-            if not settings["enabled"]:
-                return None
-            self.news_launcher = NewsServerLauncher(
-                host=settings["host"], port=settings["port"],
-            )
-        return self.news_launcher
-
     def launch_news_server(self) -> None:
         """Автозапуск news-сервера (вызывается из main.py).
 
@@ -646,6 +669,63 @@ class ChatApplication:
             return
         started, message = launcher.launch()
         utils.get_logger("deepseek-chat.ui").info("News: %s", message)
+
+    def _get_news_launcher(self) -> Optional[NewsServerLauncher]:
+        """Ленивое создание лаунчера news-сервера (NEWS_ENABLED=false → None)."""
+        if self.news_launcher is None:
+            settings = get_news_settings(self.config)
+            if not settings["enabled"]:
+                return None
+            self.news_launcher = NewsServerLauncher(
+                host=settings["host"], port=settings["port"],
+            )
+        return self.news_launcher
+
+    def _get_geo_launcher(self) -> Optional[GeoServerLauncher]:
+        """Ленивое создание лаунчера geo-сервера (GEO_ENABLED=false → None)."""
+        if self.geo_launcher is None:
+            settings = get_geo_settings(self.config)
+            if not settings["enabled"]:
+                return None
+            self.geo_launcher = GeoServerLauncher(
+                host=settings["host"], port=settings["port"],
+            )
+        return self.geo_launcher
+
+    def launch_geo_server(self) -> None:
+        """Автозапуск geo-сервера (вызывается из main.py).
+
+        Если сервер уже работает (порт занят — он живёт 24/7), запуск
+        НЕ повторяется.
+        """
+        launcher = self._get_geo_launcher()
+        if launcher is None:
+            return
+        started, message = launcher.launch()
+        utils.get_logger("deepseek-chat.ui").info("Geo: %s", message)
+
+    def _get_weather_launcher(self) -> Optional[WeatherServerLauncher]:
+        """Ленивое создание лаунчера weather-сервера (WEATHER_ENABLED=false → None)."""
+        if self.weather_launcher is None:
+            settings = get_weather_settings(self.config)
+            if not settings["enabled"]:
+                return None
+            self.weather_launcher = WeatherServerLauncher(
+                host=settings["host"], port=settings["port"],
+            )
+        return self.weather_launcher
+
+    def launch_weather_server(self) -> None:
+        """Автозапуск weather-сервера (вызывается из main.py).
+
+        Если сервер уже работает (порт занят — он живёт 24/7), запуск
+        НЕ повторяется.
+        """
+        launcher = self._get_weather_launcher()
+        if launcher is None:
+            return
+        started, message = launcher.launch()
+        utils.get_logger("deepseek-chat.ui").info("Weather: %s", message)
 
     def start_reminder_listener(self) -> None:
         """Запускает слушатель SSE-уведомлений сервера (из main.py).

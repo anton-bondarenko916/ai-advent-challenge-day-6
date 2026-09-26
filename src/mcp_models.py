@@ -65,3 +65,32 @@ class MCPTool:
 def sort_tools(tools: List[MCPTool]) -> List[MCPTool]:
     """Возвращает копию списка инструментов, отсортированную по имени."""
     return sorted(tools, key=MCPTool.sort_key)
+
+
+@dataclass
+class ServerTools:
+    """Инструменты одного MCP-сервера (группа для панели UI).
+
+    Attributes:
+        name: отображаемое имя сервера (например, "geo", "weather");
+            пустая строка — группа без заголовка (совместимость с
+            одиночным сервером).
+        tools: список инструментов (пустой при ошибке подключения).
+        error: текст ошибки tools/list ("" — сервер ответил успешно).
+        url: MCP-эндпоинт сервера (для маршрутизации вызова кнопкой
+            «Вызвать»); пустая строка — stdio-сервер панели.
+    """
+
+    name: str
+    tools: List[MCPTool] = None  # type: ignore[assignment]
+    error: str = ""
+    url: str = ""
+
+    def __post_init__(self) -> None:
+        if self.tools is None:
+            self.tools = []
+
+    @property
+    def total(self) -> int:
+        """Количество инструментов группы."""
+        return len(self.tools)

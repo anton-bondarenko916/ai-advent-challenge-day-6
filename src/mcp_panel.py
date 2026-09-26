@@ -2,20 +2,29 @@
 
 MCPPanel — сворачиваемый Frame, который встраивается в правую часть
 вкладки «Чат»: индикатор состояния, кнопка «Обновить», скроллируемый
-список карточек инструментов. Каждая карточка имеет кнопки:
+список карточек инструментов, сгруппированных по серверам (заголовок
+«● имя сервера» + карточки его инструментов). Источники: stdio-сервер
+(команда MCP_SERVER_COMMAND, обычно Git) и HTTP-серверы (напоминания,
+news, geo, weather — http_sources). Карточка имеет кнопки:
 
 * «Вызвать» — открывает диалог вызова (open_call_dialog): поля
   параметров строятся по inputSchema инструмента, результат выводится
-  в то же окно после выполнения в фоновом потоке;
+  в то же окно после выполнения в фоновом потоке; вызов уходит на
+  сервер, которому принадлежит инструмент (HTTP — через
+  MCPRemoteCallWorker, stdio — через MCPToolCallWorker);
 * «Параметры» — модальное окно с описанием и inputSchema (JSON);
   туда же ведёт клик по карточке.
 
+Сервер, не ответивший на tools/list, не скрывает остальные: его группа
+помечается красным с текстом ошибки (как в agentic loop — недоступный
+сервер не ломает диалог).
+
 Потокобезопасность: и запрос списка, и вызов инструмента выполняют
-воркеры в отдельных daemon-потоках (MCPWorker / MCPToolCallWorker);
-их callback'и кладут результат в queue.Queue, а главный поток опрашивает
-очередь через ``root.after`` — тот же паттерн, что у задач (FSM) в
-ui.py, поэтому UI никогда не блокируется и не обновляется из чужого
-потока.
+воркеры в отдельных daemon-потоках (MultiServerListWorker /
+MCPToolCallWorker / MCPRemoteCallWorker); их callback'и кладут
+результат в queue.Queue, а главный поток опрашивает очередь через
+``root.after`` — тот же паттерн, что у задач (FSM) в ui.py, поэтому UI
+никогда не блокируется и не обновляется из чужого потока.
 
 Состояние сворачивания сохраняется в SQLite (AppStateStore, таблица
 app_state) и восстанавливается при следующем запуске.
@@ -31,8 +40,12 @@ from tkinter import messagebox, ttk
 
 from .app_state import AppStateStore
 from .config import PROJECT_ROOT
-from .mcp_models import MCPTool
-from .mcp_worker import MCPToolCallWorker, MCPWorker
+from .mcp_models import MCPTool, ServerTools
+from .mcp_worker import (
+    MCPRemoteCallWorker,
+    MCPToolCallWorker,
+    MultiServerListWorker,
+)
 
 # Состояния индикатора панели: цвет точки ● и подпись.
 STATUS_IDLE = "idle"            # серый:  «Не подключён» (старт)
@@ -62,9 +75,14 @@ class MCPPanel(tk.Frame):
     Attributes:
         settings: настройки из config.get_mcp_settings (enabled,
             server_command, timeout, log_path).
+        http_sources: HTTP-серверы для панели — список
+            ``{"name", "url"}`` (напоминания, news, geo, weather).
         app_state: хранилище состояния UI; None — сворачивание не
             сохраняется.
-        tools: последний полученный список инструментов.
+        tools: последний полученный список инструментов (плоский список
+            всех серверов).
+        tool_sources: маршрут вызовов «имя инструмента → url сервера»
+            ("" — stdio-сервер панели).
         collapsed: свёрнута ли панель (остаётся только заголовок).
     """
 
@@ -73,8 +91,9 @@ class MCPPanel(tk.Frame):
         master: tk.Misc,
         settings: Dict[str, Any],
         app_state: Optional[AppStateStore] = None,
-        worker_factory: Optional[Callable[[Any, Any], MCPWorker]] = None,
-        call_worker_factory: Optional[Callable[[str, Dict[str, Any], Any, Any], Any]] = None,
+        worker_factory: Optional[Callable[[Any, Any], MultiServerListWorker]] = None,
+        call_worker_factory: Optional[Callable[..., Any]] = None,
+        http_sources: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Строит панель.
 
@@ -83,15 +102,20 @@ class MCPPanel(tk.Frame):
             settings: словарь настроек MCP (get_mcp_settings).
             app_state: хранилище состояния UI (сворачивание панели).
             worker_factory: фабрика воркера списка ``f(on_success, on_error)``;
-                None — стандартный MCPWorker. Для тестов подаётся фейк.
+                None — стандартный MultiServerListWorker (stdio + http_sources).
+                Для тестов подаётся фейк.
             call_worker_factory: фабрика воркера вызова
-                ``f(tool_name, arguments, on_success, on_error)``; None —
-                стандартный MCPToolCallWorker (настройки из settings).
+                ``f(tool_name, arguments, on_success, on_error)``
+                (для инструментов HTTP-серверов — с kwarg ``source_url``);
+                None — стандартные MCPToolCallWorker/MCPRemoteCallWorker.
+            http_sources: HTTP-серверы — список ``{"name", "url"}``.
         """
         super().__init__(master, bg="#ECECEC", width=_WIDTH)
         self.settings = settings
+        self.http_sources: List[Dict[str, Any]] = list(http_sources or [])
         self.app_state = app_state
         self.tools: List[MCPTool] = []
+        self.tool_sources: Dict[str, str] = {}
         self.collapsed = False
         self._busy = False
         self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -225,18 +249,29 @@ class MCPPanel(tk.Frame):
     # Обновление списка (запрос в отдельном потоке)
     # ------------------------------------------------------------------
 
-    def _default_worker_factory(self, on_success, on_error) -> MCPWorker:
-        """Стандартная фабрика: MCPWorker с настройками из config."""
-        return MCPWorker(
+    def _default_worker_factory(self, on_success, on_error) -> MultiServerListWorker:
+        """Стандартная фабрика: опрос stdio-сервера и всех HTTP-серверов."""
+        return MultiServerListWorker(
             on_success=on_success,
             on_error=on_error,
             server_command=self.settings.get("server_command"),
             timeout=self.settings.get("timeout"),
             log_path=str(self.settings.get("log_path") or ""),
+            http_sources=self.http_sources,
         )
 
-    def _default_call_worker_factory(self, tool_name, arguments, on_success, on_error):
-        """Стандартная фабрика вызова: MCPToolCallWorker на тот же сервер."""
+    def _default_call_worker_factory(
+        self, tool_name, arguments, on_success, on_error, source_url: str = "",
+    ):
+        """Фабрика вызова: HTTP-сервер (source_url) или stdio панели."""
+        if source_url:
+            return MCPRemoteCallWorker(
+                tool_name=tool_name,
+                arguments=arguments,
+                on_success=on_success,
+                on_error=on_error,
+                server_url=source_url,
+            )
         return MCPToolCallWorker(
             tool_name=tool_name,
             arguments=arguments,
@@ -283,25 +318,100 @@ class MCPPanel(tk.Frame):
             if self._busy:
                 self._poll_job = self.after(100, self._poll)
 
-    def _on_tools_loaded(self, tools: List[MCPTool]) -> None:
-        """Успешный ответ: перерисовать список (без дублей)."""
+    def _on_tools_loaded(self, result: Any) -> None:
+        """Успешный ответ: перерисовать список по группам серверов.
+
+        Принимает оба формата воркера: список групп ServerTools
+        (MultiServerListWorker) или плоский список MCPTool — ответы
+        одиночного сервера (старые воркеры и тесты) рисуются как одна
+        группа без заголовка.
+        """
         self._busy = False
-        self.tools = list(tools)
         self.refresh_btn.config(state="normal")
-        count = len(self.tools)
-        self._set_status(
-            STATUS_CONNECTED,
-            f"Подключён | {count} {_plural_tools(count)}"
-        )
+        groups = self._normalize_groups(result)
+        self.tools = [tool for group in groups for tool in group.tools]
+        self.tool_sources = {
+            tool.name: group.url for group in groups for tool in group.tools
+        }
+        total = len(self.tools)
+        failed = [group for group in groups if group.error]
+        if total:
+            status = f"Подключён | {total} {_plural_tools(total)}"
+            if failed:
+                status += " · нет связи: " + ", ".join(
+                    group.name or "сервер" for group in failed
+                )
+            self._set_status(STATUS_CONNECTED, status)
+        elif failed:
+            short = failed[0].error
+            if len(short) > 120:
+                short = short[:117] + "..."
+            self._set_status(STATUS_ERROR, f"Ошибка: {short}")
+        else:
+            self._set_status(
+                STATUS_CONNECTED,
+                "Подключён | 0 " + _plural_tools(0),
+            )
         self._clear_tools()
-        if not self.tools:
-            # Пустой список — НЕ ошибка.
+        if not groups:
             self._show_placeholder(
-                "Сервер ответил, но инструментов не вернул."
+                "Серверы не настроены.\nПроверьте MCP_ENABLED и enabled у "
+                "HTTP-серверов."
             )
             return
-        for tool in self.tools:
-            self._add_tool_card(tool)
+        if not self.tools and not failed:
+            # Пустой список — НЕ ошибка.
+            self._show_placeholder(
+                "Серверы ответили, но инструментов не вернули."
+            )
+            return
+        for group in groups:
+            self._render_group(group)
+
+    @staticmethod
+    def _normalize_groups(result: Any) -> List[ServerTools]:
+        """Приводит ответ воркера к списку групп ServerTools.
+
+        Args:
+            result: список ServerTools (многосерверный воркер) либо
+                список MCPTool (одиночный сервер — обратная совместимость).
+
+        Returns:
+            Список групп; плоский список инструментов становится одной
+            безымянной группой (без заголовка в панели).
+        """
+        if isinstance(result, ServerTools):
+            return [result]
+        if result and all(isinstance(item, MCPTool) for item in result):
+            return [ServerTools(name="", tools=list(result))]
+        return [item for item in result if isinstance(item, ServerTools)]
+
+    def _render_group(self, group: ServerTools) -> None:
+        """Рисует одну группу: заголовок сервера, ошибка, карточки.
+
+        Args:
+            group: группа ServerTools (имя, инструменты, ошибка, url).
+        """
+        if group.name:
+            color = "#C62828" if group.error else "#2E7D32"
+            header = tk.Label(
+                self.tools_frame,
+                text=f"● {group.name}",
+                bg="#ECECEC", fg=color,
+                font=FONTS_SERVER_NAME, anchor="w",
+            )
+            header.pack(side="top", fill="x", padx=2, pady=(6, 0))
+        if group.error and not group.tools:
+            error_label = tk.Label(
+                self.tools_frame,
+                text=_shorten(group.error, _CARD_LIMIT),
+                bg="#ECECEC", fg="#C62828",
+                font=FONTS_SMALL, anchor="w", justify="left",
+                wraplength=_WIDTH - 24,
+            )
+            error_label.pack(side="top", fill="x", padx=6)
+        for tool in group.tools:
+            self._add_tool_card(tool, source_url=group.url)
 
     def _on_error(self, message: str) -> None:
         """Ошибка запроса: красный статус + messagebox с текстом."""
@@ -344,12 +454,16 @@ class MCPPanel(tk.Frame):
         )
         label.pack(side="top", fill="x", pady=(8, 0))
 
-    def _add_tool_card(self, tool: MCPTool) -> None:
+    def _add_tool_card(self, tool: MCPTool, source_url: str = "") -> None:
         """Добавляет карточку инструмента с кнопками «Вызвать»/«Параметры».
 
         Клик по карточке (или меткам) открывает модалку с inputSchema —
         как и кнопка «Параметры»; кнопка «Вызвать» открывает диалог
-        вызова инструмента.
+        вызова инструмента (на сервере ``source_url``, "" — stdio).
+
+        Args:
+            tool: инструмент для карточки.
+            source_url: MCP-эндпоинт сервера инструмента; "" — stdio.
         """
         card = tk.Frame(
             self.tools_frame, bg="#FFFFFF", bd=1, relief="solid",
@@ -381,7 +495,7 @@ class MCPPanel(tk.Frame):
 
         tk.Button(
             buttons, text="▶ Вызвать",
-            command=lambda t=tool: self.open_call_dialog(t),
+            command=lambda t=tool, u=source_url: self.open_call_dialog(t, u),
             bg="#007AFF", fg="#FFFFFF", activebackground="#0066D6",
             activeforeground="#FFFFFF", relief="flat", cursor="hand2",
             font=FONTS_SMALL,
@@ -478,7 +592,7 @@ class MCPPanel(tk.Frame):
     # Диалог вызова инструмента
     # ------------------------------------------------------------------
 
-    def open_call_dialog(self, tool: MCPTool) -> "_ToolCallDialog":
+    def open_call_dialog(self, tool: MCPTool, source_url: str = "") -> "_ToolCallDialog":
         """Открывает диалог вызова инструмента (кнопка «Вызвать»).
 
         Форма параметров строится по inputSchema; вызов выполняется в
@@ -486,11 +600,12 @@ class MCPPanel(tk.Frame):
 
         Args:
             tool: инструмент для вызова.
+            source_url: MCP-эндпоинт сервера инструмента; "" — stdio.
 
         Returns:
             Созданное окно (_ToolCallDialog) — для тестов и вызывателя.
         """
-        return _ToolCallDialog(self, tool)
+        return _ToolCallDialog(self, tool, source_url)
 
     # ------------------------------------------------------------------
     # Сворачивание панели
@@ -627,16 +742,20 @@ class _ToolCallDialog(tk.Toplevel):
     (это безопасно, поток daemon).
     """
 
-    def __init__(self, panel: MCPPanel, tool: MCPTool) -> None:
+    def __init__(self, panel: MCPPanel, tool: MCPTool,
+                 source_url: str = "") -> None:
         """Строит окно вызова.
 
         Args:
             panel: панель MCP (источник настроек и фабрики воркера).
             tool: вызываемый инструмент.
+            source_url: MCP-эндпоинт сервера инструмента; "" — stdio
+                сервер панели.
         """
         super().__init__(panel)
         self.panel = panel
         self.tool = tool
+        self.source_url = str(source_url or "")
         self._busy = False
         self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._poll_job: Optional[str] = None
@@ -803,12 +922,23 @@ class _ToolCallDialog(tk.Toplevel):
         self._busy = True
         self.run_btn.config(state="disabled")
         self._set_status("Выполняется...", "#F9A825")
-        worker = self.panel._make_call_worker(
-            self.tool.name,
-            arguments,
-            on_success=lambda text: self._queue.put({"ok": text}),
-            on_error=lambda message: self._queue.put({"error": message}),
-        )
+        if self.source_url:
+            # Инструмент HTTP-сервера (geo/weather/напоминания/news):
+            # вызов уходит на его сервер
+            worker = self.panel._make_call_worker(
+                self.tool.name,
+                arguments,
+                on_success=lambda text: self._queue.put({"ok": text}),
+                on_error=lambda message: self._queue.put({"error": message}),
+                source_url=self.source_url,
+            )
+        else:
+            worker = self.panel._make_call_worker(
+                self.tool.name,
+                arguments,
+                on_success=lambda text: self._queue.put({"ok": text}),
+                on_error=lambda message: self._queue.put({"error": message}),
+            )
         worker.start()
         self._poll_job = self.after(100, self._poll)
 
@@ -928,9 +1058,18 @@ def _parse_argument(raw: str, ptype: str) -> Any:
     return raw
 
 
+def _shorten(text: str, limit: int) -> str:
+    """Обрезает текст до ``limit`` символов с многоточием (для группы)."""
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1].rstrip() + "…"
+
+
 # Шрифты панели (отдельный словарь, чтобы не трогать FONTS в ui.py).
 FONTS_DOT = ("Segoe UI", 11)
 FONTS_HEADER = ("Segoe UI", 10, "bold")
+FONTS_SERVER_NAME = ("Segoe UI", 9, "bold")
 FONTS_SMALL = ("Segoe UI", 8)
 FONTS_CARD_NAME = ("Segoe UI", 9, "bold")
 FONTS_MONO = ("Consolas", 9)

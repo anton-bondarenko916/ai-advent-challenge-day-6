@@ -161,6 +161,21 @@ DEFAULTS: Dict[str, Any] = {
     "NEWS_OUTPUT_DIR": "",           # "" — output/ в корне проекта
     "NEWS_RSS_FEEDS": "",            # "" — lenta+rbc+gazeta (в news_server)
     # ------------------------------------------------------------------
+    # MCP-сервер геолокации (geo_server.py, HTTP-транспорт 24/7):
+    # get_user_city() — город пользователя по IP (ip-api.com).
+    # Порт 8001 занят news-сервером, поэтому geo — 8002, weather — 8003.
+    # ------------------------------------------------------------------
+    "GEO_ENABLED": True,             # False — без geo-инструмента и автозапуска
+    "GEO_SERVER_HOST": "127.0.0.1",  # только локально, не хостить!
+    "GEO_SERVER_PORT": 8002,         # порт http://127.0.0.1:<порт>/mcp
+    # ------------------------------------------------------------------
+    # MCP-сервер погоды (weather_server.py, HTTP-транспорт 24/7):
+    # get_weather(city) — текущая погода (Open-Meteo, геокодинг + прогноз)
+    # ------------------------------------------------------------------
+    "WEATHER_ENABLED": True,         # False — без погоды и автозапуска
+    "WEATHER_SERVER_HOST": "127.0.0.1",  # только локально, не хостить!
+    "WEATHER_SERVER_PORT": 8003,     # порт http://127.0.0.1:<порт>/mcp
+    # ------------------------------------------------------------------
     # Состояние UI (сворачивание панели MCP и т.п.): SQLite key-value
     # ------------------------------------------------------------------
     "APP_STATE_PATH": "data/app_state.db",  # путь к БД (относительно корня)
@@ -176,6 +191,8 @@ _BOOL_KEYS = (
     "MCP_ENABLED",
     "REMINDER_ENABLED",
     "NEWS_ENABLED",
+    "GEO_ENABLED",
+    "WEATHER_ENABLED",
 )
 
 # Переменные, значения которых нужно приводить к числу
@@ -189,6 +206,7 @@ _INT_KEYS = (
     "TASKS_MAX_RETRIES",
     "REMINDER_SERVER_PORT", "REMINDER_TOOLCALL_MAX_ROUNDS",
     "NEWS_SERVER_PORT", "NEWS_SUMMARY_MAX_TOKENS",
+    "GEO_SERVER_PORT", "WEATHER_SERVER_PORT",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
@@ -933,4 +951,60 @@ def get_news_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         "summary_model": summary_model,
         "summary_max_tokens": summary_max_tokens,
         "output_dir": output_dir,
+    }
+
+
+def get_geo_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки подсистемы геолокации.
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "host", "port", "url"}: host — только
+        127.0.0.1 (хостить в интернете запрещено); url — MCP-эндпоинт
+        ``http://<host>:<port>/mcp``.
+    """
+    cfg = config if config is not None else get_config()
+
+    host, port = _local_host_and_port(
+        cfg, "GEO_SERVER_HOST", "GEO_SERVER_PORT", 8002
+    )
+    return {
+        "enabled": _coerce_bool(cfg.get("GEO_ENABLED", True)),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}/mcp",
+    }
+
+
+def get_weather_settings(
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Собирает и валидирует настройки подсистемы погоды.
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "host", "port", "url"}: host — только
+        127.0.0.1 (хостить в интернете запрещено); url — MCP-эндпоинт
+        ``http://<host>:<port>/mcp``.
+    """
+    cfg = config if config is not None else get_config()
+
+    host, port = _local_host_and_port(
+        cfg, "WEATHER_SERVER_HOST", "WEATHER_SERVER_PORT", 8003
+    )
+    return {
+        "enabled": _coerce_bool(cfg.get("WEATHER_ENABLED", True)),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}/mcp",
     }
