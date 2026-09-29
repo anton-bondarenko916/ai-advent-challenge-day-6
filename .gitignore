@@ -2,9 +2,15 @@
 .env
 
 # --- Данные приложения (история диалога, SQLite) ---
-data/
+# Якорь на корень: app/data/ содержит коммитимые тестовые вопросы
+# и MD-документы базы знаний (исключение — chroma_db ниже).
+/data/
 reminders.db
 output/
+
+# --- RAG (Flet-приложение): векторная база и результаты прогона ---
+app/data/chroma_db/
+app/data/comparison_results.json
 
 # --- Python ---
 __pycache__/

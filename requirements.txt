@@ -55,3 +55,19 @@ httpx>=0.27
 # search_news читает ленты lenta.ru / rssexport.rbc.ru и фильтрует
 # записи по теме для agentic loop (поиск → сводка → сохранение).
 feedparser>=6.0,<7
+
+# ------------------------------------------------------------------
+# Flet-приложение (app/main.py, миграция с Tkinter): нативное окно
+# на Flutter, вкладки «Чат / База знаний / Сравнение / Настройки».
+# Требуется flet-desktop (ставится вместе с flet).
+# ------------------------------------------------------------------
+flet>=1.0,<2
+
+# Векторная БД RAG (app/rag/vector_store.py): PersistentClient
+# (данные в app/data/chroma_db переживают перезапуск), cosine space.
+chromadb>=1.0,<2
+
+# Chunking MD-документов (app/rag/chunkers.py): две стратегии —
+# RecursiveCharacterTextSplitter (fixed) и MarkdownHeaderTextSplitter
+# + RecursiveCharacterTextSplitter (structure).
+langchain-text-splitters>=1.0,<2

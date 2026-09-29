@@ -1,0 +1,17 @@
+# Зависимости Flet/RAG-приложения (app/main.py).
+# Полный набор зависимостей проекта — в корневом requirements.txt
+# (pip install -r requirements.txt уже включает эти пакеты).
+
+# UI: нативное окно на Flutter (вкладки Чат / База знаний / Сравнение / Настройки)
+flet>=1.0,<2
+
+# Векторная БД: PersistentClient + cosine (app/data/chroma_db)
+chromadb>=1.0,<2
+
+# Chunking: fixed (RecursiveCharacterTextSplitter) и
+# structure (MarkdownHeaderTextSplitter + Recursive)
+langchain-text-splitters>=1.0,<2
+
+# Эмбеддинги Ollama (/api/embed) — httpx уже входит в корневой набор,
+# перечислен здесь как прямая зависимость RAG-пайплайна
+httpx>=0.27

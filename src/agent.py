@@ -447,6 +447,15 @@ class DeepSeekAgent:
         # (обновляется при каждом успешном list_tools)
         self._tool_routes: Dict[str, Any] = {}
 
+        # RAG-хук (миграция на Flet, app/rag/): одноразовый контекст для
+        # следующего хода. set_rag_context задаёт полный текст последнего
+        # user-сообщения запроса к API (промпт с чанками базы знаний) и
+        # список источников; история диалога при этом хранит вопрос
+        # пользователя как есть. Контекст расходуется одним ходом: в
+        # конце send_message сбрасывается.
+        self._rag_block: Optional[str] = None
+        self._rag_sources: Optional[List[Dict[str, Any]]] = None
+
         # Клиент создаётся только вне mock-режима
         self._client: Optional[OpenAI] = None
         if not self._mock_mode:
@@ -554,8 +563,11 @@ class DeepSeekAgent:
             self._append_message({"role": "user", "content": user_input.strip()})
             # Снимок того, что реально уйдёт в API (system + конспект +
             # непокрытая история) — используется для оценки токенов, если
-            # API не вернул usage.
+            # API не вернул usage. RAG-контекст подмешивается и в снимок:
+            # оценка токенов должна включать чанки базы знаний.
             request_messages = self._build_context_messages()
+            if self._rag_block:
+                request_messages = self._apply_rag_block(request_messages)
 
             start = time.perf_counter()
             try:
@@ -640,6 +652,12 @@ class DeepSeekAgent:
                 saved_path = payload.pop("saved_file_path", None)
                 if saved_path:
                     result["file_path"] = saved_path
+                # RAG: источники чанков, использованных в промпте (панель
+                # «Источники» в UI). Появляется, только если контекст был
+                # установлен через set_rag_context.
+                if self._rag_sources is not None:
+                    result["sources"] = list(self._rag_sources)
+                    result["rag_used"] = bool(self._rag_block)
                 return result
             except ApiError as exc:
                 # При ошибке откатываем сообщение пользователя из истории,
@@ -655,6 +673,65 @@ class DeepSeekAgent:
                     humanize_api_error(exc),
                     response_time=round(time.perf_counter() - start, 2),
                 )
+            finally:
+                # Одноразовость RAG-контекста: блок расходуется одним ходом
+                self._rag_block = None
+                self._rag_sources = None
+
+    def set_rag_context(
+        self,
+        user_content: Optional[str],
+        sources: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Устанавливает одноразовый RAG-контекст для следующего хода.
+
+        Вызывается RAG-обёрткой (app/agent.py) перед send_message:
+        ``user_content`` — полный текст последнего user-сообщения запроса
+        к API (промпт с чанками базы знаний, собранный retriever'ом);
+        ``sources`` — метаданные чанков для панели «Источники».
+
+        История диалога не изменяется: вопрос пользователя сохраняется
+        как есть, контекст уходит только в копию запроса (см.
+        _apply_rag_block). Контекст расходуется одним ходом send_message
+        и сбрасывается в его конце.
+
+        Args:
+            user_content: текст промпта с контекстом (None — сбросить).
+            sources: список словарей-источников (source, section, preview,
+                strategy, distance и т.п.) или None.
+        """
+        with self._lock:
+            self._rag_block = user_content
+            self._rag_sources = list(sources) if sources is not None else (
+                [] if user_content is not None else None
+            )
+
+    def clear_rag_context(self) -> None:
+        """Сбрасывает RAG-контекст, установленный set_rag_context."""
+        with self._lock:
+            self._rag_block = None
+            self._rag_sources = None
+
+    def _apply_rag_block(self, messages: List[Message]) -> List[Message]:
+        """Подставляет RAG-контекст в копию сообщений запроса.
+
+        Последнее user-сообщение заменяется на self._rag_block (полный
+        промпт с контекстом и вопросом). История диалога не мутируется:
+        заменяются копии словарей, исходные списки/словари не изменяются.
+
+        Args:
+            messages: сообщения запроса (system + конспект + история).
+
+        Returns:
+            Копия списка с заменённым последним user-сообщением.
+        """
+        augmented = list(messages)
+        for index in range(len(augmented) - 1, -1, -1):
+            if augmented[index].get("role") == "user":
+                augmented[index] = dict(augmented[index])
+                augmented[index]["content"] = self._rag_block
+                break
+        return augmented
 
     def clear_history(self) -> None:
         """Очищает историю диалога активной ветки.
@@ -1486,12 +1563,18 @@ class DeepSeekAgent:
         маркеров состояния (LLM сообщает о смене этапа, решение о
         переходе принимает FSM по матрице).
 
+        Если установлен RAG-контекст (set_rag_context), последнее
+        user-сообщение запроса заменяется промптом с чанками базы
+        знаний; история диалога не изменяется.
+
         Returns:
             Словарь параметров для chat.completions.create: модель,
             контекст (system + конспект + непокрытая часть истории),
             температура, max_tokens.
         """
         messages = self._build_context_messages()
+        if self._rag_block:
+            messages = self._apply_rag_block(messages)
         markers_block = self._task_markers_block()
         if markers_block and messages:
             # Копируем system-сообщение: не мутируем историю диалога
