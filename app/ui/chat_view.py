@@ -135,16 +135,18 @@ class ChatView:
         content = bubble.content
         if result.get("error"):
             content.controls.append(components.markdown_text(
-                f"⚠️ **Ошибка:** {result['error']}"))
+                f"⚠️ **Ошибка:** {result['error']}",
+                components.ERROR_TEXT_COLOR))
             self._set_status(f"Ошибка: {result['error']}", error=True)
             return
         content.controls.append(components.markdown_text(
-            str(result.get("text") or "(пустой ответ)")))
+            str(result.get("text") or "(пустой ответ)"),
+            components.MESSAGE_TEXT_COLOR))
         rag_error = result.get("rag_error")
         if rag_error:
             content.controls.append(ft.Text(
                 f"⚠️ RAG: {rag_error}", size=12,
-                color=ft.Colors.ORANGE_700, selectable=True))
+                color=components.RAG_WARNING_COLOR, selectable=True))
         sources_panel = components.sources_panel(result.get("sources") or [])
         if sources_panel is not None:
             content.controls.append(sources_panel)

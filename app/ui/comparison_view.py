@@ -130,10 +130,25 @@ class ComparisonView:
         )
         self.progress_bar = ft.ProgressBar(value=0, visible=False)
         self.progress_text = ft.Text("", size=12)
+        # Сводка: тёмная панель с явным светлым текстом — контраст не
+        # зависит от темы окна (голубой BLUE_GREY_50 на тёмной теме
+        # делал «Без RAG: нет оценок» нечитаемым)
+        self.summary_text_color = ft.Colors.GREY_50
+        self.summary_bgcolor = ft.Colors.BLUE_GREY_900
         self.summary_no_rag = ft.Text("Без RAG: нет оценок", size=13,
-                                      weight=ft.FontWeight.BOLD, selectable=True)
+                                      weight=ft.FontWeight.BOLD,
+                                      color=self.summary_text_color,
+                                      selectable=True)
         self.summary_rag = ft.Text("С RAG: нет оценок", size=13,
-                                   weight=ft.FontWeight.BOLD, selectable=True)
+                                   weight=ft.FontWeight.BOLD,
+                                   color=self.summary_text_color,
+                                   selectable=True)
+        self.summary_container = ft.Container(
+            ft.Column([self.summary_no_rag, self.summary_rag], spacing=4),
+            padding=10,
+            bgcolor=self.summary_bgcolor,
+            border_radius=8,
+        )
         self._apply_saved_summaries()
         self._questions_column = questions_column
 
@@ -146,12 +161,7 @@ class ComparisonView:
             ft.Row([self.run_button, self.progress_bar, self.progress_text],
                    spacing=12),
             self._questions_column,
-            ft.Container(
-                ft.Column([self.summary_no_rag, self.summary_rag], spacing=4),
-                padding=8,
-                bgcolor=ft.Colors.BLUE_GREY_50,
-                border_radius=8,
-            ),
+            self.summary_container,
         ], expand=True, spacing=10)
 
     def on_show(self) -> None:

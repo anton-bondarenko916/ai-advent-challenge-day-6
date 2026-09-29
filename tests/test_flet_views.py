@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import flet as ft
+
 from app.rag.embedder import EmbedderError
 from app.rag.retriever import Retriever
 from app.rag.vector_store import VectorStore
@@ -121,6 +123,52 @@ class ComponentsTest(unittest.TestCase):
     def test_assessment_options(self) -> None:
         self.assertEqual(components.ASSESSMENT_OPTIONS,
                          ("Хорошо", "Частично", "Плохо"))
+
+    def test_message_bubbles_contrast_colors(self) -> None:
+        """Пузыри читаемы независимо от темы: тёмный фон + светлый текст."""
+        user = components.message_bubble("Вопрос", "user")
+        assistant = components.message_bubble("Ответ", "assistant")
+        # Разные контрастные фоны (не сливаются с поверхностью страницы)
+        self.assertEqual(user.bgcolor, components.USER_BUBBLE_COLOR)
+        self.assertEqual(assistant.bgcolor, components.ASSISTANT_BUBBLE_COLOR)
+        self.assertNotEqual(user.bgcolor, assistant.bgcolor)
+        # Явный светлый цвет текста Markdown в обоих пузырях
+        for bubble in (user, assistant):
+            markdown = bubble.content.controls[1]
+            self.assertEqual(
+                markdown.md_style_sheet.p_text_style.color,
+                components.MESSAGE_TEXT_COLOR,
+            )
+        # Цвета заголовков тоже заданы явно
+        self.assertEqual(user.content.controls[0].color,
+                         components.USER_HEADER_COLOR)
+        self.assertEqual(assistant.content.controls[0].color,
+                         components.ASSISTANT_HEADER_COLOR)
+
+    def test_markdown_color_only_when_set(self) -> None:
+        colored = components.markdown_text("текст", ft.Colors.GREY_50)
+        themed = components.markdown_text("текст")
+        self.assertEqual(colored.md_style_sheet.p_text_style.color,
+                         ft.Colors.GREY_50)
+        self.assertIsNone(themed.md_style_sheet)
+
+    def test_sources_panel_light_on_dark(self) -> None:
+        from app.rag.retriever import RetrievedChunk
+        sources = Retriever.format_sources([
+            RetrievedChunk(text="Текст чанка", source="installation.md",
+                           section="## Windows", strategy="structure",
+                           distance=0.1, chunk_id=1)])
+        panel = components.sources_panel(sources)
+        # Заголовок и строки источников — светлые (тёмный пузырь под ними)
+        self.assertEqual(panel.title.color, ft.Colors.BLUE_200)
+        self.assertEqual(panel.controls[0].color, ft.Colors.BLUE_200)
+        self.assertEqual(panel.controls[1].color, ft.Colors.GREY_300)
+
+    def test_tools_panel_light_on_dark(self) -> None:
+        panel = components.tools_panel([
+            {"name": "create_reminder", "arguments": {}, "result": "ok"}])
+        self.assertEqual(panel.title.color, ft.Colors.TEAL_200)
+        self.assertEqual(panel.controls[0].color, ft.Colors.TEAL_200)
 
 
 class ChatViewTest(unittest.TestCase):
@@ -368,6 +416,16 @@ class ComparisonViewTest(unittest.TestCase):
 
     def test_build_returns_column(self) -> None:
         self.assertEqual(type(self.view.build()).__name__, "Column")
+
+    def test_summary_panel_contrast(self) -> None:
+        """Панель сводки: тёмный фон + явный светлый текст (в любой теме)."""
+        self.assertEqual(self.view.summary_container.bgcolor,
+                         ft.Colors.BLUE_GREY_900)
+        self.assertEqual(self.view.summary_no_rag.color,
+                         ft.Colors.GREY_50)
+        self.assertEqual(self.view.summary_rag.color, ft.Colors.GREY_50)
+        # Панель входит в дерево вкладки
+        self.assertIn(self.view.summary_container, self.view.build().controls)
 
     def test_ten_question_rows(self) -> None:
         self.assertEqual(len(self.view.rows), 10)

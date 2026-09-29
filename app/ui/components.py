@@ -24,18 +24,62 @@ def truncate(text: Optional[str], limit: int = PREVIEW_TOOL_RESULT) -> str:
     return value
 
 
-def markdown_text(value: str) -> ft.Markdown:
-    """Selectable Markdown (копирование из чата) с переносом строк."""
+# Дизайн чата: тёмные пузыри с явным светлым текстом — контраст не
+# зависит от светлой/тёмной темы окна (по умолчанию Flet берёт тему
+# системы, и «светлый текст на светлом пузыре» делал сообщения
+# нечитаемыми).
+USER_BUBBLE_COLOR = ft.Colors.BLUE_800
+ASSISTANT_BUBBLE_COLOR = ft.Colors.BLUE_GREY_800
+USER_HEADER_COLOR = ft.Colors.BLUE_200
+ASSISTANT_HEADER_COLOR = ft.Colors.BLUE_GREY_200
+MESSAGE_TEXT_COLOR = ft.Colors.GREY_50
+ERROR_TEXT_COLOR = ft.Colors.RED_200
+RAG_WARNING_COLOR = ft.Colors.ORANGE_300
+
+
+def _message_style_sheet(color: str) -> ft.MarkdownStyleSheet:
+    """Явные цвета текста Markdown (абзацы, заголовки, списки, код)."""
+    style = ft.TextStyle(color=color)
+    return ft.MarkdownStyleSheet(
+        p_text_style=style,
+        h1_text_style=style,
+        h2_text_style=style,
+        h3_text_style=style,
+        h4_text_style=style,
+        h5_text_style=style,
+        h6_text_style=style,
+        em_text_style=style,
+        strong_text_style=style,
+        del_text_style=style,
+        list_bullet_text_style=style,
+        blockquote_text_style=style,
+        code_text_style=style,
+    )
+
+
+def markdown_text(value: str, color: Optional[str] = None) -> ft.Markdown:
+    """Selectable Markdown (копирование из чата) с переносом строк.
+
+    Args:
+        value: текст сообщения (Markdown).
+        color: явный цвет текста — задавайте внутри цветных контейнеров
+            (пузыри чата), где цвет темы может слиться с фоном; None —
+            цвет темы (для текста на поверхности страницы/карточек).
+    """
     return ft.Markdown(
         value or "",
         selectable=True,
         extension_set=ft.MarkdownExtensionSet.GITHUB_FLAVORED,
         soft_line_break=True,
+        md_style_sheet=_message_style_sheet(color) if color else None,
     )
 
 
 def message_bubble(text: str, role: str, timestamp: str = "") -> ft.Container:
     """Пузырь сообщения чата (пользователь — справа, ассистент — слева).
+
+    Тёмный контрастный фон + светлый текст (константы выше) — читаемо
+    и в светлой, и в тёмной теме окна.
 
     Args:
         text: текст сообщения (Markdown).
@@ -51,12 +95,15 @@ def message_bubble(text: str, role: str, timestamp: str = "") -> ft.Container:
         f"{header_role}{' · ' + timestamp if timestamp else ''}",
         size=11,
         weight=ft.FontWeight.BOLD,
-        color=ft.Colors.BLUE_GREY_400,
+        color=USER_HEADER_COLOR if is_user else ASSISTANT_HEADER_COLOR,
     )
-    body = ft.Column([header, markdown_text(text)], spacing=2, tight=True)
+    body = ft.Column(
+        [header, markdown_text(text, MESSAGE_TEXT_COLOR)],
+        spacing=2, tight=True,
+    )
     return ft.Container(
         content=body,
-        bgcolor=ft.Colors.BLUE_50 if is_user else ft.Colors.GREY_100,
+        bgcolor=USER_BUBBLE_COLOR if is_user else ASSISTANT_BUBBLE_COLOR,
         border_radius=10,
         padding=10,
         margin=ft.Margin(left=40 if is_user else 0,
@@ -65,7 +112,9 @@ def message_bubble(text: str, role: str, timestamp: str = "") -> ft.Container:
 
 
 def source_line(source: Dict[str, Any]) -> ft.Text:
-    """Строка источника: 📄 installation.md → ## Windows (structure, d=0.12)."""
+    """Строка источника: 📄 installation.md → ## Windows (structure, d=0.12).
+
+    Светлый цвет — панель лежит на тёмном пузыре сообщения."""
     path = source.get("source") or "?"
     section = source.get("section") or "—"
     strategy = source.get("strategy") or "fixed"
@@ -74,25 +123,27 @@ def source_line(source: Dict[str, Any]) -> ft.Text:
     return ft.Text(
         f"📄 {path} → {section}{suffix}",
         size=12,
-        color=ft.Colors.BLUE_GREY_700,
+        color=ft.Colors.BLUE_200,
         selectable=True,
     )
 
 
 def source_preview(source: Dict[str, Any]) -> ft.Text:
-    """Фрагмент текста чанка в кавычках."""
+    """Фрагмент текста чанка в кавычках (светлый — на тёмном пузыре)."""
     preview = source.get("preview") or ""
     return ft.Text(
         f"   «{preview}»",
         size=11,
         italic=True,
-        color=ft.Colors.GREY_700,
+        color=ft.Colors.GREY_300,
         selectable=True,
     )
 
 
 def sources_panel(sources: List[Dict[str, Any]]) -> Optional[ft.ExpansionTile]:
     """Сворачиваемая панель «Источники» под ответом LLM.
+
+    Светлые заголовок/иконка — панель лежит на тёмном пузыре сообщения.
 
     Args:
         sources: список метаданных чанков (Retriever.format_sources).
@@ -108,16 +159,22 @@ def sources_panel(sources: List[Dict[str, Any]]) -> Optional[ft.ExpansionTile]:
         rows.append(source_preview(source))
     return ft.ExpansionTile(
         title=ft.Text(f"📚 Источники ({len(sources)})", size=13,
-                      weight=ft.FontWeight.BOLD),
+                      weight=ft.FontWeight.BOLD,
+                      color=ft.Colors.BLUE_200),
         controls=rows,
         expanded=False,
         tile_padding=6,
+        icon_color=ft.Colors.BLUE_200,
+        collapsed_icon_color=ft.Colors.BLUE_200,
+        text_color=ft.Colors.BLUE_100,
+        collapsed_text_color=ft.Colors.BLUE_200,
     )
 
 
 def tools_panel(tool_calls: List[Dict[str, Any]]) -> Optional[ft.ExpansionTile]:
     """Панель выполненных MCP-инструментов под ответом (напоминания,
-    новости, гео/погода — функциональность agentic loop из src)."""
+    новости, гео/погода — функциональность agentic loop из src).
+    Светлые цвета — на тёмном пузыре сообщения."""
     if not tool_calls:
         return None
     rows: List[ft.Control] = []
@@ -129,14 +186,19 @@ def tools_panel(tool_calls: List[Dict[str, Any]]) -> Optional[ft.ExpansionTile]:
             f"🛠 {name} {arguments}\n   → {result}",
             size=12,
             selectable=True,
-            color=ft.Colors.TEAL_800,
+            color=ft.Colors.TEAL_200,
         ))
     return ft.ExpansionTile(
         title=ft.Text(f"🛠 Инструменты ({len(tool_calls)})", size=13,
-                      weight=ft.FontWeight.BOLD),
+                      weight=ft.FontWeight.BOLD,
+                      color=ft.Colors.TEAL_200),
         controls=rows,
         expanded=False,
         tile_padding=6,
+        icon_color=ft.Colors.TEAL_200,
+        collapsed_icon_color=ft.Colors.TEAL_200,
+        text_color=ft.Colors.TEAL_100,
+        collapsed_text_color=ft.Colors.TEAL_200,
     )
 
 
