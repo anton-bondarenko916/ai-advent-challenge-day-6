@@ -1,4 +1,5 @@
-"""Общие компоненты Flet-интерфейса: сообщения чата, панели источников.
+"""Общие компоненты Flet-интерфейса: сообщения чата, панели источников,
+гард фоновых задач.
 
 Чистая сборка контролов без обращения к page — вкладки тестируются
 офлайн (контролы Flet 1.0 — обычные dataclass-объекты).
@@ -6,14 +7,50 @@
 
 from __future__ import annotations
 
+import traceback
 from typing import Any, Dict, List, Optional
 
 import flet as ft
+
+from src.utils import get_logger
+
+logger = get_logger("deepseek-chat.flet.ui")
 
 # Варианты оценки на вкладке «Сравнение» (порядок = порядок в сводке)
 ASSESSMENT_OPTIONS = ("Хорошо", "Частично", "Плохо")
 
 PREVIEW_TOOL_RESULT = 220
+
+
+def guarded_task(app: Any, handler) -> Any:
+    """Обёртка async-задачи вкладки: исключение не «роняет» интерфейс.
+
+    Без обёртки неперехваченное исключение в async-обработчике Flet
+    показывает полноэкранный error-overlay — вернуться на другие
+    вкладки нельзя. Гард пишет полный traceback в лог (терминал) и
+    показывает пользователю SnackBar с текстом ошибки.
+
+    Args:
+        app: владелец вкладок (используется app.notify).
+        handler: корутинная функция задачи.
+
+    Returns:
+        Корутинная функция-обёртку (для page.run_task).
+    """
+
+    async def wrapper(*args) -> None:
+        try:
+            await handler(*args)
+        except Exception as exc:  # noqa: BLE001 — гард по определению широкий
+            logger.error("Ошибка в %s:\n%s",
+                         getattr(handler, "__qualname__", handler),
+                         traceback.format_exc())
+            try:
+                app.notify(f"⚠️ Ошибка: {exc} (подробности — в логе)")
+            except Exception:
+                logger.error("Не удалось показать SnackBar об ошибке")
+
+    return wrapper
 
 
 def truncate(text: Optional[str], limit: int = PREVIEW_TOOL_RESULT) -> str:

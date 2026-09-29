@@ -227,13 +227,17 @@ class ComparisonView:
     # Прогон
     # ------------------------------------------------------------------
     def _on_run(self, event=None) -> None:
-        self._schedule(self._run_async())
+        self._schedule(self._run_async)
 
-    def _schedule(self, coroutine) -> None:
-        if self.app.page is not None:
-            self.app.page.run_task(coroutine)
-        else:
-            coroutine.close()
+    def _schedule(self, handler, *args) -> None:
+        """Запускает async-задачу: КОРУТИННУЮ ФУНКЦИЮ (не корутину!) в
+        page.run_task — иначе TypeError и error-overlay Flet. Гард
+        (components.guarded_task) пишет traceback в лог и показывает
+        SnackBar вместо падения интерфейса. Без page (тесты) — no-op."""
+        if self.app.page is None:
+            return
+        self.app.page.run_task(
+            components.guarded_task(self.app, handler), *args)
 
     async def _run_async(self) -> None:
         """Прогоняет все вопросы в двух режимах последовательно."""

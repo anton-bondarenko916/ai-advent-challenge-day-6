@@ -62,6 +62,101 @@ def make_app(agent, page=None, file_picker=None):
     )
 
 
+class FakePage:
+    """Страница-заглушка: запоминает задачи, переданные в run_task."""
+
+    def __init__(self) -> None:
+        self.tasks: list = []
+
+    def run_task(self, handler, *args) -> None:
+        self.tasks.append((handler, args))
+
+
+class ScheduleTest(unittest.TestCase):
+    """Запуск фоновых задач: run_task получает корутинную ФУНКЦИЮ.
+
+    Регрессия: раньше в run_task передавалась готовая корутина —
+    TypeError «handler must be a coroutine function» в обработчике
+    кнопки давал полноэкранный error-overlay Flet и блокировал вкладки.
+    """
+
+    def test_run_task_receives_coroutine_function(self) -> None:
+        import inspect
+
+        page = FakePage()
+        cases = (
+            ("ChatView", lambda app: ChatView(app), "_on_send"),
+            ("KnowledgeView", lambda app: KnowledgeView(app), "_on_index"),
+            ("SettingsView", lambda app: SettingsView(app), "_on_save"),
+        )
+        for name, build_view, handler_name in cases:
+            agent = make_agent()
+            app = make_app(agent, page=page)
+            view = build_view(app)
+            # Синхронные обработчики кнопок не бросают и не создают
+            # «висящих» корутин
+            getattr(view, handler_name)()
+            self.assertEqual(len(page.tasks), 1, name)
+            handler, args = page.tasks[0]
+            self.assertTrue(inspect.iscoroutinefunction(handler),
+                            f"{name}: не корутинная функция")
+            self.assertFalse(inspect.iscoroutine(handler))
+            self.assertEqual(args, ())
+            page.tasks.clear()
+
+    def test_comparison_run_passes_function(self) -> None:
+        import inspect
+
+        page = FakePage()
+        agent = make_agent()
+        agent.bind_config(dict(COMPARISON_CONFIG))
+        view = ComparisonView(make_app(agent, page=page),
+                              questions_path=QUESTION_FILE,
+                              results_path=Path(tempfile.mkdtemp()) / "r.json")
+        view._on_run()
+        handler, _args = page.tasks[0]
+        self.assertTrue(inspect.iscoroutinefunction(handler))
+        self.assertFalse(inspect.iscoroutine(handler))
+
+    def test_guarded_task_swallows_and_notifies(self) -> None:
+        """Гард: исключение задачи — traceback в лог, SnackBar, UI жив."""
+        calls: list = []
+        app = SimpleNamespace(notify=lambda m: calls.append(m))
+        from app.ui import components as ui_components
+
+        async def boom(value) -> None:
+            raise RuntimeError(f"бум {value}")
+
+        wrapper = ui_components.guarded_task(app, boom)
+        # Не бросает: ошибка проглочена, пользователь уведомлён
+        asyncio.run(wrapper("тест"))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("бум тест", calls[0])
+        self.assertIn("лог", calls[0])
+
+    def test_guarded_task_silent_on_success(self) -> None:
+        calls: list = []
+        app = SimpleNamespace(notify=lambda m: calls.append(m))
+        from app.ui import components as ui_components
+
+        async def ok() -> None:
+            calls.append("done")
+
+        asyncio.run(ui_components.guarded_task(app, ok)())
+        self.assertEqual(calls, ["done"])
+
+    def test_guarded_task_returns_coroutine_function(self) -> None:
+        import inspect
+
+        from app.ui import components as ui_components
+
+        async def task() -> None:
+            pass
+
+        wrapper = ui_components.guarded_task(make_app(make_agent()), task)
+        self.assertTrue(inspect.iscoroutinefunction(wrapper))
+
+
 class ComponentsTest(unittest.TestCase):
     """Общие компоненты."""
 

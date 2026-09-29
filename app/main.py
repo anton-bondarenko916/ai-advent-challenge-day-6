@@ -124,15 +124,31 @@ class ChatApp:
         ]
 
     def _on_tab_change(self, event=None) -> None:
-        """Переключение вкладок: видимость + refresh активной."""
-        index = int(self.tabs.selected_index or 0)
-        for i, container in enumerate(self.view_containers):
-            container.visible = i == index
-        view = self._views[index]
-        on_show = getattr(view, "on_show", None)
-        if on_show is not None:
-            on_show()
-        self.page.update()
+        """Переключение вкладок: видимость + refresh активной.
+
+        Ошибка refresh не блокирует интерфейс: traceback — в лог,
+        пользователю — SnackBar (без полноэкранного error-overlay Flet).
+        """
+        try:
+            index = int(self.tabs.selected_index or 0)
+            for i, container in enumerate(self.view_containers):
+                container.visible = i == index
+            view = self._views[index]
+            on_show = getattr(view, "on_show", None)
+            if on_show is not None:
+                on_show()
+        except Exception:
+            logger.error("Ошибка переключения вкладки:\n%s",
+                         traceback.format_exc())
+            try:
+                self.notify("⚠️ Ошибка вкладки (подробности — в логе)")
+            except Exception:
+                logger.error("Не удалось показать SnackBar об ошибке")
+        try:
+            self.page.update()
+        except Exception:
+            logger.error("Ошибка перерисовки после смены вкладки:\n%s",
+                         traceback.format_exc())
 
     def _on_disconnect(self, event=None) -> None:
         """Финальный flush контекста при закрытии окна."""

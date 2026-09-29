@@ -18,6 +18,7 @@ import flet as ft
 
 from app.rag.chunkers import STRATEGY_FIXED, STRATEGY_STRUCTURE, validate_chunking
 from app.rag.indexer import KnowledgeIndexer
+from app.ui import components
 
 # Значения Dropdown стратегий → последовательности стратегий chunking
 STRATEGY_CHOICES: Dict[str, tuple] = {
@@ -121,19 +122,23 @@ class KnowledgeView:
     # Обработчики
     # ------------------------------------------------------------------
     def _on_pick_folder(self, event=None) -> None:
-        self._schedule(self._pick_folder_async())
+        self._schedule(self._pick_folder_async)
 
     def _on_index(self, event=None) -> None:
-        self._schedule(self._index_async())
+        self._schedule(self._index_async)
 
     def _on_clear(self, event=None) -> None:
-        self._schedule(self._clear_async())
+        self._schedule(self._clear_async)
 
-    def _schedule(self, coroutine) -> None:
-        if self.app.page is not None:
-            self.app.page.run_task(coroutine)
-        else:
-            coroutine.close()
+    def _schedule(self, handler, *args) -> None:
+        """Запускает async-задачу: КОРУТИННУЮ ФУНКЦИЮ (не корутину!) в
+        page.run_task — иначе TypeError и error-overlay Flet. Гард
+        (components.guarded_task) пишет traceback в лог и показывает
+        SnackBar вместо падения интерфейса. Без page (тесты) — no-op."""
+        if self.app.page is None:
+            return
+        self.app.page.run_task(
+            components.guarded_task(self.app, handler), *args)
 
     # ------------------------------------------------------------------
     # Async-логика

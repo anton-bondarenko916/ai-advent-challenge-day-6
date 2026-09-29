@@ -12,6 +12,7 @@ from typing import Any, List, Optional
 
 import flet as ft
 
+from app.ui import components
 from src.utils import (
     validate_max_tokens,
     validate_model,
@@ -99,16 +100,20 @@ class SettingsView:
     # Обработчики
     # ------------------------------------------------------------------
     def _on_switch_profile(self, event=None) -> None:
-        self._schedule(self._switch_profile_async())
+        self._schedule(self._switch_profile_async)
 
     def _on_save(self, event=None) -> None:
-        self._schedule(self._save_async())
+        self._schedule(self._save_async)
 
-    def _schedule(self, coroutine) -> None:
-        if self.app.page is not None:
-            self.app.page.run_task(coroutine)
-        else:
-            coroutine.close()
+    def _schedule(self, handler, *args) -> None:
+        """Запускает async-задачу: КОРУТИННУЮ ФУНКЦИЮ (не корутину!) в
+        page.run_task — иначе TypeError и error-overlay Flet. Гард
+        (components.guarded_task) пишет traceback в лог и показывает
+        SnackBar вместо падения интерфейса. Без page (тесты) — no-op."""
+        if self.app.page is None:
+            return
+        self.app.page.run_task(
+            components.guarded_task(self.app, handler), *args)
 
     # ------------------------------------------------------------------
     # Async-логика

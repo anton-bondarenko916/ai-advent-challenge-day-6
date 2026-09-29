@@ -47,7 +47,7 @@ class ChatView:
             max_lines=4,
             shift_enter=True,
             hint_text="Сообщение (Enter — отправить, Shift+Enter — новая строка)",
-            border_radius=8,
+            border=ft.OutlineInputBorder(border_radius=8),
             expand=True,
             on_submit=self._on_send,
         )
@@ -170,7 +170,7 @@ class ChatView:
     # Обработчики (schedule → run_task; логика — в *_async)
     # ------------------------------------------------------------------
     def _on_send(self, event=None) -> None:
-        self._schedule(self._send_async())
+        self._schedule(self._send_async)
 
     def _on_rag_toggle(self, event=None) -> None:
         # Переключатель работает на лету: режим применяется со следующего хода
@@ -185,18 +185,28 @@ class ChatView:
         self.refresh_rag_status()
 
     def _on_clear(self, event=None) -> None:
-        self._schedule(self._clear_async())
+        self._schedule(self._clear_async)
 
     def _on_open_file(self, event=None) -> None:
-        self._schedule(self._open_file_async(event))
+        self._schedule(self._open_file_async, event)
 
-    def _schedule(self, coroutine) -> None:
-        """Запускает корутину на event loop Flet (или сразу в тестах)."""
-        if self.app.page is not None:
-            self.app.page.run_task(coroutine)
-        else:
-            # Офлайн-режим (тесты): корутину запускает вызывающий код
-            coroutine.close()
+    def _schedule(self, handler, *args) -> None:
+        """Запускает async-задачу на event loop Flet.
+
+        Принимает КОРУТИННУЮ ФУНКЦИЮ и её аргументы: page.run_task сам
+        создаёт корутину — передача готовой корутины даёт TypeError
+        «handler must be a coroutine function» (и полноэкранный
+        error-overlay Flet, блокирующий вкладки). Задача оборачивается
+        в гард: исключение пишется в лог и показывается SnackBar'ом,
+        а не роняет интерфейс.
+
+        Без page (офлайн-тесты) ничего не делает: корутины запускает
+        вызывающий код через asyncio.run.
+        """
+        if self.app.page is None:
+            return
+        self.app.page.run_task(
+            components.guarded_task(self.app, handler), *args)
 
     # ------------------------------------------------------------------
     # Async-логика
