@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 import flet as ft
 
+from app.rag.pipeline import RAG_MODES, RAG_MODE_LABELS
 from app.ui import components
 
 
@@ -69,6 +70,25 @@ class ChatView:
             on_blur=self._on_top_k_change,
             on_submit=self._on_top_k_change,
         )
+        self.rag_mode_dropdown = ft.Dropdown(
+            value=self.agent.rag_mode,
+            width=190,
+            label="RAG-режим",
+            options=[
+                ft.DropdownOption(key=mode, content=ft.Text(
+                    RAG_MODE_LABELS[mode], size=12))
+                for mode in RAG_MODES
+            ],
+            on_select=self._on_rag_mode_change,
+            tooltip="Пайплайн поиска: rewrite / фильтр / реранкер",
+        )
+        self.threshold_field = ft.TextField(
+            value=str(self.agent.similarity_threshold),
+            width=110,
+            label="порог",
+            on_blur=self._on_threshold_change,
+            on_submit=self._on_threshold_change,
+        )
         self.rag_status_text = ft.Text("", size=12, color=ft.Colors.BLUE_GREY_500)
         self.status_text = ft.Text(
             "Готов к работе", size=12, color=ft.Colors.BLUE_GREY_500, expand=True
@@ -76,7 +96,9 @@ class ChatView:
         self.controls_row = ft.Container(
             content=ft.Row([
                 self.rag_switch,
+                self.rag_mode_dropdown,
                 self.top_k_field,
+                self.threshold_field,
                 self.rag_status_text,
             ], spacing=12, wrap=True),
             padding=ft.Padding(left=10, top=0, right=10, bottom=0),
@@ -177,6 +199,22 @@ class ChatView:
         self.agent.set_rag_enabled(bool(self.rag_switch.value))
         self.refresh_rag_status()
 
+    def _on_rag_mode_change(self, event=None) -> None:
+        try:
+            self.agent.set_rag_mode(str(self.rag_mode_dropdown.value or ""))
+        except ValueError:
+            self.rag_mode_dropdown.value = self.agent.rag_mode
+        self.refresh_rag_status()
+
+    def _on_threshold_change(self, event=None) -> None:
+        try:
+            value = float(
+                str(self.threshold_field.value or "").replace(",", "."))
+            self.agent.set_similarity_threshold(value)
+        except ValueError:
+            self.threshold_field.value = str(self.agent.similarity_threshold)
+        self.refresh_rag_status()
+
     def _on_top_k_change(self, event=None) -> None:
         try:
             self.agent.set_top_k(int(self.top_k_field.value or "3"))
@@ -253,14 +291,17 @@ class ChatView:
     # Служебное
     # ------------------------------------------------------------------
     def refresh_rag_status(self) -> None:
-        """Статус базы знаний: число чанков + top_k."""
+        """Статус базы знаний: число чанков + режим + top_k + порог."""
         try:
             chunks = self.agent.count_chunks()
         except Exception:
             chunks = 0
         mode = "включён" if self.agent.rag_enabled else "выключен"
         self.rag_status_text.value = (
-            f"RAG {mode} · база: {chunks} чанков · top_k: {self.agent.top_k}"
+            f"RAG {mode} · база: {chunks} чанков · "
+            f"{self.agent.rag_mode} · top_k: {self.agent.top_k}→"
+            f"{self.agent.top_k_search} · порог: "
+            f"{self.agent.similarity_threshold:.2f}"
         )
 
     def _replace_placeholder(self) -> ft.Container:

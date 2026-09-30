@@ -71,3 +71,14 @@ chromadb>=1.0,<2
 # RecursiveCharacterTextSplitter (fixed) и MarkdownHeaderTextSplitter
 # + RecursiveCharacterTextSplitter (structure).
 langchain-text-splitters>=1.0,<2
+
+# ------------------------------------------------------------------
+# Реранкер RAG (app/rag/reranker.py) — ОПЦИОНАЛЬНО.
+# Fallback-цепочка реранкера: Ollama (кастомная сборка
+# xitao/bge-reranker-v2-m3) → FlagEmbedding (BAAI/bge-reranker-v2-m3)
+# → LexicalReranker (без зависимостей, всегда доступен).
+# FlagEmbedding тянет torch — ставьте по желанию:
+#   pip install FlagEmbedding
+# Без него rerank-режимы работают через Ollama либо лексический
+# запасной реранкер (имя активного бэкенда видно в UI).
+# ------------------------------------------------------------------

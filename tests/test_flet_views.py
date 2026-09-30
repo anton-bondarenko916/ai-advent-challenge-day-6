@@ -67,9 +67,13 @@ class FakePage:
 
     def __init__(self) -> None:
         self.tasks: list = []
+        self.updates: int = 0
 
     def run_task(self, handler, *args) -> None:
         self.tasks.append((handler, args))
+
+    def update(self) -> None:
+        self.updates += 1
 
 
 class ScheduleTest(unittest.TestCase):
@@ -305,8 +309,8 @@ class ChatViewTest(unittest.TestCase):
     def test_send_with_rag_error_shows_warning(self) -> None:
         embedder = FakeEmbedder()
         embedder.fail = True
-        # Retriever держит ссылку на эмбеддер — подменяем у него
-        self.agent.retriever.embedder = embedder
+        # Поиск идёт через RAGPipeline — подменяем эмбеддер у него
+        self.agent.pipeline.embedder = embedder
         self.agent.set_rag_enabled(True)
         self.chat.input_field.value = "Вопрос"
         asyncio.run(self.chat._send_async())

@@ -1613,10 +1613,12 @@ flet run app/main.py          # через flet CLI
 ### Экраны (вкладки)
 
 - **💬 Чат** — история (`ft.ListView` с автоскроллом), поле ввода,
-  переключатель **«Использовать RAG»** и **top_k** (работают на лету),
-  сворачиваемая панель **«Источники»** под ответом (`📄 installation.md →
-  ## Windows` + фрагмент чанка), панель MCP-инструментов, кнопка
-  «📂 Открыть файл», копирование текста (Markdown selectable).
+  переключатель **«Использовать RAG»**, **RAG-режим** (5 режимов
+  пайплайна), **top_k** (чанков в контексте) и **порог** similarity
+  (работают на лету), сворачиваемая панель **«Источники»** под ответом
+  (`📄 installation.md → ## Windows` + фрагмент чанка), панель
+  MCP-инструментов, кнопка «📂 Открыть файл», копирование текста
+  (Markdown selectable).
 - **📚 База знаний** — выбор папки с MD (`ft.FilePicker`), `chunk_size`
   / `overlap` (по умолчанию 500/50), стратегия **Fixed / Structure /
   Обе**, кнопка «Проиндексировать», прогресс-бар по файлам, статус
@@ -1628,15 +1630,38 @@ flet run app/main.py          # через flet CLI
   колонки ответов и источников, оценки **Хорошо/Частично/Плохо**
   (Dropdown), сводка внизу («Без RAG: 70% хорошо, …» / «С RAG: 90% …»),
   ответы и оценки сохраняются в `app/data/comparison_results.json`.
+- **🔀 RAG-режимы (Сравнение RAG-режимов)** — настройки поиска
+  (**Top-K (до)** = 20, **Top-K (после)** = 3, **Порог similarity** =
+  0.7 — только через UI), поле «Вопрос» с кнопкой «Найти» (один вопрос
+  через все 5 режимов) и «Прогнать все» (контрольные вопросы × 5
+  режимов); колонка на режим: чанков после фильтрации/реранка, средний
+  similarity score, покрытие ключевых слов из expected (✓/✗),
+  переформулированный запрос, активный бэкенд реранкера, ответ и
+  источники; метрики полностью автоматические (без оценок человека),
+  сводка и последний прогон сохраняются в
+  `app/data/rag_mode_comparison.json`.
 - **⚙️ Настройки** — профиль (SQLite), модель (`deepseek-v4-flash` /
   `deepseek-v4-pro`), температура, `max_tokens`; информация о RAG
   (адрес Ollama и модель эмбеддингов).
 
 ### RAG-пайплайн (`app/rag/`)
 
+Пять режимов (`app/rag/pipeline.py`):
+
+| Режим | Пайплайн |
+|-------|----------|
+| `basic` | question → embed → search(top_k) → LLM |
+| `rewrite` | question → LLM rewrite → embed → search(top_k) → LLM |
+| `rewrite_filter` | rewrite → search(top_k) → filter(threshold) → LLM |
+| `reranker` | search(top_k) → rerank → top_k_final → LLM |
+| `rewrite_reranker` | rewrite → search(top_k) → rerank → top_k_final → LLM |
+
+Косинусная мера Chroma конвертируется в similarity: `score = 1 − distance`.
+
 ```
-Вопрос → embed_query (Ollama, префикс search_query:) → Chroma.search(top_k)
-       → топ-K чанков → промпт «Контекст: … Вопрос: …» → LLM → Ответ + источники
+Вопрос → [Query Rewrite] → embed_query (Ollama, префикс search_query:)
+       → Chroma.search(top_k) → [filter(threshold)] → [rerank → top_k_final]
+       → промпт «Контекст: … Вопрос: …» → LLM → Ответ + источники
 ```
 
 - **chunkers** — две стратегии: `fixed`
@@ -1658,6 +1683,23 @@ flet run app/main.py          # через flet CLI
 - **indexer** — оркестрация: пошагово для UI (файл за файлом →
   прогресс-бар, эмбеддинг батчем в commit) и `index_directory` целиком
   для тестов/консоли.
+- **rewriter** — `QueryRewriter`: переформулировка вопроса через
+  DeepSeek API (temperature 0.3, тот же OpenAI-совместимый SDK);
+  ошибка сети/пустой ответ не ломают ход — поиск идёт по исходному
+  вопросу (`rewrite_error` в диагностике); в mock-режиме сеть не
+  используется.
+- **reranker** — fallback-цепочка `FallbackReranker`:
+  `OllamaReranker` (кастомная сборка `xitao/bge-reranker-v2-m3` —
+  стандартная Ollama реранкеры не поддерживает, любая ошибка →
+  `RerankerError`) → `FlagEmbeddingReranker` (официальный пакет
+  FlagEmbedding, `BAAI/bge-reranker-v2-m3`, use_fp16; пакет
+  опционален) → `LexicalReranker` (пересечение токенов, без
+  зависимостей). Первый заработавший бэкенд «залипает», его имя видно
+  в UI; полный отказ реранка деградирует режим к топ-K эмбеддинга.
+- **pipeline** — `RAGPipeline.retrieve(question, mode, top_k,
+  top_k_final, threshold)`: собирает ступени по режиму и возвращает
+  чанки, метаданные, similarity-скоры и диагностику (`search_query`,
+  `rewrite_used`, `rerank_backend`, ошибки ступеней).
 
 ### Интеграция с ядром
 
@@ -1676,19 +1718,28 @@ user-сообщение), история диалога хранит вопро�
 ### Конфигурация
 
 Переменные `.env` (необязательные): `OLLAMA_BASE_URL`
-(http://localhost:11434), `OLLAMA_EMBED_MODEL` (nomic-embed-text).
+(http://localhost:11434), `OLLAMA_EMBED_MODEL` (nomic-embed-text),
+`OLLAMA_RERANK_MODEL` (xitao/bge-reranker-v2-m3 — модель реранкера в
+Ollama). Порог similarity и top_k — только через UI, без хардкода.
 
 ### Тесты
 
-+170 офлайн-тестов (`tests/test_rag_*.py`, `tests/test_app_agent.py`,
-`tests/test_flet_views.py`, `tests/test_app_data.py`): чанкеры,
-эмбеддер на `httpx.MockTransport` (префиксы, батч, ошибки), реальный
-Chroma в tmp (персистентность, cosine, clear), retriever, индексатор,
-хук ядра (история чистая, одноразовость, токены с контекстом), режимы
-агента и фолбэки, все вкладки офлайн (контролы Flet — без запуска
-GUI), агрегация оценок и сохранение прогона. Живой тест Ollama
-(`tests/test_rag_ollama_live.py`) выполняется автоматически, только
-если `ollama serve` отвечает; иначе пропускается.
++250 офлайн-тестов (`tests/test_rag_*.py`, `tests/test_app_agent.py`,
+`tests/test_app_rag_modes.py`, `tests/test_flet_views.py`,
+`tests/test_app_data.py`, `tests/test_rag_comparison_view.py`):
+чанкеры, эмбеддер на `httpx.MockTransport` (префиксы, батч, ошибки),
+реальный Chroma в tmp (персистентность, cosine, clear), retriever,
+индексатор, хук ядра (история чистая, одноразовость, токены с
+контекстом), режимы агента и фолбэки, все вкладки офлайн (контролы
+Flet — без запуска GUI), агрегация оценок и сохранение прогона,
+QueryRewriter (фейковый SDK-клиент: промпт, пустой ответ, ошибки,
+mock), реранкеры (Ollama на MockTransport, FlagEmbedding через
+фейковый модуль, Lexical, залипающий fallback), RAGPipeline (5
+режимов, порог, конвертация 1 − distance, деградации), вкладка
+«Сравнение RAG-режимов» (метрики, ключевые слова, агрегация, прогон).
+Живой тест Ollama (`tests/test_rag_ollama_live.py`) выполняется
+автоматически, только если `ollama serve` отвечает; иначе
+пропускается.
 
 ## Известные ограничения
 

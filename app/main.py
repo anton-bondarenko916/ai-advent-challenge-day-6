@@ -1,8 +1,9 @@
 """Точка входа Flet-приложения DeepSeek Chat (миграция с Tkinter).
 
-Экраны (вкладки): 💬 Чат (RAG-переключатель, источники), 📚 База
-знаний (индексация MD), ⚖️ Сравнение (10 вопросов × 2 режима),
-⚙️ Настройки (профиль, температура, max_tokens, модель).
+Экраны (вкладки): 💬 Чат (RAG-режим, источники), 📚 База знаний
+(индексация MD), ⚖️ Сравнение (10 вопросов × 2 режима), 🔀 Сравнение
+RAG-режимов (5 режимов + автоматические метрики), ⚙️ Настройки
+(профиль, температура, max_tokens, модель).
 
 Ядро агента — то же, что в Tkinter-версии (src.agent.DeepSeekAgent:
 профили, память, FSM задач, инварианты, MCP-инструменты).
@@ -37,13 +38,15 @@ from app.agent import RAGChatAgent
 from app.ui.chat_view import ChatView
 from app.ui.comparison_view import ComparisonView
 from app.ui.knowledge_view import KnowledgeView
+from app.ui.rag_comparison_view import RAGModesView
 from app.ui.settings_view import SettingsView
 from src.config import load_config, validate_api_key
 from src.utils import get_logger
 
 logger = get_logger("deepseek-chat.flet")
 
-TAB_TITLES = ("💬 Чат", "📚 База знаний", "⚖️ Сравнение", "⚙️ Настройки")
+TAB_TITLES = ("💬 Чат", "📚 База знаний", "⚖️ Сравнение",
+              "🔀 RAG-режимы", "⚙️ Настройки")
 
 DEFAULT_DOCS_DIR = PROJECT_ROOT / "app" / "data" / "docs"
 
@@ -80,10 +83,12 @@ class ChatApp:
         self.knowledge_view = KnowledgeView(
             self, default_folder=str(DEFAULT_DOCS_DIR))
         self.comparison_view = ComparisonView(self)
+        self.rag_modes_view = RAGModesView(self)
         self.settings_view = SettingsView(self)
         self._views = (
             self.chat_view, self.knowledge_view,
-            self.comparison_view, self.settings_view,
+            self.comparison_view, self.rag_modes_view,
+            self.settings_view,
         )
 
         self.tabs = ft.Tabs(

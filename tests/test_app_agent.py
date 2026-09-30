@@ -147,10 +147,10 @@ class RagHookCoreTest(unittest.TestCase):
         self.assertTrue(result.get("rag_used"))
         self.assertEqual(len(result.get("sources") or []), 2)
         self.assertEqual(result["sources"][0]["source"], "installation.md")
-        # Одноразовость: следующий ход (RAG ещё включён — источник
-        # появляется заново, но это новый поиск, а не остаток блока)
+        # Поиск идёт через RAGPipeline: Chroma запрашивается top_k_search
+        # (кандидатов до фильтрации/реранка), контекст — top_k (после)
         store = agent.vector_store
-        self.assertEqual(store.last_k, agent.top_k)
+        self.assertEqual(store.last_k, agent.top_k_search)
 
     def test_history_keeps_raw_question_after_rag_turn(self) -> None:
         agent = make_agent(rag_enabled=True)
@@ -200,13 +200,23 @@ class RAGChatAgentModesTest(unittest.TestCase):
         result = run(agent.send_message("Вопрос 3"))
         self.assertNotIn("sources", result)
 
-    def test_top_k_applied_to_search(self) -> None:
+    def test_top_k_search_applied_to_search(self) -> None:
+        # Поиск (top_k до фильтрации/реранка) настраивается отдельно
         agent = make_agent(rag_enabled=True, top_k=2)
+        agent.set_top_k_search(15)
         run(agent.send_message("Вопрос"))
-        self.assertEqual(agent.vector_store.last_k, 2)
-        agent.set_top_k(1)
+        self.assertEqual(agent.vector_store.last_k, 15)
+        agent.set_top_k_search(5)
         run(agent.send_message("Вопрос"))
-        self.assertEqual(agent.vector_store.last_k, 1)
+        self.assertEqual(agent.vector_store.last_k, 5)
+
+    def test_context_top_k_limits_final_chunks(self) -> None:
+        # top_k (контекст после фильтрации/реранка) — прежняя семантика:
+        # из двух найденных кандидатов в контекст попадает один
+        agent = make_agent(rag_enabled=True, top_k=1)
+        result = run(agent.send_message("Вопрос"))
+        self.assertEqual(len(result.get("sources") or []), 1)
+        self.assertEqual(agent.top_k_final, 1)
 
     def test_set_top_k_validation(self) -> None:
         agent = make_agent()
