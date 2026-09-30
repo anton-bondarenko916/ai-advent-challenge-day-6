@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import flet as ft
+
 from app.rag.pipeline import RAG_MODES
 from app.ui.rag_comparison_view import (
     RAGModesView,
@@ -237,6 +239,27 @@ class RAGModesViewTest(unittest.TestCase):
             app, questions_path=QUESTION_FILE,
             results_path=Path(tempfile.mkdtemp()) / "run.json")
         return view, agent
+
+    def test_layout_regression_wrap_expand(self) -> None:
+        """Регрессия серой области (flet 1.0): expand-ребёнок внутри
+        wrap-Row ломает лейаут (Wrap — не Flex) — вместо строки вопроса
+        и карточек Flet рисует серую ErrorWidget-заглушку. Воспроизведено
+        скриншотом окна; тест держит контракт: у строки вопроса нет wrap,
+        у строки карточек expand=True (bounded-высота для ListView)."""
+        view, _ = self.make_view()
+        layout = view.build()
+        question_row = layout.controls[2]
+        self.assertFalse(question_row.wrap)
+        cards_row = layout.controls[4]
+        self.assertTrue(cards_row.expand)
+        self.assertEqual(cards_row.scroll, ft.ScrollMode.AUTO)
+        # Карточки фиксированного размера: без явной высоты карточка даёт
+        # intrinsic (~550px) и режется строкой ограниченной высоты
+        for mode in RAG_MODES:
+            container = view.mode_columns[mode]["card"].content
+            self.assertEqual(container.width, 300)
+            self.assertIsNotNone(container.height)
+            self.assertEqual(container.content.scroll, ft.ScrollMode.AUTO)
 
     def test_build_has_five_columns(self) -> None:
         view, _ = self.make_view()

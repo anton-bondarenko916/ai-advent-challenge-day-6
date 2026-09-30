@@ -18,10 +18,6 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from langchain_core.documents import Document
-from langchain_text_splitters import (
-    MarkdownHeaderTextSplitter,
-    RecursiveCharacterTextSplitter,
-)
 
 # Заголовки Markdown, по которым режет structure-aware стратегия
 HEADERS_TO_SPLIT_ON = [("#", "h1"), ("##", "h2"), ("###", "h3")]
@@ -31,6 +27,24 @@ STRATEGY_FIXED = "fixed"
 STRATEGY_STRUCTURE = "structure"
 
 SEPARATORS = ["\n\n", "\n", " ", ""]
+
+# Ленивый импорт langchain_text_splitters (кэш): пакет при импорте
+# тащит sentence_transformers/transformers (~7 с), а сплиттеры нужны
+# только в момент индексации — старт приложения не должен их ждать
+_splitters = None
+
+
+def _get_splitters():
+    """MarkdownHeaderTextSplitter и RecursiveCharacterTextSplitter (лениво)."""
+    global _splitters
+    if _splitters is None:
+        from langchain_text_splitters import (
+            MarkdownHeaderTextSplitter,
+            RecursiveCharacterTextSplitter,
+        )
+        _splitters = (MarkdownHeaderTextSplitter,
+                      RecursiveCharacterTextSplitter)
+    return _splitters
 
 
 def validate_chunking(chunk_size: int, overlap: int) -> None:
@@ -72,7 +86,8 @@ def chunk_fixed(text: str, chunk_size: int = 500, overlap: int = 50) -> List[Doc
         ValueError: некорректные chunk_size/overlap.
     """
     validate_chunking(chunk_size, overlap)
-    splitter = RecursiveCharacterTextSplitter(
+    _, recursive_cls = _get_splitters()
+    splitter = recursive_cls(
         chunk_size=chunk_size,
         chunk_overlap=overlap,
         separators=SEPARATORS,
@@ -102,11 +117,12 @@ def chunk_structure(
         ValueError: некорректные chunk_size/overlap.
     """
     validate_chunking(chunk_size, overlap)
-    header_splitter = MarkdownHeaderTextSplitter(
+    header_cls, recursive_cls = _get_splitters()
+    header_splitter = header_cls(
         headers_to_split_on=HEADERS_TO_SPLIT_ON
     )
     header_chunks = header_splitter.split_text(text)
-    text_splitter = RecursiveCharacterTextSplitter(
+    text_splitter = recursive_cls(
         chunk_size=chunk_size,
         chunk_overlap=overlap,
     )

@@ -51,9 +51,12 @@ DEFAULT_THRESHOLD_TEXT = str(DEFAULT_THRESHOLD)
 MAX_KEYWORDS = 8
 MIN_KEYWORD_LEN = 5
 
-# Фиксированная ширина колонки режима (5 колонок в горизонтальном скролле)
+# Фиксированная ширина/высота колонки режима (5 колонок в горизонтальном
+# скролле). Высота подобрана под окно 1000×760: строка карточек
+# (expand=True) получает ~350px; содержимое карточки прокручивается
+# внутри — метрики, ответ и источники доступны при любой высоте окна.
 MODE_COLUMN_WIDTH = 300
-ANSWER_AREA_HEIGHT = 320
+MODE_COLUMN_HEIGHT = 340
 
 
 def extract_keywords(question: str, expected: str = "") -> List[str]:
@@ -275,13 +278,20 @@ class RAGModesView:
                 self.top_k_field, self.top_k_final_field,
                 self.threshold_field, self.mode_dropdown,
             ], spacing=10, wrap=True),
+            # БЕЗ wrap: в flet 1.0 expand-ребёнок внутри wrap-Row ломает
+            # лейаут (Wrap — не Flex) — виджет заменяется серой заглушкой
             ft.Row([self.question_field, self.search_button,
-                    self.run_button], spacing=10, wrap=True),
+                    self.run_button], spacing=10),
             ft.Row([self.progress_bar, self.progress_text], spacing=12),
+            # ВАЖНО: expand=True — иначе скроллируемый Row (горизонтальный
+            # ListView) не flex-ребёнок Column и получает НЕОГРАНИЧЕННУЮ
+            # высоту: лейаут падает, Flet рисует серую область вместо
+            # карточек (регрессия ai_1_22, воспроизведена скриншотом)
             ft.Row(
                 [self._mode_column_controls(mode) for mode in RAG_MODES],
                 spacing=8,
                 scroll=ft.ScrollMode.AUTO,
+                expand=True,
             ),
             self.summary_container,
         ], expand=True, spacing=10)
@@ -296,14 +306,12 @@ class RAGModesView:
                                 color=ft.Colors.BLUE_GREY_600,
                                 selectable=True)
             answer_markdown = components.markdown_text("—")
-            answer_area = ft.Container(
-                content=ft.Column([answer_markdown],
-                                  scroll=ft.ScrollMode.AUTO),
-                height=ANSWER_AREA_HEIGHT,
-            )
             sources_text = ft.Text("—", size=11,
                                    color=ft.Colors.BLUE_GREY_600,
                                    selectable=True)
+            # Фиксированные размеры карточки + внутренний скролл: строка
+            # карточек — горизонтальный ListView с bounded-высотой,
+            # карточка без явной высоты даёт intrinsic (~550px) и режется
             card = ft.Card(ft.Container(
                 ft.Column([
                     ft.Text(RAG_MODE_LABELS[mode], size=13,
@@ -312,11 +320,12 @@ class RAGModesView:
                     metrics_text,
                     diag_text,
                     ft.Text("Ответ:", size=11, weight=ft.FontWeight.BOLD),
-                    answer_area,
+                    answer_markdown,
                     ft.Text("Источники:", size=11, weight=ft.FontWeight.BOLD),
                     sources_text,
-                ], spacing=4, tight=True),
-                width=MODE_COLUMN_WIDTH, padding=10,
+                ], spacing=4, tight=True, scroll=ft.ScrollMode.AUTO),
+                width=MODE_COLUMN_WIDTH, height=MODE_COLUMN_HEIGHT,
+                padding=10,
             ))
             self.mode_columns[mode] = {
                 "card": card,

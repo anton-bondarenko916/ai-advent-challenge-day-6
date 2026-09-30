@@ -24,7 +24,7 @@ from __future__ import annotations
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Запуск "python app/main.py": корень проекта — в sys.path для
 # абсолютных импортов app.* и src.*
@@ -40,7 +40,14 @@ from app.ui.comparison_view import ComparisonView
 from app.ui.knowledge_view import KnowledgeView
 from app.ui.rag_comparison_view import RAGModesView
 from app.ui.settings_view import SettingsView
-from src.config import load_config, validate_api_key
+from src.config import (
+    get_geo_settings,
+    get_news_settings,
+    get_reminder_settings,
+    get_weather_settings,
+    load_config,
+    validate_api_key,
+)
 from src.utils import get_logger
 
 logger = get_logger("deepseek-chat.flet")
@@ -164,6 +171,53 @@ class ChatApp:
                          traceback.format_exc())
 
 
+def launch_mcp_servers(config: Dict[str, Any]) -> List[str]:
+    """Автозапуск локальных MCP-серверов (как в Tkinter-версии).
+
+    Без этого серверы стартуют только при первом ходе LLM через
+    self-healing хук (restart_hook → ensure_running) — инструменты
+    недоступны до первого запроса. Каждый launch(): порт уже отвечает →
+    сервер не трогаем (живёт 24/7); иначе процесс в отдельном окне, не
+    дожидаясь бинда. Ошибки запуска приложение не ломают.
+
+    Args:
+        config: конфигурация load_config.
+
+    Returns:
+        Список сообщений для лога (метка сервера: результат).
+    """
+    from src.geo_launcher import GeoServerLauncher
+    from src.news_launcher import NewsServerLauncher
+    from src.reminder_launcher import ReminderServerLauncher
+    from src.weather_launcher import WeatherServerLauncher
+
+    specs = []
+    reminder = get_reminder_settings(config)
+    if reminder["enabled"]:
+        specs.append(ReminderServerLauncher(host=reminder["host"],
+                                            port=reminder["port"]))
+    news = get_news_settings(config)
+    if news["enabled"]:
+        specs.append(NewsServerLauncher(host=news["host"], port=news["port"]))
+    geo = get_geo_settings(config)
+    if geo["enabled"]:
+        specs.append(GeoServerLauncher(host=geo["host"], port=geo["port"]))
+    weather = get_weather_settings(config)
+    if weather["enabled"]:
+        specs.append(WeatherServerLauncher(host=weather["host"],
+                                           port=weather["port"]))
+
+    messages: List[str] = []
+    for launcher in specs:
+        try:
+            _started, message = launcher.launch()
+        except Exception as exc:  # noqa: BLE001 — старт не должен падать
+            message = f"Ошибка автозапуска: {exc}"
+        messages.append(f"{launcher.label}: {message}")
+        logger.info(message)
+    return messages
+
+
 def run_app(argv: Optional[list] = None) -> None:
     """Загружает конфиг, собирает агента и запускает Flet-приложение.
 
@@ -194,6 +248,11 @@ def run_app(argv: Optional[list] = None) -> None:
     except Exception as exc:
         print(f"[ОШИБКА] Не удалось создать агента: {exc}", file=sys.stderr)
         raise SystemExit(1)
+
+    # Автозапуск MCP-серверов (напоминания/новости/гео/погода): порты
+    # уже отвечают → мгновенный пропуск; иначе процессы в новых окнах.
+    # Не блокирует открытие окна: launch() только спавнит процесс.
+    launch_mcp_servers(config)
 
     def start(page: ft.Page) -> None:
         ChatApp(page, agent, config)
