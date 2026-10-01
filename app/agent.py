@@ -9,7 +9,12 @@
   источники``, где RAGPipeline (app.rag.pipeline) поддерживает пять
   режимов: basic / rewrite / rewrite_filter / reranker /
   rewrite_reranker (Query Rewrite через DeepSeek, порог similarity,
-  реранкер с fallback-цепочкой).
+  реранкер с fallback-цепочкой);
+* с цитатами (ТЗ ai_1_23): ``answer_with_citations`` — гейт «Не знаю»
+  по среднему similarity (0.6, nomic-embed-text; ниже порога LLM не
+  вызывается), затем JSON-mode вызов (CitationAnswerer,
+  app.rag.citations: answer/sources/quotes) и дословная валидация
+  цитат по чанкам (validate_quotes).
 
 Ядро агента остаётся синхронным (SDK OpenAI); все сетевые вызовы
 выполняются через ``asyncio.to_thread`` / native-async клиенты, поэтому
@@ -33,6 +38,15 @@ import asyncio
 import os
 from typing import Any, Dict, List, Optional
 
+from app.rag.citations import (
+    ABSTAIN_THRESHOLD,
+    CitationAnswerer,
+    CitationError,
+    LLM_DONT_KNOW,
+    abstain_result,
+    should_abstain,
+    validate_quotes,
+)
 from app.rag.embedder import EmbedderError, OllamaEmbedder
 from app.rag.pipeline import (
     DEFAULT_THRESHOLD,
@@ -49,6 +63,9 @@ from app.rag.rewriter import QueryRewriter
 from app.rag.vector_store import VectorStore
 from src.agent import DeepSeekAgent
 from src.agent_factory import create_agent
+from src.utils import get_logger
+
+logger = get_logger("deepseek-chat.rag.agent")
 
 # Размер контекста (после фильтрации/реранка) — прежнее имя top_k
 DEFAULT_TOP_K = DEFAULT_TOP_K_FINAL
@@ -82,6 +99,7 @@ class RAGChatAgent:
         retriever: Optional[Retriever] = None,
         rewriter: Optional[QueryRewriter] = None,
         reranker: Optional[Any] = None,
+        citation_answerer: Optional[CitationAnswerer] = None,
         rag_enabled: bool = False,
         top_k: int = DEFAULT_TOP_K,
         top_k_search: int = DEFAULT_TOP_K_SEARCH,
@@ -96,6 +114,9 @@ class RAGChatAgent:
         )
         self.rewriter = rewriter
         self.reranker = reranker
+        self.citation_answerer = citation_answerer or CitationAnswerer(
+            api_key=""
+        )
         self.rag_enabled = bool(rag_enabled)
         self.top_k = int(top_k)
         self.top_k_search = int(top_k_search)
@@ -145,8 +166,16 @@ class RAGChatAgent:
             model=os.getenv("OLLAMA_RERANK_MODEL",
                             "xitao/bge-reranker-v2-m3"),
         )
+        citation_answerer = CitationAnswerer(
+            api_key=str(config.get("DEEPSEEK_API_KEY") or ""),
+            base_url=str(config.get("DEEPSEEK_BASE_URL")
+                         or "https://api.deepseek.com"),
+            model=str(config.get("DEFAULT_MODEL") or "deepseek-v4-flash"),
+            mock_mode=bool(config.get("MOCK_MODE")),
+        )
         return cls(core, embedder=embedder, vector_store=vector_store,
-                   rewriter=rewriter, reranker=reranker)
+                   rewriter=rewriter, reranker=reranker,
+                   citation_answerer=citation_answerer)
 
     # ------------------------------------------------------------------
     # Настройки режима (UI: переключатель + параметры, «на лету»)
@@ -365,14 +394,177 @@ class RAGChatAgent:
         if rag_error is not None:
             result["rag_error"] = rag_error
         if retrieval is not None:
-            result["retrieval"] = {
-                "search_query": retrieval["search_query"],
-                "rewrite_used": retrieval["rewrite_used"],
-                "rewrite_error": retrieval["rewrite_error"],
-                "rerank_backend": retrieval["rerank_backend"],
-                "rerank_error": retrieval["rerank_error"],
-                "scores": [round(score, 4) for score in retrieval["scores"]],
-            }
+            result["retrieval"] = self._retrieval_diagnostics(retrieval)
+        return result
+
+    @staticmethod
+    def _retrieval_diagnostics(
+        retrieval: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Диагностика поиска для результата хода (+ средний score)."""
+        if retrieval is None:
+            return {}
+        scores = [round(float(score), 4) for score in retrieval["scores"]]
+        return {
+            "search_query": retrieval["search_query"],
+            "rewrite_used": retrieval["rewrite_used"],
+            "rewrite_error": retrieval["rewrite_error"],
+            "rerank_backend": retrieval["rerank_backend"],
+            "rerank_error": retrieval["rerank_error"],
+            "scores": scores,
+            "avg_score": (round(sum(scores) / len(scores), 4)
+                          if scores else None),
+        }
+
+    # ------------------------------------------------------------------
+    # Ответ с обязательными источниками/цитатами (ТЗ ai_1_23)
+    # ------------------------------------------------------------------
+    async def answer_with_citations(
+        self,
+        question: str,
+        rag_mode: Optional[str] = None,
+        retrieval_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Ответ с обязательными источниками, цитатами и гейтом «Не знаю».
+
+        Пайплайн ТЗ (ai_1_23) для вкладки «Сравнение RAG-режимов»:
+        поиск чанков → если средний similarity ниже порога (0.6,
+        откалиброван для nomic-embed-text) — LLM НЕ вызывается,
+        возвращается заготовка «Не знаю»; иначе контекст уходит в
+        CitationAnswerer (JSON mode: answer/sources/quotes), а цитаты
+        дословно проверяются по чанкам (validate_quotes, неверные
+        помечаются valid: False).
+
+        Основной диалог не затрагивается: метод не пишет историю чата
+        (как answer_once).
+
+        Args:
+            question: контрольный вопрос.
+            rag_mode: режим пайплайна (None — текущий self.rag_mode).
+            retrieval_params: {"top_k", "top_k_final", "threshold"} —
+                переопределение параметров; threshold здесь же порог
+                воздержания (нет ключа — ABSTAIN_THRESHOLD).
+
+        Returns:
+            {"answer"/"text", "sources" (метаданные чанков + флаг
+            "cited"), "citations" (sources как вернул LLM), "quotes"
+            (валидированные, с valid True/False), "abstained",
+            "abstain_reason"? (при воздержании), "rag_used",
+            "retrieval" (диагностика + avg_score), "rag_error"?/
+            "citation_error"?, "error"}.
+        """
+        params = dict(self._retrieval_params())
+        if retrieval_params:
+            params.update(retrieval_params)
+        mode = self.rag_mode if rag_mode is None else normalize_mode(rag_mode)
+
+        rag_error: Optional[str] = None
+        retrieval: Optional[Dict[str, Any]] = None
+        chunks: List[RetrievedChunk] = []
+        try:
+            retrieval = await self.pipeline.retrieve_async(
+                question, mode=mode, **params
+            )
+            chunks = retrieval["chunks"]
+        except EmbedderError as exc:
+            rag_error = str(exc)
+        scores: List[float] = (list(retrieval["scores"])
+                               if retrieval else [])
+        threshold = float(params.get("threshold", ABSTAIN_THRESHOLD))
+
+        base: Dict[str, Any] = {
+            "question": question,
+            "mode": mode,
+            "retrieval": self._retrieval_diagnostics(retrieval),
+        }
+        if rag_error is not None:
+            base["rag_error"] = rag_error
+
+        # Гейт ДО вызова LLM: мало релевантности — честное «Не знаю»
+        if rag_error is not None or should_abstain(scores, threshold):
+            if scores:
+                avg = sum(scores) / len(scores)
+                reason = (f"средний score {avg:.2f} ниже порога "
+                          f"{threshold:.2f}")
+            elif rag_error:
+                reason = rag_error
+            else:
+                reason = "чанки не найдены"
+            result = abstain_result(reason)
+            result["rag_used"] = bool(chunks)
+            result.update(base)
+            return result
+
+        parsed = None
+        answer, citations, raw_quotes = "", [], []
+        for attempt in (1, 2):
+            try:
+                parsed = await self.citation_answerer.answer_async(
+                    question, chunks
+                )
+            except CitationError as exc:
+                # Деградация без падения: источники есть, цитат нет
+                result = {
+                    "answer": "", "text": "",
+                    "sources": Retriever.format_sources(chunks),
+                    "citations": [], "quotes": [],
+                    "abstained": False, "rag_used": True,
+                    "citation_error": str(exc), "error": None,
+                }
+                result.update(base)
+                return result
+            answer = str(parsed.get("answer") or "").strip()
+            citations = list(parsed.get("sources") or [])
+            raw_quotes = list(parsed.get("quotes") or [])
+            if (answer and answer != LLM_DONT_KNOW
+                    and not citations and not raw_quotes and attempt == 1):
+                # Контракт ТЗ: sources и quotes обязательны; модель
+                # изредка присылает валидный JSON с пустыми списками —
+                # одна повторная попытка (прецедент: пустая сводка
+                # news-сервера). Второй пустой итог не ретраится.
+                logger.warning(
+                    "JSON-ответ без sources/quotes — повторная попытка")
+                continue
+            break
+
+        # Модель честно сообщила, что контекст не содержит ответа
+        if answer == LLM_DONT_KNOW or (
+            not answer and not citations and not raw_quotes
+        ):
+            result = abstain_result("модель не нашла ответа в контексте")
+            result["rag_used"] = True
+            result.update(base)
+            return result
+
+        validated = validate_quotes(
+            {"quotes": raw_quotes},
+            [chunk.text for chunk in chunks],
+            retrieval["metadatas"] if retrieval else [],
+        )["quotes"]
+
+        # Флаг cited: LLM реально сослался на этот chunk_id
+        cited_ids = set()
+        for item in citations:
+            try:
+                cited_ids.add(int(item.get("chunk_id")))
+            except (TypeError, ValueError):
+                continue
+        sources = Retriever.format_sources(chunks)
+        for source in sources:
+            source["cited"] = (source["chunk_id"] in cited_ids
+                               if cited_ids else True)
+
+        result = {
+            "answer": answer,
+            "text": answer,
+            "sources": sources,
+            "citations": citations,
+            "quotes": validated,
+            "abstained": False,
+            "rag_used": True,
+            "error": None,
+        }
+        result.update(base)
         return result
 
     # ------------------------------------------------------------------

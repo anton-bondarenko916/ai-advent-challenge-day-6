@@ -23,9 +23,12 @@ from app.rag.pipeline import RAG_MODES
 from app.ui.rag_comparison_view import (
     RAGModesView,
     aggregate_metrics,
+    citation_checks,
     extract_keywords,
     format_aggregate_line,
+    format_checks_line,
     format_metrics_line,
+    format_quotes_text,
     keyword_coverage,
     load_questions,
     load_run,
@@ -39,7 +42,7 @@ QUESTION_FILE = (Path(__file__).resolve().parents[1] / "app" / "data" /
 
 
 class FakeModesAgent:
-    """Агент-заглушка: answer_once отдаёт результат по режиму."""
+    """Агент-заглушка: answer_with_citations отдаёт результат по режиму."""
 
     def __init__(self, rag_mode="basic") -> None:
         self.rag_mode = rag_mode
@@ -52,8 +55,8 @@ class FakeModesAgent:
         self.rag_mode = mode
         return mode
 
-    async def answer_once(self, question, rag_enabled, rag_mode=None,
-                          retrieval_params=None):
+    async def answer_with_citations(self, question, rag_mode=None,
+                                    retrieval_params=None):
         self.calls.append((question, rag_mode, retrieval_params))
         scores = {"basic": [0.82], "rewrite": [0.85],
                   "rewrite_filter": [0.9], "reranker": [0.91],
@@ -61,12 +64,21 @@ class FakeModesAgent:
         chosen = rag_mode or self.rag_mode
         mode_scores = scores.get(chosen, [0.5])
         return {
+            "answer": f"Ответ {chosen} про установку приложения Windows",
             "text": f"Ответ {chosen} про установку приложения Windows",
             "sources": [{"source": "installation.md",
                          "section": "## Windows",
                          "strategy": "structure",
                          "distance": round(1.0 - mode_scores[0], 4),
+                         "chunk_id": 12,
+                         "cited": True,
                          "preview": "Установка приложения на Windows"}],
+            "citations": [{"chunk_id": 12, "source": "installation.md",
+                           "section": "## Windows"}],
+            "quotes": [{"chunk_id": 12,
+                        "text": "Установка приложения на Windows",
+                        "valid": True}],
+            "abstained": False,
             "rag_used": True,
             "retrieval": {
                 "search_query": f"поиск: {question}",
@@ -76,6 +88,7 @@ class FakeModesAgent:
                                    if "reranker" in chosen else None),
                 "rerank_error": None,
                 "scores": mode_scores,
+                "avg_score": mode_scores[0],
             },
         }
 
@@ -150,6 +163,22 @@ class MetricsTest(unittest.TestCase):
         self.assertIsNone(metrics["avg_score"])
         self.assertEqual((metrics["kw_found"], metrics["kw_total"]), (0, 1))
 
+    def test_quotes_counted(self) -> None:
+        result = dict(self.RESULT, quotes=[
+            {"chunk_id": 1, "text": "а", "valid": True},
+            {"chunk_id": 2, "text": "б", "valid": False},
+        ])
+        metrics = mode_metrics(result, [])
+        self.assertEqual(metrics["quotes"], 2)
+        self.assertEqual(metrics["quotes_valid"], 1)
+        self.assertFalse(metrics["abstained"])
+
+    def test_abstained_flag(self) -> None:
+        metrics = mode_metrics({"text": "Я не знаю.", "sources": [],
+                                "abstained": True,
+                                "retrieval": {"scores": [0.4]}}, [])
+        self.assertTrue(metrics["abstained"])
+
     def test_format_metrics_line(self) -> None:
         line = format_metrics_line({"chunks": 3, "avg_score": 0.8234,
                                     "kw_found": 4, "kw_total": 5})
@@ -166,20 +195,50 @@ class AggregateTest(unittest.TestCase):
 
     def test_average_over_runs(self) -> None:
         runs = [
-            {"chunks": 3, "avg_score": 0.8, "kw_found": 4, "kw_total": 5},
-            {"chunks": 2, "avg_score": 0.9, "kw_found": 3, "kw_total": 5},
+            {"chunks": 3, "avg_score": 0.8, "kw_found": 4, "kw_total": 5,
+             "quotes": 2, "quotes_valid": 2},
+            {"chunks": 2, "avg_score": 0.9, "kw_found": 3, "kw_total": 5,
+             "quotes": 1, "quotes_valid": 0},
         ]
         stats = aggregate_metrics(runs)
         self.assertEqual(stats["questions"], 2)
         self.assertAlmostEqual(stats["chunks"], 2.5, places=6)
         self.assertAlmostEqual(stats["avg_score"], 0.85, places=6)
         self.assertAlmostEqual(stats["kw_rate"], 70.0, places=6)
+        # Источники/цитаты: доли по вопросам (ТЗ ai_1_23)
+        self.assertAlmostEqual(stats["sources_rate"], 100.0, places=6)
+        self.assertAlmostEqual(stats["quotes_rate"], 100.0, places=6)
+        self.assertAlmostEqual(stats["valid_rate"], 50.0, places=6)
+
+    def test_quotes_rates(self) -> None:
+        runs = [
+            {"chunks": 3, "avg_score": 0.8, "kw_found": 1, "kw_total": 2,
+             "quotes": 2, "quotes_valid": 2},
+            {"chunks": 2, "avg_score": 0.9, "kw_found": 1, "kw_total": 2,
+             "quotes": 1, "quotes_valid": 0},
+            {"chunks": 0, "avg_score": None, "kw_found": 0, "kw_total": 2,
+             "quotes": 0, "quotes_valid": 0},
+        ]
+        stats = aggregate_metrics(runs)
+        self.assertAlmostEqual(stats["sources_rate"], 66.7, places=6)
+        self.assertAlmostEqual(stats["quotes_rate"], 66.7, places=6)
+        # Валидность — доля среди вопросов с цитатами
+        self.assertAlmostEqual(stats["valid_rate"], 50.0, places=6)
+
+    def test_no_quotes_anywhere_gives_zero_rate(self) -> None:
+        runs = [{"chunks": 2, "avg_score": 0.8, "kw_found": 1, "kw_total": 2,
+                 "quotes": 0, "quotes_valid": 0}]
+        stats = aggregate_metrics(runs)
+        self.assertAlmostEqual(stats["quotes_rate"], 0.0, places=6)
+        self.assertIsNone(stats["valid_rate"])
 
     def test_empty_runs(self) -> None:
         stats = aggregate_metrics([])
         self.assertEqual(stats["questions"], 0)
         self.assertIsNone(stats["avg_score"])
         self.assertIsNone(stats["kw_rate"])
+        self.assertIsNone(stats["sources_rate"])
+        self.assertIsNone(stats["quotes_rate"])
 
     def test_format_aggregate_line(self) -> None:
         line = format_aggregate_line("basic", {
@@ -189,9 +248,107 @@ class AggregateTest(unittest.TestCase):
         self.assertIn("0.82", line)
         self.assertIn("78%", line)
 
+    def test_format_aggregate_line_with_citation_rates(self) -> None:
+        line = format_aggregate_line("basic", {
+            "questions": 10, "chunks": 3.0, "avg_score": 0.82,
+            "kw_rate": 78.0, "sources_rate": 100.0, "quotes_rate": 90.0})
+        self.assertIn("ист. 100%", line)
+        self.assertIn("цит. 90%", line)
+
     def test_format_aggregate_line_empty(self) -> None:
         self.assertIn("нет данных",
                       format_aggregate_line("basic", {}))
+
+
+class CitationChecksTest(unittest.TestCase):
+    """Автопроверка ответа: источники, цитаты, валидность, смысл."""
+
+    RESULT = {
+        "text": "Установка приложения: скачайте Python.",
+        "sources": [{"source": "installation.md", "chunk_id": 12}],
+        "quotes": [
+            {"chunk_id": 12, "text": "скачайте Python", "valid": True},
+        ],
+        "abstained": False,
+    }
+
+    def test_all_ok(self) -> None:
+        checks = citation_checks(self.RESULT, ["установка", "python"])
+        self.assertTrue(checks["sources_ok"])
+        self.assertTrue(checks["quotes_ok"])
+        self.assertTrue(checks["quotes_valid"])
+        self.assertTrue(checks["meaning_ok"])
+        self.assertEqual(checks["valid_count"], 1)
+        self.assertFalse(checks["abstained"])
+
+    def test_missing_sources_fails(self) -> None:
+        checks = citation_checks(dict(self.RESULT, sources=[]), [])
+        self.assertFalse(checks["sources_ok"])
+
+    def test_missing_quotes_fails(self) -> None:
+        checks = citation_checks(dict(self.RESULT, quotes=[]), [])
+        self.assertFalse(checks["quotes_ok"])
+        self.assertFalse(checks["quotes_valid"])
+
+    def test_invalid_quote_fails_validation(self) -> None:
+        result = dict(self.RESULT, quotes=[
+            {"chunk_id": 12, "text": "цитата", "valid": False}])
+        checks = citation_checks(result, [])
+        self.assertFalse(checks["quotes_valid"])
+        self.assertEqual(checks["valid_count"], 0)
+
+    def test_meaning_fails_without_keywords(self) -> None:
+        checks = citation_checks(self.RESULT, ["несуществующее"])
+        self.assertFalse(checks["meaning_ok"])
+
+    def test_abstained_is_not_failure(self) -> None:
+        result = {"text": "Я не знаю.", "sources": [], "quotes": [],
+                  "abstained": True}
+        checks = citation_checks(result, ["установка"])
+        self.assertTrue(checks["abstained"])
+        self.assertTrue(checks["meaning_ok"])
+        self.assertIn("Не знаю", format_checks_line(checks))
+
+    def test_format_checks_line_ok(self) -> None:
+        checks = citation_checks(self.RESULT, ["python"])
+        line = format_checks_line(checks)
+        self.assertIn("Источн.: ✅", line)
+        self.assertIn("Цитаты: ✅ 1/1 valid", line)
+        self.assertIn("Смысл: ✅", line)
+
+    def test_format_checks_line_failures(self) -> None:
+        checks = {"abstained": False, "sources_ok": False, "quotes_ok": True,
+                  "quotes_valid": False, "quotes_count": 2, "valid_count": 1,
+                  "kw_found": 0, "kw_total": 3, "meaning_ok": False}
+        line = format_checks_line(checks)
+        self.assertIn("Источн.: ❌", line)
+        self.assertIn("Цитаты: ❌ 1/2 valid", line)
+        self.assertIn("Смысл: ❌", line)
+
+    def test_format_checks_line_empty(self) -> None:
+        self.assertEqual(format_checks_line({}), "—")
+
+
+class FormatQuotesTextTest(unittest.TestCase):
+    """Цитаты в колонке: ✅ валидная, ⚠️ не найдена, обрезка длинных."""
+
+    def test_valid_and_invalid_marks(self) -> None:
+        text = format_quotes_text([
+            {"chunk_id": 1, "text": "Первая цитата", "valid": True},
+            {"chunk_id": 2, "text": "Вторая цитата", "valid": False},
+        ])
+        self.assertIn("«Первая цитата» ✅", text)
+        self.assertIn("«Вторая цитата» ⚠️ не найдена", text)
+
+    def test_empty_gives_dash(self) -> None:
+        self.assertEqual(format_quotes_text([]), "—")
+        self.assertEqual(format_quotes_text(None), "—")
+
+    def test_long_quote_truncated(self) -> None:
+        text = format_quotes_text([
+            {"chunk_id": 1, "text": "д" * 300, "valid": True}])
+        self.assertIn("…", text)
+        self.assertLess(len(text), 140)
 
 
 class SaveLoadRunTest(unittest.TestCase):
@@ -289,13 +446,28 @@ class RAGModesViewTest(unittest.TestCase):
         self.assertIn("0.82", view.mode_columns["basic"]["metrics"].value)
         self.assertIn("Чанков: 1",
                       view.mode_columns["basic"]["metrics"].value)
-        # Источники заполнены
-        self.assertIn("installation.md",
-                      view.mode_columns["basic"]["sources"].value)
-        # Прогон сохранён
+        # Источники заполнены: файл, секция, chunk_id, флаг cited
+        sources_text = view.mode_columns["basic"]["sources"].value
+        self.assertIn("installation.md", sources_text)
+        self.assertIn("## Windows", sources_text)
+        self.assertIn("chunk:12", sources_text)
+        self.assertIn("✓", sources_text)
+        # Цитаты с отметкой валидности
+        self.assertIn("«Установка приложения на Windows» ✅",
+                      view.mode_columns["basic"]["quotes"].value)
+        # Блок «Проверка»: источники, цитаты, смысл
+        checks_text = view.mode_columns["basic"]["checks"].value
+        self.assertIn("Источн.: ✅", checks_text)
+        self.assertIn("Цитаты: ✅ 1/1 valid", checks_text)
+        # Прогон сохранён вместе с цитатами и проверками
         saved = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(saved["question"], "Как установить приложение?")
         self.assertEqual(set(saved["results"]), set(RAG_MODES))
+        saved_basic = saved["results"]["basic"]
+        self.assertEqual(saved_basic["quotes"][0]["text"],
+                         "Установка приложения на Windows")
+        self.assertTrue(saved_basic["checks"]["sources_ok"])
+        self.assertTrue(saved_basic["checks"]["quotes_valid"])
 
     def test_run_all_aggregates_and_schedules_function(self) -> None:
         page = FakePage()
@@ -340,6 +512,11 @@ class RAGModesViewTest(unittest.TestCase):
         self.assertEqual(params, {"top_k": 15, "top_k_final": 2,
                                   "threshold": 0.55})
 
+    def test_threshold_defaults_to_06(self) -> None:
+        # ТЗ ai_1_23: порог «Не знаю» 0.6 (nomic-embed-text), не 0.7
+        view, _ = self.make_view()
+        self.assertEqual(view.threshold_field.value, "0.6")
+
     def test_retrieval_params_invalid_falls_back(self) -> None:
         view, agent = self.make_view()
         view.top_k_field.value = "abc"
@@ -363,6 +540,12 @@ class RAGModesViewTest(unittest.TestCase):
             "question": "Сохранённый вопрос?",
             "results": {"basic": {
                 "answer": "Ответ basic",
+                "quotes": [{"chunk_id": 12, "text": "Цитата из чанка",
+                            "valid": True}],
+                "checks": {"abstained": False, "sources_ok": True,
+                           "quotes_ok": True, "quotes_valid": True,
+                           "quotes_count": 1, "valid_count": 1,
+                           "kw_found": 2, "kw_total": 3, "meaning_ok": True},
                 "metrics": {"chunks": 3, "avg_score": 0.82,
                             "kw_found": 4, "kw_total": 5}}},
             "aggregate": {"basic": {"questions": 10, "chunks": 3.0,
@@ -373,7 +556,65 @@ class RAGModesViewTest(unittest.TestCase):
         self.assertEqual(view.question_field.value, "Сохранённый вопрос?")
         self.assertIn("0.82", view.mode_columns["basic"]["metrics"].value)
         self.assertIn("Ответ basic", view.mode_columns["basic"]["answer"].value)
+        self.assertIn("«Цитата из чанка» ✅",
+                      view.mode_columns["basic"]["quotes"].value)
+        self.assertIn("Цитаты: ✅ 1/1 valid",
+                      view.mode_columns["basic"]["checks"].value)
         self.assertIn("78%", view.summary_lines["basic"].value)
+
+    def test_saved_run_without_quotes_restores_dash(self) -> None:
+        # Старый формат прогона (до цитирования) не ломает вкладку
+        path = Path(tempfile.mkdtemp()) / "run.json"
+        save_run({
+            "question": "Старый прогон?",
+            "results": {"basic": {
+                "answer": "Старый ответ",
+                "metrics": {"chunks": 2, "avg_score": 0.7,
+                            "kw_found": 1, "kw_total": 2}}},
+        }, path)
+        view = RAGModesView(make_app(FakeModesAgent()),
+                            questions_path=QUESTION_FILE, results_path=path)
+        self.assertEqual(view.mode_columns["basic"]["quotes"].value, "—")
+        self.assertEqual(view.mode_columns["basic"]["checks"].value, "—")
+
+    def test_abstained_mode_shown_in_column(self) -> None:
+        # Режим «Не знаю»: ℹ️ в проверке, 🤷 в диагностике
+        path = Path(tempfile.mkdtemp()) / "run.json"
+
+        class AbstainAgent(FakeModesAgent):
+            async def answer_with_citations(self, question, rag_mode=None,
+                                            retrieval_params=None):
+                await super().answer_with_citations(
+                    question, rag_mode, retrieval_params)
+                return {
+                    "answer": "Я не знаю.", "text": "Я не знаю.",
+                    "sources": [], "citations": [], "quotes": [],
+                    "abstained": True,
+                    "abstain_reason": "средний score 0.52 ниже порога 0.60",
+                    "rag_used": True,
+                    "retrieval": {"search_query": question,
+                                  "rewrite_used": False,
+                                  "rewrite_error": None,
+                                  "rerank_backend": None,
+                                  "rerank_error": None,
+                                  "scores": [0.52], "avg_score": 0.52},
+                }
+
+        app = make_app(AbstainAgent())
+        view = RAGModesView(app, questions_path=QUESTION_FILE,
+                            results_path=path)
+        question = {"id": 1, "question": "Вопрос ни о чём?", "expected": "",
+                    "sources": []}
+
+        async def run() -> None:
+            await view._run_modes(question)
+
+        asyncio.run(run())
+        column = view.mode_columns["basic"]
+        self.assertIn("🤷 «Не знаю»", column["diag"].value)
+        self.assertEqual(column["quotes"].value, "—")
+        self.assertEqual(column["sources"].value, "—")
+        self.assertIn("режим «Не знаю»", column["checks"].value)
 
 
 if __name__ == "__main__":

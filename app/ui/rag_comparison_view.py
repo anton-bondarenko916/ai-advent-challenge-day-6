@@ -8,17 +8,23 @@
 * покрытие ключевых слов из expected (✓/✗ — доля найденных в ответе
   и источниках).
 
-Чистая логика (ключевые слова, метрики, агрегация, сохранение прогона)
-вынесена в функции модуля — покрывается офлайн-тестами без Flet.
+ТЗ ai_1_23: каждый ответ идёт через answer_with_citations —
+обязательные источники (source + section/chunk_id), обязательные
+цитаты с дословной валидацией (validate_quotes) и режим «Не знаю»
+(средний score ниже порога 0.6 → LLM не вызывается). В колонке режима
+показываются ответ, источники, цитаты (✓/⚠ по валидности) и блок
+«Проверка»: Источн. / Цитаты / Смысл.
 
-Прогон: для каждого вопроса пять изолированных запросов на «чистом»
-агенте (RAGChatAgent.answer_once с rag_mode=N) — история чата не
-засоряется. Результаты хранятся в app/data/rag_mode_comparison.json.
+Чистая логика (ключевые слова, метрики, проверки, агрегация, сохранение
+прогона) вынесена в функции модуля — покрывается офлайн-тестами без
+Flet.
+
+Прогон: для каждого вопроса пять изолированных запросов — история чата
+не засоряется. Результаты хранятся в app/data/rag_mode_comparison.json.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from pathlib import Path
@@ -26,8 +32,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import flet as ft
 
+from app.rag.citations import ABSTAIN_THRESHOLD
 from app.rag.pipeline import (
-    DEFAULT_THRESHOLD,
     DEFAULT_TOP_K,
     DEFAULT_TOP_K_FINAL,
     RAG_MODES,
@@ -42,10 +48,11 @@ DEFAULT_RESULTS_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "rag_mode_comparison.json"
 )
 
-# Настройки поиска по умолчанию (ТЗ): top_k=20, top_k_final=3, порог 0.7
+# Настройки поиска (ТЗ): top_k=20, top_k_final=3; порог 0.6 — гейт
+# режима «Не знаю», откалиброван для nomic-embed-text (0.7 завышен)
 DEFAULT_TOP_K_TEXT = str(DEFAULT_TOP_K)
 DEFAULT_TOP_K_FINAL_TEXT = str(DEFAULT_TOP_K_FINAL)
-DEFAULT_THRESHOLD_TEXT = str(DEFAULT_THRESHOLD)
+DEFAULT_THRESHOLD_TEXT = str(ABSTAIN_THRESHOLD)
 
 # Максимум ключевых слов для метрики покрытия
 MAX_KEYWORDS = 8
@@ -87,11 +94,13 @@ def keyword_coverage(keywords: List[str], text: str) -> Tuple[int, int]:
 
 
 def mode_metrics(result: Dict[str, Any], keywords: List[str]) -> Dict[str, Any]:
-    """Метрики режима по результату answer_once (без оценок человека).
+    """Метрики режима по результату answer_with_citations (без оценок
+    человека).
 
     Returns:
         {"chunks": int, "avg_score": Optional[float],
         "kw_found": int, "kw_total": int,
+        "quotes": int, "quotes_valid": int, "abstained": bool,
         "rewrite_used": bool, "rerank_backend": Optional[str],
         "search_query": str} — avg_score None, если чанков нет.
     """
@@ -104,11 +113,16 @@ def mode_metrics(result: Dict[str, Any], keywords: List[str]) -> Dict[str, Any]:
         str(source.get("source") or "") for source in sources
     )
     found, total = keyword_coverage(keywords, answer + " " + sources_text)
+    quotes = [q for q in (result.get("quotes") or [])
+              if isinstance(q, dict)]
     return {
         "chunks": len(sources),
         "avg_score": round(sum(scores) / len(scores), 4) if scores else None,
         "kw_found": found,
         "kw_total": total,
+        "quotes": len(quotes),
+        "quotes_valid": sum(1 for q in quotes if q.get("valid")),
+        "abstained": bool(result.get("abstained")),
         "rewrite_used": bool(retrieval.get("rewrite_used")),
         "rerank_backend": retrieval.get("rerank_backend"),
         "search_query": str(retrieval.get("search_query") or ""),
@@ -125,20 +139,41 @@ def aggregate_metrics(
 
     Returns:
         {"questions": int, "chunks": float, "avg_score": Optional[float],
-        "kw_rate": Optional[float]} — проценты None при пустом списке.
+        "kw_rate": Optional[float], "sources_rate": Optional[float],
+        "quotes_rate": Optional[float], "valid_rate": Optional[float]} —
+        проценты None при пустом списке.
+
+        sources_rate/quotes_rate — доля вопросов, где нашлись
+        источники/цитаты (ТЗ: «на 10 вопросах есть источники и
+        цитаты»); valid_rate — доля полностью валидных среди вопросов
+        с цитатами.
     """
     if not runs:
         return {"questions": 0, "chunks": 0.0, "avg_score": None,
-                "kw_rate": None}
+                "kw_rate": None, "sources_rate": None,
+                "quotes_rate": None, "valid_rate": None}
     chunks = [run["chunks"] for run in runs]
     scores = [run["avg_score"] for run in runs if run["avg_score"] is not None]
     found = sum(run["kw_found"] for run in runs)
     total = sum(run["kw_total"] for run in runs)
+    total_runs = len(runs)
+    quotes_hits = sum(1 for run in runs if run.get("quotes", 0) > 0)
+    valid_runs = sum(
+        1 for run in runs
+        if run.get("quotes", 0) > 0
+        and run.get("quotes_valid", 0) == run.get("quotes", 0)
+    )
     return {
         "questions": len(runs),
         "chunks": round(sum(chunks) / len(chunks), 2),
         "avg_score": round(sum(scores) / len(scores), 4) if scores else None,
         "kw_rate": round(100.0 * found / total, 1) if total else None,
+        "sources_rate": round(
+            100.0 * sum(1 for run in runs if run.get("chunks", 0) > 0)
+            / total_runs, 1),
+        "quotes_rate": round(100.0 * quotes_hits / total_runs, 1),
+        "valid_rate": (round(100.0 * valid_runs / quotes_hits, 1)
+                       if quotes_hits else None),
     }
 
 
@@ -175,15 +210,95 @@ def format_metrics_line(metrics: Dict[str, Any]) -> str:
 
 
 def format_aggregate_line(mode: str, stats: Dict[str, Any]) -> str:
-    """Строка агрегата прогона: «Basic RAG: 10 вопр. · 3.0 чанк. · 0.82 · 78%»."""
+    """Строка агрегата прогона: «Basic RAG: 10 вопр. · 3.0 чанк. · 0.82
+    · ключ. 78% · ист. 100% · цит. 90%»."""
     if not stats.get("questions"):
         return f"{RAG_MODE_LABELS.get(mode, mode)}: нет данных"
     score = stats.get("avg_score")
     score_text = f"{score:.2f}" if score is not None else "—"
     rate = stats.get("kw_rate")
     rate_text = f"{rate:.0f}%" if rate is not None else "—"
-    return (f"{RAG_MODE_LABELS.get(mode, mode)}: {stats['questions']} вопр. · "
+    line = (f"{RAG_MODE_LABELS.get(mode, mode)}: {stats['questions']} вопр. · "
             f"{stats['chunks']} чанк. · score {score_text} · ключ. {rate_text}")
+    sources_rate = stats.get("sources_rate")
+    quotes_rate = stats.get("quotes_rate")
+    if sources_rate is not None:
+        line += f" · ист. {sources_rate:.0f}%"
+    if quotes_rate is not None:
+        line += f" · цит. {quotes_rate:.0f}%"
+    return line
+
+
+def citation_checks(result: Dict[str, Any],
+                    keywords: List[str]) -> Dict[str, Any]:
+    """Автопроверка ответа режима (ТЗ): источники, цитаты, валидность.
+
+    Проверки по каждому ответу:
+    * sources_ok — есть ли sources;
+    * quotes_ok — есть ли quotes;
+    * quotes_valid — все ли цитаты valid: True;
+    * meaning_ok — смысл: ключевое слово вопроса найдено в ответе
+      (для «Не знаю» воздержание и есть корректное поведение).
+
+    Returns:
+        {"abstained", "sources_ok", "quotes_ok", "quotes_valid",
+        "quotes_count", "valid_count", "kw_found", "kw_total",
+        "meaning_ok"}.
+    """
+    abstained = bool(result.get("abstained"))
+    sources = result.get("sources") or []
+    quotes = [q for q in (result.get("quotes") or [])
+              if isinstance(q, dict)]
+    valid_count = sum(1 for q in quotes if q.get("valid"))
+    answer = str(result.get("text") or "")
+    found, total = keyword_coverage(keywords, answer)
+    sources_ok = bool(sources)
+    quotes_ok = bool(quotes)
+    return {
+        "abstained": abstained,
+        "sources_ok": sources_ok,
+        "quotes_ok": quotes_ok,
+        "quotes_valid": quotes_ok and valid_count == len(quotes),
+        "quotes_count": len(quotes),
+        "valid_count": valid_count,
+        "kw_found": found,
+        "kw_total": total,
+        "meaning_ok": True if abstained else found > 0,
+    }
+
+
+def format_checks_line(checks: Dict[str, Any]) -> str:
+    """Строка блока «Проверка»: Источн. ✅ · Цитаты ✅ 2/2 · Смысл ✅.
+
+    Воздержание — корректное поведение, помечается ℹ️, а не ошибкой.
+    """
+    if not checks:
+        return "—"
+    if checks.get("abstained"):
+        return "Проверка: ℹ️ режим «Не знаю» (sources/quotes пусты)"
+    sources = "✅" if checks.get("sources_ok") else "❌"
+    valid_count = checks.get("valid_count", 0)
+    quotes_count = checks.get("quotes_count", 0)
+    quotes_mark = "✅" if checks.get("quotes_valid") else "❌"
+    meaning = "✅" if checks.get("meaning_ok") else "❌"
+    return (f"Проверка — Источн.: {sources} · "
+            f"Цитаты: {quotes_mark} {valid_count}/{quotes_count} valid · "
+            f"Смысл: {meaning}")
+
+
+def format_quotes_text(quotes: Any) -> str:
+    """Цитаты для колонки режима: «текст» ✅ / «текст» ⚠️ не найдена."""
+    items = [q for q in (quotes or []) if isinstance(q, dict)]
+    if not items:
+        return "—"
+    lines = []
+    for quote in items:
+        mark = "✅" if quote.get("valid") else "⚠️ не найдена"
+        text = " ".join(str(quote.get("text") or "").split())
+        if len(text) > 120:
+            text = text[:119] + "…"
+        lines.append(f"«{text}» {mark}")
+    return "\n".join(lines)
 
 
 class RAGModesView:
@@ -212,6 +327,9 @@ class RAGModesView:
         )
         self.threshold_field = ft.TextField(
             value=DEFAULT_THRESHOLD_TEXT, label="Порог similarity", width=130,
+            tooltip=("Гейт режима «Не знаю» и фильтрация: средний score "
+                     f"ниже порога — LLM не вызывается (0.6 для "
+                     f"nomic-embed-text)"),
         )
         self.mode_dropdown = ft.Dropdown(
             label="Режим",
@@ -309,6 +427,12 @@ class RAGModesView:
             sources_text = ft.Text("—", size=11,
                                    color=ft.Colors.BLUE_GREY_600,
                                    selectable=True)
+            quotes_text = ft.Text("—", size=11,
+                                  color=ft.Colors.BLUE_GREY_600,
+                                  selectable=True)
+            checks_text = ft.Text("—", size=12,
+                                  weight=ft.FontWeight.BOLD,
+                                  selectable=True)
             # Фиксированные размеры карточки + внутренний скролл: строка
             # карточек — горизонтальный ListView с bounded-высотой,
             # карточка без явной высоты даёт intrinsic (~550px) и режется
@@ -323,6 +447,9 @@ class RAGModesView:
                     answer_markdown,
                     ft.Text("Источники:", size=11, weight=ft.FontWeight.BOLD),
                     sources_text,
+                    ft.Text("Цитаты:", size=11, weight=ft.FontWeight.BOLD),
+                    quotes_text,
+                    checks_text,
                 ], spacing=4, tight=True, scroll=ft.ScrollMode.AUTO),
                 width=MODE_COLUMN_WIDTH, height=MODE_COLUMN_HEIGHT,
                 padding=10,
@@ -333,6 +460,8 @@ class RAGModesView:
                 "diag": diag_text,
                 "answer": answer_markdown,
                 "sources": sources_text,
+                "quotes": quotes_text,
+                "checks": checks_text,
             }
 
     def _mode_column_controls(self, mode: str) -> ft.Control:
@@ -464,16 +593,18 @@ class RAGModesView:
             "aggregate": self.aggregate,
         }
         for mode in RAG_MODES:
-            result = await self.agent.answer_once(
+            result = await self.agent.answer_with_citations(
                 str(question.get("question") or ""),
-                rag_enabled=True,
                 rag_mode=mode,
                 retrieval_params=params,
             )
             metrics = mode_metrics(result, keywords)
-            self._show_mode_result(mode, result, metrics)
+            checks = citation_checks(result, keywords)
+            self._show_mode_result(mode, result, metrics, checks)
             saved_payload["results"][mode] = {
                 "answer": self._answer_text(result),
+                "quotes": list(result.get("quotes") or []),
+                "checks": checks,
                 "metrics": metrics,
             }
             if runs is not None:
@@ -490,11 +621,15 @@ class RAGModesView:
         self.update()
 
     def _show_mode_result(self, mode: str, result: Dict[str, Any],
-                          metrics: Dict[str, Any]) -> None:
-        """Заполняет колонку режима: метрики, ответ, источники."""
+                          metrics: Dict[str, Any],
+                          checks: Optional[Dict[str, Any]] = None) -> None:
+        """Заполняет колонку режима: метрики, ответ, источники, цитаты."""
         column = self.mode_columns[mode]
         column["metrics"].value = format_metrics_line(metrics)
         diagnostics: List[str] = []
+        if result.get("abstained"):
+            diagnostics.append(
+                f"🤷 «Не знаю»: {result.get('abstain_reason') or ''}")
         if metrics.get("rewrite_used"):
             diagnostics.append(f"✍ {metrics.get('search_query', '')}")
         if metrics.get("rerank_backend"):
@@ -502,11 +637,16 @@ class RAGModesView:
         rag_error = result.get("rag_error")
         if rag_error:
             diagnostics.append(f"⚠ {rag_error}")
+        citation_error = result.get("citation_error")
+        if citation_error:
+            diagnostics.append(f"⚠ Цитаты: {citation_error}")
         if result.get("error"):
             diagnostics.append(f"⚠ {result['error']}")
         column["diag"].value = "\n".join(diagnostics)
         column["answer"].value = self._answer_text(result)
         column["sources"].value = self._sources_text(result)
+        column["quotes"].value = format_quotes_text(result.get("quotes"))
+        column["checks"].value = format_checks_line(checks or {})
 
     def _refresh_summary(self) -> None:
         """Пересчитывает агрегированные строки сводки."""
@@ -541,6 +681,9 @@ class RAGModesView:
                 diagnostics.append(f"🔀 {metrics['rerank_backend']}")
             column["diag"].value = "\n".join(diagnostics)
             column["answer"].value = str(saved.get("answer") or "—")
+            column["quotes"].value = format_quotes_text(saved.get("quotes"))
+            column["checks"].value = format_checks_line(
+                saved.get("checks") or {})
         self._refresh_summary()
 
     # ------------------------------------------------------------------
@@ -558,6 +701,10 @@ class RAGModesView:
 
     @staticmethod
     def _sources_text(result: Dict[str, Any]) -> str:
+        """Источники: «✓ 📄 файл → секция (chunk:N, s=0.88)».
+
+        ✓ — LLM сослался на этот chunk_id (флаг cited); abstain — «—».
+        """
         sources = result.get("sources") or []
         if not sources:
             return "—"
@@ -568,8 +715,14 @@ class RAGModesView:
             score_text = (
                 f", s={1.0 - distance:.2f}" if distance is not None else ""
             )
+            chunk_text = ""
+            if source.get("chunk_id") is not None and \
+                    int(source.get("chunk_id")) >= 0:
+                chunk_text = f", chunk:{source['chunk_id']}"
+            cited = "✓ " if source.get("cited") else ""
             lines.append(
-                f"📄 {source.get('source')} → {section}{score_text}")
+                f"{cited}📄 {source.get('source')} → {section}"
+                f"{chunk_text}{score_text}")
         return "\n".join(lines)
 
     def update(self) -> None:
