@@ -1,6 +1,7 @@
 """Точка входа Flet-приложения DeepSeek Chat (миграция с Tkinter).
 
-Экраны (вкладки): 💬 Чат (RAG-режим, источники), 📚 База знаний
+Экраны (вкладки): 💬 Чат (RAG всегда включён, источники с цитатами,
+память задачи: «Состояние диалога» и «Новый диалог»), 📚 База знаний
 (индексация MD), ⚖️ Сравнение (10 вопросов × 2 режима), 🔀 Сравнение
 RAG-режимов (5 режимов + автоматические метрики), ⚙️ Настройки
 (профиль, температура, max_tokens, модель).
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import sys
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -35,6 +37,8 @@ if str(PROJECT_ROOT) not in sys.path:
 import flet as ft
 
 from app.agent import RAGChatAgent
+from app.chat_handler import ChatHandler, build_chat_extractor
+from app.task_state import TaskStateRepository
 from app.ui.chat_view import ChatView
 from app.ui.comparison_view import ComparisonView
 from app.ui.knowledge_view import KnowledgeView
@@ -43,6 +47,7 @@ from app.ui.settings_view import SettingsView
 from src.config import (
     get_geo_settings,
     get_news_settings,
+    get_project_path,
     get_reminder_settings,
     get_weather_settings,
     load_config,
@@ -65,6 +70,11 @@ class ChatApp:
         page: страница Flet.
         agent: RAGChatAgent (ядро + RAG-пайплайн).
         file_picker: сервис выбора папки (страница «База знаний»).
+        session_id: UUID текущего диалога (ключ памяти задачи; новый
+            выдаётся кнопкой «Новый диалог»).
+        task_state_repo: репозиторий памяти задачи (SQLite); None,
+            если хранилище отключено (STORAGE_ENABLED=False).
+        chat_handler: обработчик хода чата (RAG + память задачи + цитаты).
     """
 
     def __init__(
@@ -76,6 +86,19 @@ class ChatApp:
         self.page = page
         self.agent = agent
         self.config = config
+        self.session_id = str(uuid.uuid4())
+
+        # Память задачи (ТЗ ai_1_24): таблица task_state в БД истории;
+        # отключается только вместе с хранилищем ядра
+        self.task_state_repo: Optional[TaskStateRepository] = None
+        if config.get("STORAGE_ENABLED", True):
+            self.task_state_repo = TaskStateRepository(
+                get_project_path(config, "STORAGE_PATH"))
+        self.chat_handler = ChatHandler(
+            agent,
+            task_state_repo=self.task_state_repo,
+            extractor=build_chat_extractor(config),
+        )
 
         page.title = str(config.get("UI_TITLE", "DeepSeek Chat")) + " (Flet)"
         page.padding = 16
@@ -123,6 +146,15 @@ class ChatApp:
     def notify(self, message: str) -> None:
         """SnackBar-уведомление (только из event loop)."""
         self.page.show_dialog(ft.SnackBar(content=ft.Text(message)))
+
+    def profile_id(self) -> int:
+        """Активный профиль ядра (0 — профиль не выбран)."""
+        profile = getattr(self.agent.core, "profile", None)
+        profile_id = getattr(profile, "id", None)
+        try:
+            return int(profile_id) if profile_id is not None else 0
+        except (TypeError, ValueError):
+            return 0
 
     def _history_messages(self) -> list:
         """История ядра без системного сообщения (для восстановления чата)."""

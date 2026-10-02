@@ -149,14 +149,21 @@ def message_bubble(text: str, role: str, timestamp: str = "") -> ft.Container:
 
 
 def source_line(source: Dict[str, Any]) -> ft.Text:
-    """Строка источника: 📄 installation.md → ## Windows (structure, d=0.12).
+    """Строка источника (формат ТЗ ai_1_24):
+    📄 installation.md → ## Windows (chunk_id: 12 · structure · d=0.12).
 
     Светлый цвет — панель лежит на тёмном пузыре сообщения."""
     path = source.get("source") or "?"
     section = source.get("section") or "—"
+    chunk_id = source.get("chunk_id")
+    suffix = f"chunk_id: {chunk_id}" if chunk_id is not None else ""
     strategy = source.get("strategy") or "fixed"
     distance = source.get("distance")
-    suffix = f" · {strategy}" + (f" · d={distance}" if distance is not None else "")
+    if strategy:
+        suffix += (", " if suffix else "") + str(strategy)
+    if distance is not None:
+        suffix += f" · d={distance}"
+    suffix = f" ({suffix})" if suffix else ""
     return ft.Text(
         f"📄 {path} → {section}{suffix}",
         size=12,
@@ -177,23 +184,49 @@ def source_preview(source: Dict[str, Any]) -> ft.Text:
     )
 
 
-def sources_panel(sources: List[Dict[str, Any]]) -> Optional[ft.ExpansionTile]:
-    """Сворачиваемая панель «Источники» под ответом LLM.
+def source_quote(quote: Dict[str, Any]) -> ft.Text:
+    """Цитата LLM из чанка: «…» + пометка ⚠️ для недословной (ТЗ ai_1_23:
+    цитаты не выбрасываются — неверная помечается valid: False)."""
+    mark = "" if quote.get("valid", True) else " ⚠️ не дословная"
+    return ft.Text(
+        f"   «{quote.get('text') or ''}»{mark}",
+        size=11,
+        italic=True,
+        color=ft.Colors.BLUE_100 if quote.get("valid", True)
+        else ft.Colors.ORANGE_200,
+        selectable=True,
+    )
 
-    Светлые заголовок/иконка — панель лежит на тёмном пузыре сообщения.
+
+def sources_panel(sources: List[Dict[str, Any]],
+                  quotes: Optional[List[Dict[str, Any]]] = None
+                  ) -> Optional[ft.ExpansionTile]:
+    """Сворачиваемая панель «Источники» под ответом LLM (свёрнута).
+
+    С цитатами (ТЗ ai_1_24): под каждым источником показываются
+    дословные цитаты LLM из этого чанка (invalid — с пометкой ⚠️);
+    без цитат — прежний фрагмент превью чанка.
 
     Args:
         sources: список метаданных чанков (Retriever.format_sources).
+        quotes: валидированные цитаты LLM (validate_quotes) или None.
 
     Returns:
         ExpansionTile или None, если источников нет.
     """
     if not sources:
         return None
+    quotes_by_chunk: Dict[Any, List[Dict[str, Any]]] = {}
+    for quote in quotes or []:
+        quotes_by_chunk.setdefault(quote.get("chunk_id"), []).append(quote)
     rows: List[ft.Control] = []
     for source in sources:
         rows.append(source_line(source))
-        rows.append(source_preview(source))
+        chunk_quotes = quotes_by_chunk.get(source.get("chunk_id"))
+        if chunk_quotes:
+            rows.extend(source_quote(quote) for quote in chunk_quotes)
+        else:
+            rows.append(source_preview(source))
     return ft.ExpansionTile(
         title=ft.Text(f"📚 Источники ({len(sources)})", size=13,
                       weight=ft.FontWeight.BOLD,
@@ -247,6 +280,43 @@ def file_open_button(file_path: str, on_open) -> ft.FilledTonalButton:
         on_click=on_open,
         tooltip=file_path,
     )
+
+
+def task_state_panel(state: Dict[str, Any]) -> ft.Column:
+    """Панель памяти задачи для модалки «Состояние диалога» (ТЗ ai_1_24:
+    🎯 цель, 📝 уточнения, ⚠️ ограничения, 📚 термины).
+
+    Args:
+        state: словарь TaskState.to_dict() (goal/clarifications/
+            constraints/terms).
+
+    Returns:
+        Готовая Column (без обращения к page — офлайн-тесты).
+    """
+    rows: List[ft.Control] = []
+    goal = str(state.get("goal") or "").strip()
+    if goal:
+        rows.append(ft.Text(f"🎯 Цель: {goal}", size=14, selectable=True))
+    for title, key, icon in (
+        ("📝 Уточнения:", "clarifications", "  • "),
+        ("⚠️ Ограничения:", "constraints", "  • "),
+    ):
+        items = [str(item) for item in state.get(key) or [] if str(item).strip()]
+        if items:
+            rows.append(ft.Text(title, size=13, weight=ft.FontWeight.BOLD))
+            rows.extend(ft.Text(f"{icon}{item}", size=13, selectable=True)
+                        for item in items)
+    terms = state.get("terms") or {}
+    if terms:
+        rows.append(ft.Text("📚 Термины:", size=13,
+                            weight=ft.FontWeight.BOLD))
+        rows.extend(
+            ft.Text(f"  • {term}: {definition}", size=13, selectable=True)
+            for term, definition in terms.items())
+    if not rows:
+        rows.append(ft.Text("Состояние диалога пусто.", size=13,
+                            color=ft.Colors.BLUE_GREY_400))
+    return ft.Column(rows, spacing=4, tight=True, scroll=ft.ScrollMode.AUTO)
 
 
 def assessment_dropdown(value: str = "", on_select=None) -> ft.Dropdown:

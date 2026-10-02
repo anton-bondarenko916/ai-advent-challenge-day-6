@@ -173,9 +173,12 @@ class RAGChatAgent:
             model=str(config.get("DEFAULT_MODEL") or "deepseek-v4-flash"),
             mock_mode=bool(config.get("MOCK_MODE")),
         )
+        # ТЗ ai_1_24: RAG в чате всегда включён (переключатель в UI
+        # заблокирован в положении «включён»)
         return cls(core, embedder=embedder, vector_store=vector_store,
                    rewriter=rewriter, reranker=reranker,
-                   citation_answerer=citation_answerer)
+                   citation_answerer=citation_answerer,
+                   rag_enabled=True)
 
     # ------------------------------------------------------------------
     # Настройки режима (UI: переключатель + параметры, «на лету»)

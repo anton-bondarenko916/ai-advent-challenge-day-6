@@ -1,9 +1,15 @@
-"""Вкладка «Чат»: история, ввод, переключатель RAG, панель источников.
+"""Вкладка «Чат»: история, ввод, RAG (всегда включён), память задачи.
 
 Потокобезопасность: все обновления UI выполняются в async-обработчиках,
 запущенных через page.run_task (event loop Flet); блокирующие вызовы
-агента (SDK OpenAI, MCP) уходят в asyncio.to_thread внутри
-RAGChatAgent.send_message. Фоновые потоки UI не трогают.
+агента (SDK OpenAI, MCP, SQLite) уходят в asyncio.to_thread внутри
+ChatHandler/RAGChatAgent. Фоновые потоки UI не трогают.
+
+ТЗ ai_1_24: ход идёт через ChatHandler (память задачи + RAG-поиск +
+гейт 0.6 + цитаты), под каждым ответом — свёрнутые источники с
+цитатами, в шапке — кнопки «📋 Состояние диалога» (модалка с памятью
+задачи) и «➕ Новый диалог» (новый session_id: сброс памяти и истории
+с подтверждением). RAG в чате всегда включён (переключатель заблокирован).
 
 Методы *_async можно вызывать напрямую (тесты, asyncio.run) — работа с
 page вынесена в schedule-обёртки (_on_send и т.п.).
@@ -13,20 +19,67 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from typing import Any, Dict, List, Optional
 
 import flet as ft
 
+from app.chat_handler import STRATEGY_C_NOTE
 from app.rag.pipeline import RAG_MODES, RAG_MODE_LABELS
+from app.task_state import TaskState
 from app.ui import components
 
 
+def build_task_state_dialog(state: Dict[str, Any], on_reset,
+                            on_close) -> ft.AlertDialog:
+    """Модалка «Состояние диалога»: память задачи + действия (ТЗ ai_1_24).
+
+    Args:
+        state: словарь TaskState.to_dict().
+        on_reset: обработчик кнопки «Сбросить состояние» (sync).
+        on_close: обработчик кнопки «Закрыть» (sync).
+    """
+    return ft.AlertDialog(
+        title=ft.Text("📋 Состояние диалога", weight=ft.FontWeight.BOLD),
+        content=ft.Container(
+            content=components.task_state_panel(state), width=460),
+        actions=[
+            ft.TextButton("Сбросить состояние", on_click=on_reset),
+            ft.TextButton("Закрыть", on_click=on_close),
+        ],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+
+
+def build_new_dialog_dialog(on_cancel, on_confirm) -> ft.AlertDialog:
+    """Модалка подтверждения «Новый диалог» (сброс без подтверждения
+    запрещён ТЗ)."""
+    return ft.AlertDialog(
+        title=ft.Text("➕ Новый диалог", weight=ft.FontWeight.BOLD),
+        content=ft.Container(
+            content=ft.Text(
+                "Начать новый диалог? Текущая история и память задачи "
+                "будут сброшены.",
+                size=14,
+            ),
+            width=380,
+        ),
+        actions=[
+            ft.TextButton("Отмена", on_click=on_cancel),
+            ft.FilledButton("Начать новый диалог", on_click=on_confirm),
+        ],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+
+
 class ChatView:
-    """Чат с переключателем RAG и top_k.
+    """Чат: RAG всегда включён, источники с цитатами, память задачи.
 
     Attributes:
         agent: RAGChatAgent (ядро + RAG-пайплайн).
-        app: владелец (page, notify); в тестах — заглушка.
+        app: владелец (page, notify, session_id, chat_handler);
+            в тестах — заглушка (тогда ход идёт напрямую через agent).
+        last_dialog: последняя модалка (для офлайн-тестов без page).
     """
 
     def __init__(self, app: Any) -> None:
@@ -34,6 +87,7 @@ class ChatView:
         self.agent = app.agent
         self._running = False
         self._pending_bubble: Optional[ft.Container] = None
+        self.last_dialog: Optional[ft.AlertDialog] = None
 
         self.messages_list = ft.ListView(
             expand=True,
@@ -57,10 +111,29 @@ class ChatView:
             tooltip="Отправить",
             on_click=self._on_send,
         )
+        # ТЗ ai_1_24: RAG в чате всегда включён — переключатель заблокирован
         self.rag_switch = ft.Switch(
-            label="Использовать RAG",
+            label="Использовать RAG (всегда включён)",
             value=self.agent.rag_enabled,
             on_change=self._on_rag_toggle,
+            disabled=True,
+            tooltip="RAG в чате всегда включён: источники и цитаты "
+                    "под каждым ответом",
+        )
+        self.state_button = ft.FilledTonalButton(
+            "📋 Состояние диалога",
+            on_click=self._on_dialog_state,
+            tooltip="Память задачи: цель, уточнения, ограничения, термины",
+        )
+        self.new_dialog_button = ft.FilledTonalButton(
+            "➕ Новый диалог",
+            on_click=self._on_new_dialog,
+            tooltip="Новый диалог: сброс памяти задачи и истории "
+                    "(новый session_id)",
+        )
+        self.chat_actions_row = ft.Row(
+            [self.state_button, self.new_dialog_button],
+            spacing=8, wrap=True,
         )
         self.top_k_field = ft.TextField(
             value=str(self.agent.top_k),
@@ -108,9 +181,10 @@ class ChatView:
     # Компоновка
     # ------------------------------------------------------------------
     def build(self) -> ft.Column:
-        """Собирает вкладку: чат, панель RAG, ввод, статус-строка."""
+        """Собирает вкладку: чат, кнопки диалога, панель RAG, ввод, статус."""
         return ft.Column([
             self.messages_list,
+            self.chat_actions_row,
             self.controls_row,
             ft.Row([self.input_field, self.send_button], spacing=8),
             self.status_text,
@@ -169,7 +243,16 @@ class ChatView:
             content.controls.append(ft.Text(
                 f"⚠️ RAG: {rag_error}", size=12,
                 color=components.RAG_WARNING_COLOR, selectable=True))
-        sources_panel = components.sources_panel(result.get("sources") or [])
+        elif result.get("has_rag") is False:
+            # Стратегия C (ТЗ ai_1_24): RAG не нашёл релевантных чанков —
+            # ответ из общих знаний без источников
+            content.controls.append(ft.Text(
+                STRATEGY_C_NOTE, size=12,
+                color=components.RAG_WARNING_COLOR, selectable=True))
+        sources_panel = components.sources_panel(
+            result.get("sources") or [],
+            quotes=result.get("quotes") or None,
+        )
         if sources_panel is not None:
             content.controls.append(sources_panel)
         tools_panel = components.tools_panel(result.get("tool_calls") or [])
@@ -228,6 +311,93 @@ class ChatView:
     def _on_open_file(self, event=None) -> None:
         self._schedule(self._open_file_async, event)
 
+    # ------------------------------------------------------------------
+    # Модалки: «Состояние диалога» и «Новый диалог» (ТЗ ai_1_24)
+    # ------------------------------------------------------------------
+    def _on_dialog_state(self, event=None) -> None:
+        self._schedule(self._dialog_state_async)
+
+    def _on_close_dialog(self, event=None) -> None:
+        self._schedule(self._close_dialog_async)
+
+    def _on_reset_task_state(self, event=None) -> None:
+        self._schedule(self._reset_task_state_async)
+
+    def _on_new_dialog(self, event=None) -> None:
+        self._schedule(self._new_dialog_confirm_async)
+
+    def _on_cancel_new_dialog(self, event=None) -> None:
+        self._schedule(self._close_dialog_async)
+
+    def _on_confirm_new_dialog(self, event=None) -> None:
+        self._schedule(self._start_new_dialog_async)
+
+    def _open_dialog(self, dialog: ft.AlertDialog) -> None:
+        """Показ модалки; без page (офлайн-тесты) — в self.last_dialog."""
+        if self.app.page is not None:
+            self.app.page.show_dialog(dialog)
+        else:
+            self.last_dialog = dialog
+
+    def _chat_handler(self):
+        """ChatHandler приложения (None в legacy-заглушках тестов)."""
+        return getattr(self.app, "chat_handler", None)
+
+    def _session_id(self) -> str:
+        return str(getattr(self.app, "session_id", "") or "")
+
+    async def _dialog_state_async(self) -> None:
+        """Модалка с текущей памятью задачи (цель/уточнения/термины)."""
+        handler = self._chat_handler()
+        if handler is not None:
+            profile_id = (self.app.profile_id()
+                          if hasattr(self.app, "profile_id") else 0)
+            state = await asyncio.to_thread(
+                handler.load_state, self._session_id(), profile_id)
+        else:
+            state = TaskState(session_id=self._session_id(), profile_id=0)
+        self._open_dialog(build_task_state_dialog(
+            state.to_dict(), self._on_reset_task_state,
+            self._on_close_dialog))
+
+    async def _close_dialog_async(self) -> None:
+        """Закрывает верхнюю модалку (page.pop_dialog)."""
+        if self.app.page is not None:
+            self.app.page.pop_dialog()
+
+    async def _reset_task_state_async(self) -> None:
+        """«Сбросить состояние»: память задачи сессии удаляется из БД."""
+        handler = self._chat_handler()
+        if handler is not None and self._session_id():
+            await asyncio.to_thread(
+                handler.reset_session, self._session_id())
+        await self._close_dialog_async()
+        self._set_status("Память задачи сброшена")
+        self.update()
+
+    async def _new_dialog_confirm_async(self) -> None:
+        """Подтверждение «Новый диалог» (сброс без подтверждения запрещён)."""
+        self._open_dialog(build_new_dialog_dialog(
+            self._on_cancel_new_dialog, self._on_confirm_new_dialog))
+
+    async def _start_new_dialog_async(self) -> None:
+        """Новый диалог: сброс памяти задачи + истории, новый session_id.
+
+        Порядок из ТЗ: сброс памяти задачи старой сессии в SQLite →
+        очистка истории ядра (и БД) → новый UUID → пустой чат.
+        """
+        old_session_id = self._session_id()
+        handler = self._chat_handler()
+        if handler is not None and old_session_id:
+            await asyncio.to_thread(handler.reset_session, old_session_id)
+        await asyncio.to_thread(self.agent.clear_history)
+        self.app.session_id = str(uuid.uuid4())
+        self.messages_list.controls.clear()
+        await self._close_dialog_async()
+        self._set_status(
+            "Новый диалог: память задачи и история сброшены")
+        self.update()
+
     def _schedule(self, handler, *args) -> None:
         """Запускает async-задачу на event loop Flet.
 
@@ -262,7 +432,17 @@ class ChatView:
         self._set_status("Запрос к модели…")
         self.update()
         try:
-            result = await self.agent.send_message(text)
+            handler = getattr(self.app, "chat_handler", None)
+            if handler is not None:
+                # ТЗ ai_1_24: ход через ChatHandler — память задачи,
+                # RAG-гейт 0.6, цитаты, обновление состояния в SQLite
+                profile_id = (self.app.profile_id()
+                              if hasattr(self.app, "profile_id") else 0)
+                result = await handler.handle_message(
+                    str(getattr(self.app, "session_id", "") or ""),
+                    profile_id, text)
+            else:
+                result = await self.agent.send_message(text)
         except Exception as exc:  # сеть/поток — показываем как ошибку хода
             result = {"error": str(exc)}
         finally:
