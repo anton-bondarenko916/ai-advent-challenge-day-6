@@ -9,7 +9,19 @@ ChatHandler/RAGChatAgent. Фоновые потоки UI не трогают.
 гейт 0.6 + цитаты), под каждым ответом — свёрнутые источники с
 цитатами, в шапке — кнопки «📋 Состояние диалога» (модалка с памятью
 задачи) и «➕ Новый диалог» (новый session_id: сброс памяти и истории
-с подтверждением). RAG в чате всегда включён (переключатель заблокирован).
+с подтверждением).
+
+ТЗ ai_1_25: в шапке — выпадающий список провайдера LLM (DeepSeek облако
+↔ локальные модели Ollama). Переключение «на лету» через
+core.switch_provider: перед ним лаунчер гарантирует, что Ollama запущен
+и модель загружена (ollama pull при первом использовании); недоступный
+провайдер даёт модалку ошибки и откат списка; выбор сохраняется в
+app_state (SQLite) и восстанавливается при следующем запуске.
+
+RAG по умолчанию включён, но переключатель разблокирован: выключенное
+положение отправляет вопрос ядру без поиска по базе знаний (память
+задачи и инструменты MCP работают как раньше). Положение переключателя
+сохраняется в app_state (ключ rag_enabled).
 
 Методы *_async можно вызывать напрямую (тесты, asyncio.run) — работа с
 page вынесена в schedule-обёртки (_on_send и т.п.).
@@ -28,6 +40,17 @@ from app.chat_handler import STRATEGY_C_NOTE
 from app.rag.pipeline import RAG_MODES, RAG_MODE_LABELS
 from app.task_state import TaskState
 from app.ui import components
+from src.llm_providers import (
+    LLMProviderFactory,
+    ProviderUnavailableError,
+)
+from src.ollama_launcher import OllamaLauncher
+
+# Ключ выбора провайдера в app_state (SQLite)
+ACTIVE_PROVIDER_KEY = "active_provider"
+
+# Ключ положения переключателя RAG в app_state (SQLite)
+RAG_ENABLED_KEY = "rag_enabled"
 
 
 def build_task_state_dialog(state: Dict[str, Any], on_reset,
@@ -72,6 +95,26 @@ def build_new_dialog_dialog(on_cancel, on_confirm) -> ft.AlertDialog:
     )
 
 
+def build_provider_error_dialog(message: str, on_close) -> ft.AlertDialog:
+    """Модалка ошибки переключения провайдера (ТЗ ai_1_25)."""
+    return ft.AlertDialog(
+        title=ft.Text("❌ Провайдер недоступен", weight=ft.FontWeight.BOLD),
+        content=ft.Container(content=ft.Text(message, size=14), width=420),
+        actions=[ft.TextButton("Закрыть", on_click=on_close)],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+
+
+def build_provider_warning_dialog(message: str, on_close) -> ft.AlertDialog:
+    """Модалка предупреждения (например, tool calling не поддерживается)."""
+    return ft.AlertDialog(
+        title=ft.Text("⚠️ Внимание", weight=ft.FontWeight.BOLD),
+        content=ft.Container(content=ft.Text(message, size=14), width=420),
+        actions=[ft.TextButton("Понятно", on_click=on_close)],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+
+
 class ChatView:
     """Чат: RAG всегда включён, источники с цитатами, память задачи.
 
@@ -111,15 +154,17 @@ class ChatView:
             tooltip="Отправить",
             on_click=self._on_send,
         )
-        # ТЗ ai_1_24: RAG в чате всегда включён — переключатель заблокирован
+        # RAG включён по умолчанию, переключатель разблокирован: выключенное
+        # положение отправляет запрос без поиска по базе знаний
         self.rag_switch = ft.Switch(
-            label="Использовать RAG (всегда включён)",
-            value=self.agent.rag_enabled,
+            label="Использовать RAG",
+            value=self._initial_rag_enabled(),
             on_change=self._on_rag_toggle,
-            disabled=True,
-            tooltip="RAG в чате всегда включён: источники и цитаты "
-                    "под каждым ответом",
+            tooltip="Поиск по базе знаний + источники и цитаты под ответом. "
+                    "Выключите, чтобы отправлять запросы без RAG",
         )
+        # Положение из app_state применяется и к агенту (ход без RAG)
+        self.agent.set_rag_enabled(bool(self.rag_switch.value))
         self.state_button = ft.FilledTonalButton(
             "📋 Состояние диалога",
             on_click=self._on_dialog_state,
@@ -131,8 +176,23 @@ class ChatView:
             tooltip="Новый диалог: сброс памяти задачи и истории "
                     "(новый session_id)",
         )
+        # ТЗ ai_1_25: переключатель провайдера LLM в шапке чата
+        self.provider_dropdown = ft.Dropdown(
+            width=250,
+            label="Провайдер",
+            options=[
+                ft.DropdownOption(key=provider_id, content=ft.Text(
+                    spec["name"], size=12))
+                for provider_id, spec in LLMProviderFactory.PROVIDERS.items()
+            ],
+            value=self._current_provider_id(),
+            on_select=self._on_provider_change,
+            tooltip="DeepSeek — облако; Ollama — локальные модели "
+                    "(нужен запущенный ollama serve)",
+        )
         self.chat_actions_row = ft.Row(
-            [self.state_button, self.new_dialog_button],
+            [self.provider_dropdown, self.state_button,
+             self.new_dialog_button],
             spacing=8, wrap=True,
         )
         self.top_k_field = ft.TextField(
@@ -279,8 +339,33 @@ class ChatView:
 
     def _on_rag_toggle(self, event=None) -> None:
         # Переключатель работает на лету: режим применяется со следующего хода
-        self.agent.set_rag_enabled(bool(self.rag_switch.value))
+        enabled = bool(self.rag_switch.value)
+        self.agent.set_rag_enabled(enabled)
+        self._save_rag_enabled(enabled)
+        self._set_status(
+            "RAG включён: поиск по базе знаний, источники и цитаты"
+            if enabled
+            else "RAG выключен: запросы уходят без поиска по базе знаний")
         self.refresh_rag_status()
+        self.update()
+
+    def _initial_rag_enabled(self) -> bool:
+        """Начальное положение переключателя: выбор из app_state.
+
+        Нет сохранённого значения (или хранилища) — состояние агента
+        (RAG включён по умолчанию).
+        """
+        store = getattr(self.app, "app_state", None)
+        saved = store.get(RAG_ENABLED_KEY) if store is not None else None
+        if saved is None:
+            return bool(self.agent.rag_enabled)
+        return str(saved).strip() == "1"
+
+    def _save_rag_enabled(self, enabled: bool) -> None:
+        """Сохраняет положение переключателя в app_state (не фатально)."""
+        store = getattr(self.app, "app_state", None)
+        if store is not None:
+            store.set(RAG_ENABLED_KEY, "1" if enabled else "0")
 
     def _on_rag_mode_change(self, event=None) -> None:
         try:
@@ -304,6 +389,10 @@ class ChatView:
         except ValueError:
             self.top_k_field.value = str(self.agent.top_k)
         self.refresh_rag_status()
+
+    def _on_provider_change(self, event=None) -> None:
+        self._schedule(self._switch_provider_async,
+                       str(self.provider_dropdown.value or ""))
 
     def _on_clear(self, event=None) -> None:
         self._schedule(self._clear_async)
@@ -398,6 +487,103 @@ class ChatView:
             "Новый диалог: память задачи и история сброшены")
         self.update()
 
+    # ------------------------------------------------------------------
+    # Переключение провайдера LLM (ТЗ ai_1_25)
+    # ------------------------------------------------------------------
+    def _core_agent(self):
+        """Ядро DeepSeekAgent (в legacy-заглушках тестов — сам agent)."""
+        return getattr(self.agent, "core", self.agent)
+
+    def _current_provider_id(self) -> str:
+        """Идентификатор активного провайдера ядра."""
+        return str(getattr(self._core_agent(), "provider_id", "deepseek")
+                   or "deepseek")
+
+    def schedule_provider_switch(self, provider_id: str) -> None:
+        """Переключение провайдера через event loop (восстановление выбора
+        из app_state при старте приложения)."""
+        self.provider_dropdown.value = provider_id
+        self._schedule(self._switch_provider_async, provider_id)
+
+    def _save_provider_choice(self, provider_id: str) -> None:
+        """Сохраняет выбор в app_state (переживает перезапуск приложения).
+
+        Хранилище «неубиваемое»: ошибка SQLite уже гасится внутри
+        AppStateStore.set — выбор просто не сохранится.
+        """
+        store = getattr(self.app, "app_state", None)
+        if store is not None:
+            store.set(ACTIVE_PROVIDER_KEY, provider_id)
+
+    def _prepare_and_switch(self, provider_id: str) -> Dict[str, Any]:
+        """Подготовка локального провайдера + switch_provider ядра.
+
+        Для ollama_*: лаунчер гарантирует запущенный сервер (автозапуск
+        в новом окне, если не работает) и загруженную модель (ollama
+        pull при первом использовании). Блокирующие вызовы — вызывающий
+        поток (asyncio.to_thread), UI не блокируется.
+
+        Raises:
+            ProviderUnavailableError: сервер не поднялся / модель не
+                загрузилась / провайдер недоступен.
+            ValueError: неизвестное имя провайдера.
+        """
+        spec = LLMProviderFactory.spec(provider_id)
+        core = self._core_agent()
+        mock = bool(getattr(core, "_mock_mode", False))
+        if spec["requires_ollama"] and not mock:
+            launcher = OllamaLauncher()
+            if not launcher.ensure_running(timeout=30.0):
+                raise ProviderUnavailableError(
+                    "Ollama не запущен и не смог запуститься "
+                    "автоматически. Установите Ollama (ollama.com) и "
+                    "проверьте, что команда «ollama serve» работает.")
+            model_ok, model_message = launcher.ensure_model(spec["model"])
+            if not model_ok:
+                raise ProviderUnavailableError(model_message)
+        return core.switch_provider(provider_id)
+
+    async def _switch_provider_async(self, provider_id: str) -> None:
+        """Полный цикл переключения: подготовка → ядро → app_state → UI.
+
+        Недоступный провайдер не меняет состояние ядра: показывается
+        модалка ошибки, выпадающий список откатывается к активному
+        провайдеру.
+        """
+        provider_id = str(provider_id or "")
+        if not provider_id:
+            return
+        # Выбранное значение выставляется и при прямом вызове
+        # (восстановление из app_state), не только из on_select
+        self.provider_dropdown.value = provider_id
+        self._set_status("Переключение провайдера…")
+        self.update()
+        try:
+            result = await asyncio.to_thread(
+                self._prepare_and_switch, provider_id)
+        except ProviderUnavailableError as exc:
+            self._open_dialog(build_provider_error_dialog(
+                str(exc), self._on_close_dialog))
+            self.provider_dropdown.value = self._current_provider_id()
+            self._set_status(f"Провайдер не переключён: {exc}", error=True)
+            self.update()
+            return
+        except ValueError as exc:  # неизвестное имя провайдера
+            self._open_dialog(build_provider_error_dialog(
+                str(exc), self._on_close_dialog))
+            self.provider_dropdown.value = self._current_provider_id()
+            self._set_status(f"Провайдер не переключён: {exc}", error=True)
+            self.update()
+            return
+        self._save_provider_choice(provider_id)
+        if "warning" in result:
+            self._open_dialog(build_provider_warning_dialog(
+                str(result["warning"]), self._on_close_dialog))
+        self._set_status(
+            f"Провайдер: {result.get('name')} · модель {result.get('model')}")
+        self.refresh_rag_status()
+        self.update()
+
     def _schedule(self, handler, *args) -> None:
         """Запускает async-задачу на event loop Flet.
 
@@ -471,15 +657,24 @@ class ChatView:
     # Служебное
     # ------------------------------------------------------------------
     def refresh_rag_status(self) -> None:
-        """Статус базы знаний: число чанков + режим + top_k + порог."""
+        """Статус: активный провайдер + число чанков + режим + параметры."""
+        core = self._core_agent()
+        provider = getattr(core, "provider", None)
+        if provider is not None:
+            provider_label = provider.describe()
+        else:
+            provider_label = (
+                f"{LLMProviderFactory.PROVIDERS['deepseek']['name']}"
+                f" · {getattr(core, 'model', '')}"
+            )
         try:
             chunks = self.agent.count_chunks()
         except Exception:
             chunks = 0
         mode = "включён" if self.agent.rag_enabled else "выключен"
         self.rag_status_text.value = (
-            f"RAG {mode} · база: {chunks} чанков · "
-            f"{self.agent.rag_mode} · top_k: {self.agent.top_k}→"
+            f"Провайдер: {provider_label} · RAG {mode} · база: {chunks} "
+            f"чанков · {self.agent.rag_mode} · top_k: {self.agent.top_k}→"
             f"{self.agent.top_k_search} · порог: "
             f"{self.agent.similarity_threshold:.2f}"
         )

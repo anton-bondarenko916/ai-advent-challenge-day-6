@@ -75,6 +75,11 @@ from .invariant_models import Invariant, InvariantCategory
 from .invariant_prompt_builder import build_invariants_block
 from .invariant_repository import InvariantRepository
 from .invariant_validator import Conflict, InvariantValidator
+from .llm_providers import (
+    BaseLLMProvider,
+    LLMProviderFactory,
+    ProviderUnavailableError,
+)
 from .profile_prompt_builder import build_system_prompt
 from .profile_repository import ProfileRepository
 from .storage import ContextStore
@@ -194,6 +199,7 @@ class DeepSeekAgent:
         geo_client: Optional[Any] = None,
         weather_client: Optional[Any] = None,
         max_tool_rounds: Optional[int] = None,
+        provider: Optional[BaseLLMProvider] = None,
     ) -> None:
         """Инициализирует агента и сохраняет системный промпт в истории.
 
@@ -263,12 +269,30 @@ class DeepSeekAgent:
                 weather_server.py); None — инструмент get_weather выключен.
             max_tool_rounds: лимит циклов «LLM → tool_calls → результат →
                 LLM» за один ход (agentic loop); None — 5.
+            provider: провайдер LLM (BaseLLMProvider, ТЗ ai_1_25); None —
+                облако DeepSeek (клиент создаётся как раньше). Провайдер
+                поставляет клиента, модель и base_url; переключение на
+                лету — :meth:`switch_provider`.
 
         Raises:
             AgentConfigError: если какой-либо параметр некорректен.
         """
+        # Провайдер LLM: источник клиента/модели/base_url. Задаётся ДО
+        # профиля, чтобы guard в _apply_profile_settings не дал настройкам
+        # профиля подменить модель чужого провайдера.
+        self._provider: Optional[BaseLLMProvider] = provider
+        self._provider_base_url: str = (
+            provider.base_url if provider is not None
+            else DeepSeekAgent._base_url
+        )
+        # MCP-инструменты включены; switch_provider отключает их, если
+        # модель провайдера не умеет tool calling
+        self._provider_tools_enabled: bool = True
+
         # Заполняем значения по умолчанию
         self.model = model or "deepseek-v4-flash"
+        if self._provider is not None:
+            self.model = self._provider.model
         self.system_prompt = system_prompt or (
             "Ты полезный AI-ассистент. Отвечай четко и по делу."
         )
@@ -456,15 +480,19 @@ class DeepSeekAgent:
         self._rag_block: Optional[str] = None
         self._rag_sources: Optional[List[Dict[str, Any]]] = None
 
-        # Клиент создаётся только вне mock-режима
+        # Клиент создаётся только вне mock-режима; при активном провайдере
+        # используется его клиент (base_url из конфига провайдера)
         self._client: Optional[OpenAI] = None
         if not self._mock_mode:
-            self._client = OpenAI(
-                api_key=self._api_key,
-                base_url=DeepSeekAgent._base_url,
-                timeout=60.0,
-                max_retries=1,
-            )
+            if self._provider is not None:
+                self._client = self._provider.client
+            else:
+                self._client = OpenAI(
+                    api_key=self._api_key,
+                    base_url=self._provider_base_url,
+                    timeout=60.0,
+                    max_retries=1,
+                )
 
         # История начинается с системного промпта
         self._message_history: List[Message] = []
@@ -806,6 +834,13 @@ class DeepSeekAgent:
 
             # Применяем изменения
             if "model" in kwargs:
+                provider = self._provider
+                if provider is not None and not provider.owns_model(model):
+                    raise AgentConfigError(
+                        f"Модель {model!r} не относится к провайдеру "
+                        f"{provider.name}. Доступные модели: "
+                        f"{', '.join(provider.model_choices())}."
+                    )
                 self.model = model
                 # Суммаризатор следует за моделью диалога, если для сжатия
                 # не задана отдельная модель
@@ -829,12 +864,17 @@ class DeepSeekAgent:
                 self.max_tokens = max_tokens
             if "mock_mode" in kwargs and new_mock != self._mock_mode:
                 self._mock_mode = new_mock
-                self._client = None if new_mock else OpenAI(
-                    api_key=self._api_key,
-                    base_url=DeepSeekAgent._base_url,
-                    timeout=60.0,
-                    max_retries=1,
-                )
+                if new_mock:
+                    self._client = None
+                elif self._provider is not None:
+                    self._client = self._provider.client
+                else:
+                    self._client = OpenAI(
+                        api_key=self._api_key,
+                        base_url=self._provider_base_url,
+                        timeout=60.0,
+                        max_retries=1,
+                    )
             if "max_history_messages" in kwargs:
                 self._max_history = new_max_history
                 # В режиме стратегий «сырая» история не урезается:
@@ -850,6 +890,114 @@ class DeepSeekAgent:
                 elif any(k in kwargs for k in
                          ("model", "temperature", "max_tokens")):
                     self._persist_params()
+
+    # ------------------------------------------------------------------
+    # Провайдер LLM: облако DeepSeek ↔ локальная Ollama (ТЗ ai_1_25)
+    # ------------------------------------------------------------------
+
+    @property
+    def provider(self) -> Optional[BaseLLMProvider]:
+        """Активный провайдер LLM (None — облако DeepSeek напрямую)."""
+        return self._provider
+
+    @property
+    def provider_id(self) -> str:
+        """Идентификатор провайдера (deepseek / ollama_qwen / …)."""
+        return self._provider.id if self._provider is not None else "deepseek"
+
+    def switch_provider(self, provider_name: str,
+                        api_key: Optional[str] = None) -> Dict[str, Any]:
+        """Переключает провайдера LLM на лету (агент не пересоздаётся).
+
+        Порядок (ТЗ): фабрика создаёт провайдера → проверка доступности
+        (для Ollama — сервер запущен и модель загружена) → замена
+        клиента, модели и base_url ядра. История диалога, профили,
+        память и хранилища не затрагиваются.
+
+        MCP-инструменты включаются только для облачных провайдеров с
+        tool calling. Локальные провайдеры (``local = True``) работают
+        БЕЗ инструментов независимо от capability модели: небольшие
+        модели склонны к ложным вызовам (например, search_news на
+        вопрос «факт о космосе»), поэтому запрос идёт только к модели —
+        без tools и без блока правил инструментов в system-промпте.
+        В mock-режиме проверка доступности пропускается (сети нет),
+        политика инструментов детерминирована: local-флаг не требует
+        HTTP, DeepSeek поддерживает tool calling всегда.
+
+        Args:
+            provider_name: ключ реестра LLMProviderFactory.PROVIDERS
+                (deepseek / ollama_qwen / ollama_llama).
+            api_key: ключ DeepSeek API; None — из окружения/агента.
+
+        Returns:
+            {"success": True, "provider", "name", "model"} либо тот же
+            словарь с "warning" (локальный провайдер или нет tool
+            calling — MCP отключён).
+
+        Raises:
+            ProviderUnavailableError: провайдер недоступен; состояние
+                агента при этом не меняется.
+            ValueError: неизвестное имя провайдера.
+        """
+        new_provider = LLMProviderFactory.create(
+            provider_name,
+            # Без явного ключа — ключ агента (переключение обратно на
+            # DeepSeek не должно зависеть от переменных окружения)
+            api_key=api_key if api_key is not None
+            else (self._api_key or None),
+        )
+        if not self._mock_mode and not new_provider.is_available():
+            raise ProviderUnavailableError(
+                f"Провайдер '{new_provider.name}' недоступен. Проверьте, "
+                f"запущен ли Ollama ({new_provider.base_url}) и загружена "
+                f"ли модель {new_provider.model}."
+            )
+        with self._lock:
+            previous = self.provider_id
+            self._provider = new_provider
+            self._provider_base_url = new_provider.base_url
+            self.model = new_provider.model
+            if not self._mock_mode:
+                self._client = new_provider.client
+            # Суммаризатор и стратегия следуют за моделью (как update_config)
+            if (self._summarizer is not None and not str(
+                    (self._summary_settings or {}).get("model") or "")):
+                self._summarizer.model = self.model
+            if self._strategy is not None:
+                self._strategy = self._make_strategy()
+            # Порядок условий важен: для локальных провайдеров capability
+            # НЕ проверяется (лишний HTTP-запрос к /api/show не нужен)
+            if not new_provider.local and new_provider.supports_tool_calling():
+                self._provider_tools_enabled = True
+                logger.info(
+                    "Провайдер переключён: %s → %s (%s), MCP-инструменты "
+                    "включены.", previous, new_provider.id,
+                    new_provider.model,
+                )
+                return {
+                    "success": True,
+                    "provider": new_provider.id,
+                    "name": new_provider.name,
+                    "model": new_provider.model,
+                }
+            self._provider_tools_enabled = False
+            warning = (
+                "Локальная модель: запросы идут только к ней — "
+                "MCP-инструменты (напоминания, новости, погода) отключены."
+                if new_provider.local
+                else ("Модель не поддерживает tool calling. "
+                      "MCP-инструменты отключены.")
+            )
+            logger.warning(
+                "Провайдер %s: MCP-инструменты отключены (%s).",
+                new_provider.id, warning,
+            )
+            return {
+                "warning": warning,
+                "provider": new_provider.id,
+                "name": new_provider.name,
+                "model": new_provider.model,
+            }
 
     # ------------------------------------------------------------------
     # Персонализация: профиль пользователя (третий слой памяти)
@@ -886,13 +1034,24 @@ class DeepSeekAgent:
         settings = self._profile_settings
         if settings is None:
             return
-        try:
-            self.model = utils.validate_model(settings.model)
-        except AgentConfigError as exc:
-            logger.warning(
-                "Профиль: некорректная модель %r (%s) — оставлено %s.",
-                settings.model, exc, self.model,
+        provider = getattr(self, "_provider", None)
+        if provider is not None and not provider.owns_model(settings.model):
+            # Профиль хранит модель другого провайдера (например, DeepSeek
+            # при активной Ollama): модель не трогаем, остальные параметры
+            # применяются как обычно
+            logger.info(
+                "Профиль: модель %r не относится к провайдеру %s — "
+                "оставлена модель %s.",
+                settings.model, provider.name, self.model,
             )
+        else:
+            try:
+                self.model = utils.validate_model(settings.model)
+            except AgentConfigError as exc:
+                logger.warning(
+                    "Профиль: некорректная модель %r (%s) — оставлено %s.",
+                    settings.model, exc, self.model,
+                )
         try:
             self.temperature = utils.validate_temperature(settings.temperature)
         except (AgentConfigError, TypeError, ValueError) as exc:
@@ -1820,7 +1979,10 @@ class DeepSeekAgent:
         Returns:
             Список словарей ``{"type": "function", "function": {...}}``.
         """
-        if not self._tool_clients or self._mock_mode:
+        if (not self._tool_clients or self._mock_mode
+                or not self._provider_tools_enabled):
+            # Без клиентов, в mock-режиме или когда модель провайдера не
+            # поддерживает tool calling — запрос уходит без tools
             return []
         now = time.monotonic()
         tools: List[Dict[str, Any]] = []

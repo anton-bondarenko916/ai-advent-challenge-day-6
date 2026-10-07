@@ -39,11 +39,12 @@ import flet as ft
 from app.agent import RAGChatAgent
 from app.chat_handler import ChatHandler, build_chat_extractor
 from app.task_state import TaskStateRepository
-from app.ui.chat_view import ChatView
+from app.ui.chat_view import ACTIVE_PROVIDER_KEY, ChatView
 from app.ui.comparison_view import ComparisonView
 from app.ui.knowledge_view import KnowledgeView
 from app.ui.rag_comparison_view import RAGModesView
 from app.ui.settings_view import SettingsView
+from src.app_state import AppStateStore
 from src.config import (
     get_geo_settings,
     get_news_settings,
@@ -53,6 +54,7 @@ from src.config import (
     load_config,
     validate_api_key,
 )
+from src.llm_providers import LLMProviderFactory
 from src.utils import get_logger
 
 logger = get_logger("deepseek-chat.flet")
@@ -87,6 +89,16 @@ class ChatApp:
         self.agent = agent
         self.config = config
         self.session_id = str(uuid.uuid4())
+
+        # Хранилище состояния UI (SQLite app_state): выбор провайдера LLM
+        # (ТЗ ai_1_25) и другие настройки, переживающие перезапуск.
+        # Ошибки (нет прав, занятый файл) не фатальны: выбор не сохраняется.
+        self.app_state: Optional[AppStateStore] = None
+        try:
+            self.app_state = AppStateStore(
+                get_project_path(config, "APP_STATE_PATH"))
+        except Exception as exc:  # noqa: BLE001 — состояние не критично
+            logger.warning("Хранилище app_state недоступно: %s", exc)
 
         # Память задачи (ТЗ ai_1_24): таблица task_state в БД истории;
         # отключается только вместе с хранилищем ядра
@@ -139,6 +151,28 @@ class ChatApp:
 
         page.add(ft.Column([self.tabs, body], expand=True, spacing=8))
         page.on_disconnect = self._on_disconnect
+        self._restore_saved_provider()
+
+    def _restore_saved_provider(self) -> None:
+        """Восстанавливает провайдера, выбранного в прошлой сессии (ai_1_25).
+
+        Выбор читается из app_state (ключ active_provider); неизвестное
+        имя игнорируется с предупреждением. Переключение идёт через
+        event loop (page.run_task): может потребоваться автозапуск
+        Ollama и загрузка модели.
+        """
+        if self.app_state is None:
+            return
+        saved = self.app_state.get(ACTIVE_PROVIDER_KEY)
+        if not saved or saved == self.agent.core.provider_id:
+            return
+        if saved not in LLMProviderFactory.PROVIDERS:
+            logger.warning(
+                "Сохранённый провайдер %r неизвестен — остаётся DeepSeek.",
+                saved)
+            return
+        logger.info("Восстановление провайдера из app_state: %s", saved)
+        self.chat_view.schedule_provider_switch(saved)
 
     # ------------------------------------------------------------------
     # Сервисные методы для вкладок

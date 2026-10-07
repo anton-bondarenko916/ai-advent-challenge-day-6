@@ -17,8 +17,14 @@ from typing import Optional
 # Допустимые параметры
 # ---------------------------------------------------------------------------
 
-# Список моделей, доступных в выпадающем списке
-AVAILABLE_MODELS = ("deepseek-v4-flash", "deepseek-v4-pro")
+# Список моделей, доступных в выпадающем списке (DeepSeek — облако,
+# qwen/llama — локальные модели Ollama, провайдеры src.llm_providers)
+AVAILABLE_MODELS = (
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "qwen2.5:7b",
+    "llama3.1:8b",
+)
 
 TEMPERATURE_RANGE = (0.0, 2.0)  # допустимый диапазон температуры
 MAX_TOKENS_RANGE = (1, 4096)  # допустимый диапазон max_tokens

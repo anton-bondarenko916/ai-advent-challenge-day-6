@@ -91,10 +91,33 @@ class SettingsView:
         ], spacing=12, scroll=ft.ScrollMode.AUTO)
 
     def on_show(self) -> None:
-        """Обновляет список профилей при открытии вкладки."""
+        """Обновляет список профилей и моделей при открытии вкладки.
+
+        Список моделей следует за активным провайдером (ТЗ ai_1_25):
+        DeepSeek — облачные модели, Ollama — локальная модель провайдера.
+        """
         self.profile_dropdown.options = self._profile_options()
         self.profile_dropdown.value = self._active_profile_value()
+        choices = self._model_choices()
+        self.model_dropdown.options = [
+            ft.DropdownOption(key=model, content=ft.Text(model))
+            for model in choices
+        ]
+        self.model_dropdown.value = (
+            self._core_agent().model if self._core_agent().model in choices
+            else choices[0]
+        )
         self.update()
+
+    def _core_agent(self):
+        """Ядро DeepSeekAgent (в legacy-заглушках тестов — сам agent)."""
+        return getattr(self.agent, "core", self.agent)
+
+    def _model_choices(self) -> tuple:
+        """Модели активного провайдера (без провайдера — DeepSeek)."""
+        provider = getattr(self._core_agent(), "provider", None)
+        choices = getattr(provider, "model_choices", None)
+        return tuple(choices()) if callable(choices) else MODEL_CHOICES
 
     # ------------------------------------------------------------------
     # Обработчики

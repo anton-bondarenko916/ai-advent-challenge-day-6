@@ -23,7 +23,7 @@ from app.rag.embedder import EmbedderError
 from app.rag.retriever import Retriever
 from app.rag.vector_store import VectorStore
 from app.ui import components
-from app.ui.chat_view import ChatView
+from app.ui.chat_view import RAG_ENABLED_KEY, ChatView
 from app.ui.comparison_view import (
     ComparisonView,
     load_results,
@@ -331,6 +331,57 @@ class ChatViewTest(unittest.TestCase):
         self.chat.rag_switch.value = False
         self.chat._on_rag_toggle()
         self.assertFalse(self.agent.rag_enabled)
+
+    def test_rag_switch_is_unlocked(self) -> None:
+        """Переключатель RAG доступен (ход без RAG разрешён)."""
+        self.assertFalse(self.chat.rag_switch.disabled)
+
+    def test_rag_toggle_persists_to_app_state(self) -> None:
+        class _Store:
+            def __init__(self) -> None:
+                self.saved: dict = {}
+
+            def get(self, key):
+                return self.saved.get(key)
+
+            def set(self, key, value):
+                self.saved[key] = value
+                return True
+
+        store = _Store()
+        app = make_app(self.agent)
+        app.app_state = store
+        chat = ChatView(app)
+        chat.rag_switch.value = False
+        chat._on_rag_toggle()
+        self.assertEqual(store.saved.get(RAG_ENABLED_KEY), "0")
+        chat.rag_switch.value = True
+        chat._on_rag_toggle()
+        self.assertEqual(store.saved.get(RAG_ENABLED_KEY), "1")
+
+    def test_rag_state_restored_from_app_state(self) -> None:
+        """Сохранённое «выключен» применяется к агенту при старте."""
+
+        class _Store:
+            def __init__(self, saved: dict) -> None:
+                self.saved = saved
+
+            def get(self, key):
+                return self.saved.get(key)
+
+            def set(self, key, value):
+                self.saved[key] = value
+                return True
+
+        agent = make_agent(rag_enabled=True)
+        app = make_app(agent)
+        app.app_state = _Store({RAG_ENABLED_KEY: "0"})
+        chat = ChatView(app)
+        self.assertFalse(chat.rag_switch.value)
+        self.assertFalse(agent.rag_enabled)
+        # Без сохранённого значения — состояние агента (включён)
+        chat2 = ChatView(make_app(make_agent(rag_enabled=True)))
+        self.assertTrue(chat2.rag_switch.value)
 
     def test_top_k_field(self) -> None:
         self.chat.top_k_field.value = "5"
