@@ -67,6 +67,13 @@ flet>=1.0,<2
 # (данные в app/data/chroma_db переживают перезапуск), cosine space.
 chromadb>=1.0,<2
 
+# Реестр моделей Ollama (src/llm_optimization.py, ТЗ ai_1_28): панель
+# «Оптимизация локальной модели» берёт из него список тегов (квантов)
+# через OllamaModelsClient.get_model. Пакет опционален: при его
+# отсутствии (или недоступности реестра) используется fallback-список
+# известных тегов — приложение продолжает работать.
+ollama-models>=0.3,<1
+
 # Chunking MD-документов (app/rag/chunkers.py): две стратегии —
 # RecursiveCharacterTextSplitter (fixed) и MarkdownHeaderTextSplitter
 # + RecursiveCharacterTextSplitter (structure).

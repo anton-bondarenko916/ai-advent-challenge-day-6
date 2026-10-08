@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 from openai import OpenAI
 
+from .llm_optimization import OptimizationSettings
+
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_OLLAMA_API_BASE = "http://localhost:11434"
 OLLAMA_TOOLS_TIMEOUT = 5.0
@@ -189,7 +191,8 @@ class OllamaProvider(BaseLLMProvider):
 
     def __init__(self, model: str = "qwen2.5:7b",
                  base_url: Optional[str] = None,
-                 api_base: Optional[str] = None) -> None:
+                 api_base: Optional[str] = None,
+                 optimization: Optional[Dict[str, Any]] = None) -> None:
         """Создаёт клиента поверх локального сервера Ollama.
 
         Args:
@@ -197,9 +200,14 @@ class OllamaProvider(BaseLLMProvider):
             base_url: OpenAI-совместимый эндпоинт (…/v1); None —
                 OLLAMA_BASE_URL + /v1.
             api_base: база нативного API (…/api/…); None — OLLAMA_BASE_URL.
+            optimization: настройки оптимизации инференса (ТЗ ai_1_28,
+                см. OptimizationSettings); None/пусто — дефолтное
+                поведение Ollama без модификации запросов.
         """
         self.api_base = (api_base or _ollama_api_base()).rstrip("/")
         url = (base_url or f"{self.api_base}/v1").rstrip("/")
+        self.optimization: Dict[str, Any] = dict(optimization or {})
+        self.enabled: bool = bool(self.optimization.get("enabled", False))
         # api_key обязателен для SDK, но Ollama его игнорирует
         super().__init__(
             model=model,
@@ -212,16 +220,81 @@ class OllamaProvider(BaseLLMProvider):
             ),
         )
 
+    def set_optimization(self, settings: Optional[Dict[str, Any]]) -> None:
+        """Горячее обновление настроек оптимизации (панель в UI).
+
+        Args:
+            settings: новые настройки; None/пусто — оптимизация снята.
+        """
+        self.optimization = dict(settings or {})
+        self.enabled = bool(self.optimization.get("enabled", False))
+
+    def apply_optimization(
+            self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Патчит запрос chat.completions по настройкам оптимизации.
+
+        Оптимизация выключена — запрос возвращается как есть (дефолты
+        Ollama). Включена:
+
+        * ``extra_body={"options": {...}}`` с параметрами Ollama —
+          температура, ``num_predict`` (аналог max_tokens!), ``num_ctx``,
+          ``top_p``, ``repeat_penalty``;
+        * кастомный системный промпт добавляется СВЕРХУ существующего
+          system-сообщения (не заменяет его); сообщения копируются —
+          история диалога ядра не мутируется.
+
+        Args:
+            request: параметры запроса (model, messages, ...).
+
+        Returns:
+            Патченная КОПИЯ словаря запроса (при выключенной оптимизации —
+            исходный объект без копии).
+        """
+        if not self.enabled:
+            return request
+        defaults = OptimizationSettings.DEFAULTS
+        options = {
+            "temperature": float(self.optimization.get(
+                "temperature", defaults["temperature"])),
+            # num_predict — аналог max_tokens в Ollama
+            "num_predict": int(self.optimization.get(
+                "max_tokens", defaults["max_tokens"])),
+            "num_ctx": int(self.optimization.get(
+                "num_ctx", defaults["num_ctx"])),
+            "top_p": float(self.optimization.get(
+                "top_p", defaults["top_p"])),
+            "repeat_penalty": float(self.optimization.get(
+                "repeat_penalty", defaults["repeat_penalty"])),
+        }
+        patched = dict(request)
+        extra_body = dict(patched.get("extra_body") or {})
+        extra_body["options"] = options
+        patched["extra_body"] = extra_body
+        custom_system = str(
+            self.optimization.get("system_prompt") or "").strip()
+        if custom_system:
+            messages = [dict(message)
+                        for message in (patched.get("messages") or [])]
+            if messages and messages[0].get("role") == "system":
+                messages[0]["content"] = (
+                    f"{custom_system}\n\n{messages[0].get('content') or ''}")
+            else:
+                messages.insert(
+                    0, {"role": "system", "content": custom_system})
+            patched["messages"] = messages
+        return patched
+
     def chat_completion(self, messages: List[Dict[str, Any]],
                         **kwargs: Any) -> Dict[str, Any]:
         # Убираем параметры облачных API, которые Ollama может не принять
         kwargs.pop("reasoning_effort", None)
         kwargs.pop("thinking", None)
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
+        request = self.apply_optimization({
+            "model": self.model,
+            "messages": messages,
             **kwargs,
-        )
+        })
+        response = self.client.chat.completions.create(**request)
         message = response.choices[0].message
         return {
             "content": message.content,
@@ -320,13 +393,18 @@ class LLMProviderFactory:
 
     @classmethod
     def create(cls, provider_name: str,
-               api_key: Optional[str] = None) -> BaseLLMProvider:
+               api_key: Optional[str] = None,
+               optimization: Optional[Dict[str, Any]] = None
+               ) -> BaseLLMProvider:
         """Создаёт провайдера по имени.
 
         Args:
             provider_name: ключ реестра (deepseek / ollama_qwen / …).
             api_key: ключ DeepSeek API; None — взять DEEPSEEK_API_KEY
                 из окружения (для Ollama не используется).
+            optimization: настройки оптимизации локальной модели
+                (ТЗ ai_1_28); передаются только Ollama-провайдерам,
+                для DeepSeek игнорируются.
 
         Returns:
             Готовый провайдер (BaseLLMProvider).
@@ -343,7 +421,8 @@ class LLMProviderFactory:
             )
         # id/name инстансу: ключ реестра знает только фабрика
         # (ollama_qwen / ollama_llama), подпись — как в UI
-        provider = OllamaProvider(model=spec["model"])
+        provider = OllamaProvider(model=spec["model"],
+                                  optimization=optimization)
         provider.id = provider_name
         provider.name = spec["name"]
         return provider

@@ -289,6 +289,11 @@ class DeepSeekAgent:
         # модель провайдера не умеет tool calling
         self._provider_tools_enabled: bool = True
 
+        # Настройки оптимизации локальной модели (ТЗ ai_1_28): глобальные
+        # (вне профилей), применяются к Ollama-провайдерам — текущему и
+        # всем созданным позже через switch_provider
+        self._ollama_optimization: Dict[str, Any] = {}
+
         # Заполняем значения по умолчанию
         self.model = model or "deepseek-v4-flash"
         if self._provider is not None:
@@ -945,6 +950,9 @@ class DeepSeekAgent:
             # DeepSeek не должно зависеть от переменных окружения)
             api_key=api_key if api_key is not None
             else (self._api_key or None),
+            # Настройки оптимизации следуют за Ollama-провайдерами
+            # (ТЗ ai_1_28): панель в UI пишет их в _ollama_optimization
+            optimization=dict(self._ollama_optimization),
         )
         if not self._mock_mode and not new_provider.is_available():
             raise ProviderUnavailableError(
@@ -998,6 +1006,49 @@ class DeepSeekAgent:
                 "name": new_provider.name,
                 "model": new_provider.model,
             }
+
+    # ------------------------------------------------------------------
+    # Оптимизация локальной модели Ollama (ТЗ ai_1_28)
+    # ------------------------------------------------------------------
+
+    @property
+    def ollama_optimization(self) -> Dict[str, Any]:
+        """Настройки оптимизации локальной модели (глобальные)."""
+        return dict(self._ollama_optimization)
+
+    def set_ollama_optimization(
+            self, settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Обновляет настройки оптимизации локальной модели.
+
+        Настройки глобальные (вне профилей): применяются к активному
+        Ollama-провайдеру сразу (горячо, через ``set_optimization``) и
+        передаются фабрикой всем провайдерам, созданным позже через
+        :meth:`switch_provider`. Для DeepSeek-провайдера значения просто
+        запоминаются — до переключения на Ollama они ни на что не влияют.
+        Санитизация (типы и диапазоны) — OptimizationSettings.sanitize.
+
+        Args:
+            settings: новые настройки; None/пусто — оптимизация снята.
+
+        Returns:
+            Санитизированный словарь, который сохранён в ядре.
+        """
+        from .llm_optimization import OptimizationSettings
+
+        clean = OptimizationSettings.sanitize(settings)
+        with self._lock:
+            self._ollama_optimization = clean
+            apply_settings = getattr(self._provider, "set_optimization",
+                                     None)
+            if callable(apply_settings):
+                apply_settings(clean)
+        logger.info(
+            "Оптимизация локальной модели: enabled=%s, temperature=%s, "
+            "num_predict=%s, num_ctx=%s, top_p=%s, repeat_penalty=%s",
+            clean["enabled"], clean["temperature"], clean["max_tokens"],
+            clean["num_ctx"], clean["top_p"], clean["repeat_penalty"],
+        )
+        return clean
 
     # ------------------------------------------------------------------
     # Персонализация: профиль пользователя (третий слой памяти)
@@ -1898,6 +1949,15 @@ class DeepSeekAgent:
         # Сначала tools: от их наличия зависит и system-блок правил
         tools = self._get_tools_for_llm()
         request = self._build_request()
+        # Параметры оптимизации локальной модели (ТЗ ai_1_28): провайдер
+        # Ollama добавляет extra_body с options и кастомный system-промпт
+        # (копия сообщений — история не мутируется). Только для основного
+        # хода: служебные вызовы (суммаризатор, инварианты, задачи) имеют
+        # собственные бюджеты токенов и промпты.
+        apply_optimization = getattr(self._provider,
+                                     "apply_optimization", None)
+        if callable(apply_optimization):
+            request = apply_optimization(request)
         if tools:
             request["tools"] = tools
             request["tool_choice"] = "auto"

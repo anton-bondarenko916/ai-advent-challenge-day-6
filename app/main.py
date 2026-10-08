@@ -100,6 +100,19 @@ class ChatApp:
         except Exception as exc:  # noqa: BLE001 — состояние не критично
             logger.warning("Хранилище app_state недоступно: %s", exc)
 
+        # Оптимизация локальной модели (ТЗ ai_1_28): глобальные настройки
+        # из app_state применяются к ядру до первого хода и переключения
+        # провайдера (список полей — в панели вкладки «Настройки»)
+        if self.app_state is not None:
+            try:
+                from src.llm_optimization import OptimizationSettings
+                settings = OptimizationSettings.load(self.app_state)
+                getattr(self.agent, "core", self.agent) \
+                    .set_ollama_optimization(settings)
+            except Exception as exc:  # noqa: BLE001 — не критично
+                logger.warning(
+                    "Настройки оптимизации не восстановлены: %s", exc)
+
         # Память задачи (ТЗ ai_1_24): таблица task_state в БД истории;
         # отключается только вместе с хранилищем ядра
         self.task_state_repo: Optional[TaskStateRepository] = None

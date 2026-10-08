@@ -13,6 +13,7 @@ from typing import Any, List, Optional
 import flet as ft
 
 from app.ui import components
+from app.ui.optimization_view import OptimizationPanel
 from src.utils import (
     validate_max_tokens,
     validate_model,
@@ -73,6 +74,10 @@ class SettingsView:
         )
         self.status_text = ft.Text("", size=12, expand=True)
 
+        # Оптимизация локальной модели (ТЗ ai_1_28): секция с рамкой
+        # под основными настройками; глобальные настройки в app_state
+        self.optimization_panel = OptimizationPanel(app)
+
     # ------------------------------------------------------------------
     # Компоновка
     # ------------------------------------------------------------------
@@ -88,6 +93,7 @@ class SettingsView:
             ], spacing=12, wrap=True),
             ft.Row([self.save_button, self.status_text], spacing=12),
             self.rag_info_text,
+            self.optimization_panel.build(),
         ], spacing=12, scroll=ft.ScrollMode.AUTO)
 
     def on_show(self) -> None:
@@ -107,6 +113,7 @@ class SettingsView:
             self._core_agent().model if self._core_agent().model in choices
             else choices[0]
         )
+        self.optimization_panel.on_show()
         self.update()
 
     def _core_agent(self):
