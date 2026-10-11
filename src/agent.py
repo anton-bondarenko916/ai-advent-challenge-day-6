@@ -294,6 +294,10 @@ class DeepSeekAgent:
         # всем созданным позже через switch_provider
         self._ollama_optimization: Dict[str, Any] = {}
 
+        # Удалённый доступ (ТЗ ai_1_30): URL Nginx-прокси + API Key +
+        # DDNS — та же логика «глобальных Ollama-настроек», что и выше
+        self._ollama_remote_access: Dict[str, Any] = {}
+
         # Заполняем значения по умолчанию
         self.model = model or "deepseek-v4-flash"
         if self._provider is not None:
@@ -950,9 +954,11 @@ class DeepSeekAgent:
             # DeepSeek не должно зависеть от переменных окружения)
             api_key=api_key if api_key is not None
             else (self._api_key or None),
-            # Настройки оптимизации следуют за Ollama-провайдерами
-            # (ТЗ ai_1_28): панель в UI пишет их в _ollama_optimization
+            # Настройки оптимизации и удалённого доступа следуют за
+            # Ollama-провайдерами (ТЗ ai_1_28 / ai_1_30): панель в UI
+            # пишет их в _ollama_optimization / _ollama_remote_access
             optimization=dict(self._ollama_optimization),
+            remote_access=dict(self._ollama_remote_access),
         )
         if not self._mock_mode and not new_provider.is_available():
             raise ProviderUnavailableError(
@@ -1047,6 +1053,51 @@ class DeepSeekAgent:
             "num_predict=%s, num_ctx=%s, top_p=%s, repeat_penalty=%s",
             clean["enabled"], clean["temperature"], clean["max_tokens"],
             clean["num_ctx"], clean["top_p"], clean["repeat_penalty"],
+        )
+        return clean
+
+    # ------------------------------------------------------------------
+    # Удалённый доступ к Ollama через Nginx-прокси (ТЗ ai_1_30)
+    # ------------------------------------------------------------------
+
+    @property
+    def ollama_remote_access(self) -> Dict[str, Any]:
+        """Настройки удалённого доступа Ollama (глобальные)."""
+        return dict(self._ollama_remote_access)
+
+    def set_ollama_remote_access(
+            self, settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Обновляет настройки удалённого доступа (прокси + DDNS).
+
+        Аналогично оптимизации: настройки глобальные (вне профилей),
+        применяются к активному Ollama-провайдеру сразу (горячо, через
+        ``set_remote_access`` — пересборка клиента OpenAI SDK) и
+        передаются фабрикой всем провайдерам, созданным позже через
+        :meth:`switch_provider`. DeepSeek-провайдер их игнорирует.
+        Санитизация — RemoteAccessSettings.sanitize.
+
+        Args:
+            settings: новые настройки; None/пусто — локальный режим.
+
+        Returns:
+            Санитизированный словарь, который сохранён в ядре.
+        """
+        from .remote_access import RemoteAccessSettings
+
+        clean = RemoteAccessSettings.sanitize(settings)
+        with self._lock:
+            self._ollama_remote_access = clean
+            apply_settings = getattr(self._provider, "set_remote_access",
+                                     None)
+            if callable(apply_settings):
+                apply_settings(clean)
+        # Ключ не пишем в журнал даже частично — только факт активности
+        logger.info(
+            "Удалённый доступ Ollama: proxy=%s, api_key задан=%s, "
+            "ddns=%s (%s), rate_limit=%s r/s",
+            clean["proxy_url"] or "выключен (локальный режим)",
+            bool(clean["api_key"]), clean["ddns_domain"] or "—",
+            clean["ddns_provider"], clean["rate_limit"],
         )
         return clean
 

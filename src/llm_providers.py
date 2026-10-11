@@ -13,13 +13,18 @@
 Локальные модели могут не поддерживать tool calling: OllamaProvider
 проверяет capability ``tools`` через ``/api/show`` и сообщает ядру —
 без поддержки инструменты MCP не отправляются в запрос.
+
+Удалённый доступ (ТЗ ai_1_30): OllamaProvider умеет работать через
+Nginx-прокси (DDNS-домен, API Key, HTTPS) — заданы ``proxy_url`` и
+``api_key`` в настройках remote_access, запросы и проверки доступности
+идут через прокси с заголовком Authorization; иначе — локальный режим.
 """
 
 from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from openai import OpenAI
@@ -30,6 +35,9 @@ DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_OLLAMA_API_BASE = "http://localhost:11434"
 OLLAMA_TOOLS_TIMEOUT = 5.0
 OLLAMA_TAGS_TIMEOUT = 3.0
+# Проверка доступности через прокси: сеть длиннее локальной петли
+# (DNS + TLS + роутер), локальный таймаут 3 с не подходит
+PROXY_TAGS_TIMEOUT = 10.0
 
 # Семейство моделей DeepSeek (владение моделью проверяет профиль:
 # настройки профиля не должны подменять модель чужого провайдера)
@@ -49,6 +57,18 @@ def _ollama_api_base() -> str:
 def _model_base_name(model: str) -> str:
     """Имя модели без тега (``qwen2.5:7b`` → ``qwen2.5``)."""
     return str(model or "").split(":", 1)[0].strip().lower()
+
+
+def _proxy_base(url: Any) -> str:
+    """База прокси без хвоста ``/v1`` и слешей (``""`` — не задан).
+
+    Чату нужен суффикс ``/v1`` (OpenAI-SDK), нативным эндпоинтам
+    (/api/tags, /api/show) — нет: храним базу, суффикс добавляем точечно.
+    """
+    clean = str(url or "").strip().rstrip("/")
+    if clean.endswith("/v1"):
+        clean = clean[:-3]
+    return clean
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -192,7 +212,8 @@ class OllamaProvider(BaseLLMProvider):
     def __init__(self, model: str = "qwen2.5:7b",
                  base_url: Optional[str] = None,
                  api_base: Optional[str] = None,
-                 optimization: Optional[Dict[str, Any]] = None) -> None:
+                 optimization: Optional[Dict[str, Any]] = None,
+                 remote_access: Optional[Dict[str, Any]] = None) -> None:
         """Создаёт клиента поверх локального сервера Ollama.
 
         Args:
@@ -203,22 +224,90 @@ class OllamaProvider(BaseLLMProvider):
             optimization: настройки оптимизации инференса (ТЗ ai_1_28,
                 см. OptimizationSettings); None/пусто — дефолтное
                 поведение Ollama без модификации запросов.
+            remote_access: настройки удалённого доступа (ТЗ ai_1_30,
+                см. RemoteAccessSettings): заданы И ``proxy_url``, И
+                ``api_key`` — запросы идут через Nginx-прокси с
+                заголовком ``Authorization: Bearer``; иначе локальный
+                режим без изменений.
         """
-        self.api_base = (api_base or _ollama_api_base()).rstrip("/")
-        url = (base_url or f"{self.api_base}/v1").rstrip("/")
+        self._local_api_base = (api_base or _ollama_api_base()).rstrip("/")
+        self.api_base = self._local_api_base
+        self.remote_access: Dict[str, Any] = dict(remote_access or {})
+        self.uses_proxy: bool = False
+        url, headers = self._resolve_endpoint(base_url)
         self.optimization: Dict[str, Any] = dict(optimization or {})
         self.enabled: bool = bool(self.optimization.get("enabled", False))
-        # api_key обязателен для SDK, но Ollama его игнорирует
+        # api_key обязателен для SDK, но Ollama его игнорирует (ключ
+        # Nginx уходит отдельным заголовком Authorization)
         super().__init__(
             model=model,
             base_url=url,
-            client=OpenAI(
-                api_key="ollama",
-                base_url=url,
-                timeout=120.0,  # локальный инференс медленнее облака
-                max_retries=1,
-            ),
+            client=self._make_client(url, headers),
         )
+
+    # ------------------------------------------------------------------
+    # Удалённый доступ: прокси-режим (ТЗ ai_1_30)
+    # ------------------------------------------------------------------
+    def _resolve_endpoint(
+            self, base_url: Optional[str]) -> Tuple[str, Optional[Dict[str, str]]]:
+        """URL чата и заголовки по настройкам удалённого доступа.
+
+        Прокси активен при заданном URL и: ключе, либо явном
+        ``use_api_key=False`` (LAN без авторизации — заголовок не
+        отправляется). ``api_base`` (база проверок /api/tags,
+        /api/show) следует за режимом: адрес прокси в нём, локальный
+        адрес — при выключении прокси (исходный хранится в
+        ``self._local_api_base``).
+
+        Returns:
+            (base_url чата, заголовки Authorization или None).
+        """
+        proxy_url = _proxy_base(self.remote_access.get("proxy_url"))
+        api_key = str(self.remote_access.get("api_key") or "").strip()
+        # Сервер без авторизации (LAN, use_api_key=False) пускает и без
+        # ключа; флаг должен быть явным False — в словарях без него
+        # (legacy/ручные) сохраняется прежнее правило «нужны оба поля»
+        allow_no_key = self.remote_access.get("use_api_key") is False
+        self.uses_proxy = bool(proxy_url and (api_key or allow_no_key))
+        if self.uses_proxy:
+            self.api_base = proxy_url
+            headers = ({"Authorization": f"Bearer {api_key}"}
+                       if api_key else None)
+            return f"{proxy_url}/v1", headers
+        self.api_base = self._local_api_base
+        return (base_url or f"{self.api_base}/v1").rstrip("/"), None
+
+    @staticmethod
+    def _make_client(base_url: str,
+                     headers: Optional[Dict[str, str]]) -> OpenAI:
+        """Клиент OpenAI SDK (default_headers переживают Authorization SDK)."""
+        kwargs: Dict[str, Any] = {
+            "api_key": "ollama",
+            "base_url": base_url,
+            "timeout": 120.0,  # локальный инференс медленнее облака
+            "max_retries": 1,
+        }
+        if headers:
+            kwargs["default_headers"] = headers
+        return OpenAI(**kwargs)
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Заголовок Authorization для прямых httpx-запросов (пусто — локально)."""
+        if not self.uses_proxy:
+            return {}
+        api_key = str(self.remote_access.get("api_key") or "").strip()
+        return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    def set_remote_access(self, settings: Optional[Dict[str, Any]]) -> None:
+        """Горячее переключение «локально ↔ через прокси» (панель в UI).
+
+        Пересобирает клиента OpenAI SDK (base_url и заголовки) и
+        обновляет базу нативных проверок /api/tags, /api/show.
+        """
+        self.remote_access = dict(settings or {})
+        url, headers = self._resolve_endpoint(None)
+        self.base_url = url
+        self.client = self._make_client(url, headers)
 
     def set_optimization(self, settings: Optional[Dict[str, Any]]) -> None:
         """Горячее обновление настроек оптимизации (панель в UI).
@@ -313,6 +402,7 @@ class OllamaProvider(BaseLLMProvider):
             response = httpx.post(
                 f"{self.api_base}/api/show",
                 json={"model": self.model},
+                headers=self._auth_headers() or None,
                 timeout=OLLAMA_TOOLS_TIMEOUT,
             )
         except Exception:
@@ -326,10 +416,17 @@ class OllamaProvider(BaseLLMProvider):
         return "tools" in capabilities
 
     def is_available(self) -> bool:
-        """Сервер запущен и модель присутствует (по /api/tags)."""
+        """Сервер запущен и модель присутствует (по /api/tags).
+
+        В прокси-режиме проверка идёт через Nginx с API Key (иначе
+        переключение на недоступный извне прокси выглядело бы успехом).
+        """
+        timeout = PROXY_TAGS_TIMEOUT if self.uses_proxy else OLLAMA_TAGS_TIMEOUT
         try:
             response = httpx.get(
-                f"{self.api_base}/api/tags", timeout=OLLAMA_TAGS_TIMEOUT)
+                f"{self.api_base}/api/tags",
+                headers=self._auth_headers() or None,
+                timeout=timeout)
         except Exception:
             return False
         if response.status_code != 200:
@@ -394,7 +491,8 @@ class LLMProviderFactory:
     @classmethod
     def create(cls, provider_name: str,
                api_key: Optional[str] = None,
-               optimization: Optional[Dict[str, Any]] = None
+               optimization: Optional[Dict[str, Any]] = None,
+               remote_access: Optional[Dict[str, Any]] = None
                ) -> BaseLLMProvider:
         """Создаёт провайдера по имени.
 
@@ -405,6 +503,9 @@ class LLMProviderFactory:
             optimization: настройки оптимизации локальной модели
                 (ТЗ ai_1_28); передаются только Ollama-провайдерам,
                 для DeepSeek игнорируются.
+            remote_access: настройки удалённого доступа (ТЗ ai_1_30):
+                URL прокси + API Key; передаются только
+                Ollama-провайдерам, для DeepSeek игнорируются.
 
         Returns:
             Готовый провайдер (BaseLLMProvider).
@@ -422,7 +523,8 @@ class LLMProviderFactory:
         # id/name инстансу: ключ реестра знает только фабрика
         # (ollama_qwen / ollama_llama), подпись — как в UI
         provider = OllamaProvider(model=spec["model"],
-                                  optimization=optimization)
+                                  optimization=optimization,
+                                  remote_access=remote_access)
         provider.id = provider_name
         provider.name = spec["name"]
         return provider

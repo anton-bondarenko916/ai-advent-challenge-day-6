@@ -112,6 +112,17 @@ class ChatApp:
             except Exception as exc:  # noqa: BLE001 — не критично
                 logger.warning(
                     "Настройки оптимизации не восстановлены: %s", exc)
+            # Удалённый доступ (ТЗ ai_1_30): URL прокси + API Key + DDNS —
+            # восстанавливаются так же, до первого хода
+            try:
+                from src.remote_access import RemoteAccessSettings
+                remote = RemoteAccessSettings.load(self.app_state)
+                getattr(self.agent, "core", self.agent) \
+                    .set_ollama_remote_access(remote)
+            except Exception as exc:  # noqa: BLE001 — не критично
+                logger.warning(
+                    "Настройки удалённого доступа не восстановлены: %s",
+                    exc)
 
         # Память задачи (ТЗ ai_1_24): таблица task_state в БД истории;
         # отключается только вместе с хранилищем ядра

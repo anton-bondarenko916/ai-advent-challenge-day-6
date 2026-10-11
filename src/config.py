@@ -179,6 +179,15 @@ DEFAULTS: Dict[str, Any] = {
     # Состояние UI (сворачивание панели MCP и т.п.): SQLite key-value
     # ------------------------------------------------------------------
     "APP_STATE_PATH": "data/app_state.db",  # путь к БД (относительно корня)
+    # ------------------------------------------------------------------
+    # Telegram-бот (ТЗ ai_1_31): long polling, ответы из локальной
+    # Ollama. Токен/ID — только через .env, в коде НЕ хардкодятся.
+    # ------------------------------------------------------------------
+    "TELEGRAM_BOT_TOKEN": "",        # токен от @BotFather; пусто — бот не стартует
+    "TELEGRAM_ALLOWED_IDS": "",      # CSV разрешённых Telegram user ID
+    "TELEGRAM_MODEL": "",            # модель по умолчанию; "" — первая из /api/tags
+    "TELEGRAM_HISTORY_LIMIT": 20,    # последних сообщений уходит в контекст
+    "TELEGRAM_DB_PATH": "data/telegram_bot.db",  # история диалогов (относительно корня)
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
@@ -207,6 +216,7 @@ _INT_KEYS = (
     "REMINDER_SERVER_PORT", "REMINDER_TOOLCALL_MAX_ROUNDS",
     "NEWS_SERVER_PORT", "NEWS_SUMMARY_MAX_TOKENS",
     "GEO_SERVER_PORT", "WEATHER_SERVER_PORT",
+    "TELEGRAM_HISTORY_LIMIT",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
@@ -951,6 +961,46 @@ def get_news_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         "summary_model": summary_model,
         "summary_max_tokens": summary_max_tokens,
         "output_dir": output_dir,
+    }
+
+
+def get_telegram_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки Telegram-бота (ТЗ ai_1_31).
+
+    Некорректные значения заменяются дефолтами с предупреждением в лог
+    (бот не должен падать из-за конфигурации). Токен и белый список
+    приходят только из окружения/.env — в коде их нет.
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"token", "allowed_ids", "model", "history_limit",
+        "db_path"}: allowed_ids — сырая CSV-строка (разбирает
+        parse_allowed_ids из tg_bot_logic); db_path — абсолютный путь
+        (относительный отсчитывается от корня проекта).
+    """
+    cfg = config if config is not None else get_config()
+
+    raw_limit = cfg.get("TELEGRAM_HISTORY_LIMIT")
+    try:
+        history_limit = int(raw_limit)
+    except (TypeError, ValueError):
+        logger = get_logger("deepseek-chat.config")
+        logger.warning(
+            "Некорректное значение TELEGRAM_HISTORY_LIMIT=%r — беру 20.",
+            raw_limit,
+        )
+        history_limit = 20
+    history_limit = min(max(history_limit, 2), 100)
+
+    return {
+        "token": str(cfg.get("TELEGRAM_BOT_TOKEN") or "").strip(),
+        "allowed_ids": str(cfg.get("TELEGRAM_ALLOWED_IDS") or "").strip(),
+        "model": str(cfg.get("TELEGRAM_MODEL") or "").strip(),
+        "history_limit": history_limit,
+        "db_path": str(get_project_path(
+            cfg, "TELEGRAM_DB_PATH")),
     }
 
 
