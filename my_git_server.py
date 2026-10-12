@@ -7,9 +7,10 @@
 Инструменты (регистрируются декоратором ``@mcp.tool()``, типы параметров
 автоматически превращаются в inputSchema, docstring — в описание для LLM):
 
-* ``get_git_log``      — последние N коммитов (hash, author, date, message);
-* ``get_git_status``   — статус рабочей директории (modified/staged/untracked);
-* ``get_git_branches`` — список локальных веток.
+* ``get_git_log``          — последние N коммитов (hash, author, date, message);
+* ``get_git_status``       — статус рабочей директории (modified/staged/untracked);
+* ``get_git_branches``     — список локальных веток;
+* ``get_current_branch``   — имя текущей ветки (git-контекст команды /help).
 
 Запуск вручную (для проверки): ``python -u my_git_server.py`` — сервер
 читает JSON-RPC из stdin до EOF. Флаг ``-u`` обязателен: без него stdout
@@ -163,6 +164,40 @@ def get_git_branches(repo_path: str) -> List[str]:
         return [(result.stderr or "").strip()]
 
     return [b.strip() for b in result.stdout.splitlines() if b.strip()]
+
+
+@mcp.tool()
+def get_current_branch(repo_path: str) -> str:
+    """Возвращает имя текущей ветки Git-репозитория.
+
+    Args:
+        repo_path: Абсолютный путь к git-репозиторию.
+
+    Returns:
+        Имя текущей ветки (например, "main"). В detached HEAD — строка
+        "detached HEAD (<короткий хеш>)". При ошибке — текст ошибки
+        строкой (вызов tools/call при этом не помечается isError:
+        пайплайн /help сам решает, как деградировать без ветки).
+    """
+    if not Path(repo_path).exists():
+        return f"Путь не существует: {repo_path}"
+
+    # branch --show-current: имя из HEAD-symref; работает и в репозитории
+    # без коммитов (unborn HEAD), в отличие от rev-parse HEAD.
+    result = _run_git(repo_path, "branch", "--show-current")
+
+    if result.returncode != 0:
+        return f"Ошибка git: {(result.stderr or '').strip()}"
+
+    branch = result.stdout.strip()
+    if branch:
+        return branch
+
+    # Пустое имя — detached HEAD: берём короткий хеш коммита.
+    head = _run_git(repo_path, "rev-parse", "--short", "HEAD")
+    if head.returncode == 0 and head.stdout.strip():
+        return f"detached HEAD ({head.stdout.strip()})"
+    return "(репозиторий без коммитов)"
 
 
 if __name__ == "__main__":

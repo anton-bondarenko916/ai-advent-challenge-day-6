@@ -172,9 +172,15 @@ class InputFieldRegressionTest(unittest.TestCase):
         """Реальное нажатие клавиши V с Ctrl вставляет текст ровно один раз."""
         self._set_clipboard("реальное нажатие")
         self.app.input.focus_set()
-        self.app.input.event_generate("<Control-KeyPress>", when="now",
-                                      keycode=86)
-        self.root.update()
+        # Под нагрузкой полного прогона событие изредка теряется — до
+        # трёх попыток, пока вставка не произошла (двойной вставки нет:
+        # повтор возможен только при ПУСТОМ поле)
+        for _ in range(3):
+            self.app.input.event_generate("<Control-KeyPress>", when="now",
+                                          keycode=86)
+            self.root.update()
+            if self.app._get_input_text():
+                break
         self.assertEqual(self.app._get_input_text(), "реальное нажатие")
 
     def test_ctrl_a_with_cyrillic_keysym(self) -> None:

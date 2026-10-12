@@ -18,6 +18,11 @@ core.switch_provider: перед ним лаунчер гарантирует, �
 провайдер даёт модалку ошибки и откат списка; выбор сохраняется в
 app_state (SQLite) и восстанавливается при следующем запуске.
 
+Команда /help: при вводе «/» в поле появляется подсказка автодополнения
+(клик подставляет команду); сообщение уходит в ChatHandler, где
+перехватывается HelpPipeline (документация проекта + git-контекст),
+память задачи не затрагивается.
+
 RAG по умолчанию включён, но переключатель разблокирован: выключенное
 положение отправляет вопрос ядру без поиска по базе знаний (память
 задачи и инструменты MCP работают как раньше). Положение переключателя
@@ -144,11 +149,14 @@ class ChatView:
             min_lines=1,
             max_lines=4,
             shift_enter=True,
-            hint_text="Сообщение (Enter — отправить, Shift+Enter — новая строка)",
+            hint_text="Сообщение (Enter — отправить, Shift+Enter — новая строка; /help — вопросы о проекте)",
             border=ft.OutlineInputBorder(border_radius=8),
             expand=True,
+            on_change=self._on_input_change,
             on_submit=self._on_send,
         )
+        # Автодополнение команд (ввод «/»): панель подсказок под полем
+        self.suggestions = ft.Column(visible=False, spacing=0)
         self.send_button = ft.IconButton(
             icon=ft.Icons.SEND,
             tooltip="Отправить",
@@ -247,6 +255,7 @@ class ChatView:
             self.chat_actions_row,
             self.controls_row,
             ft.Row([self.input_field, self.send_button], spacing=8),
+            self.suggestions,
             self.status_text,
         ], expand=True, spacing=6)
 
@@ -315,6 +324,11 @@ class ChatView:
         )
         if sources_panel is not None:
             content.controls.append(sources_panel)
+        if result.get("is_help") and result.get("git_context"):
+            # /help: git-контекст хода (ветка или пометка о недоступности)
+            content.controls.append(ft.Text(
+                f"🌿 {result['git_context']}", size=12,
+                color=components.RAG_WARNING_COLOR, selectable=True))
         tools_panel = components.tools_panel(result.get("tool_calls") or [])
         if tools_panel is not None:
             content.controls.append(tools_panel)
@@ -336,6 +350,46 @@ class ChatView:
     # ------------------------------------------------------------------
     def _on_send(self, event=None) -> None:
         self._schedule(self._send_async)
+
+    # ------------------------------------------------------------------
+    # Автодополнение команд при вводе «/» (ТЗ)
+    # ------------------------------------------------------------------
+    def _suggestion_controls(self) -> List[ft.Control]:
+        """Подсказки команд (сейчас одна: /help)."""
+        return [
+            ft.Container(
+                content=ft.Text(
+                    "/help — вопросы о проекте (документация, архитектура, git)",
+                    size=13,
+                ),
+                on_click=lambda _: self._fill_suggestion("/help "),
+                ink=True,
+                border_radius=8,
+                padding=ft.Padding(left=12, top=6, right=12, bottom=6),
+            )
+        ]
+
+    def _on_input_change(self, event=None) -> None:
+        """Ввод в поле: показывает подсказку, пока текст вида «/…»
+        (моложе 10 символов — команда ещё набирается)."""
+        text = str(self.input_field.value or "")
+        if text.startswith("/") and len(text) < 10:
+            self.suggestions.controls = self._suggestion_controls()
+            self.suggestions.visible = True
+        else:
+            self.suggestions.visible = False
+        self.update()
+
+    def _fill_suggestion(self, value: str) -> None:
+        """Клик по подсказке: подставляет команду и прячет панель."""
+        self.input_field.value = value
+        self.suggestions.visible = False
+        if self.app.page is not None:
+            try:
+                self.input_field.focus()
+            except Exception:  # noqa: BLE001 — фокус не критичен
+                pass
+        self.update()
 
     def _on_rag_toggle(self, event=None) -> None:
         # Переключатель работает на лету: режим применяется со следующего хода
@@ -613,6 +667,7 @@ class ChatView:
         self._running = True
         self.send_button.disabled = True
         self.input_field.value = ""
+        self.suggestions.visible = False
         self.add_user_message(text)
         self.show_thinking()
         self._set_status("Запрос к модели…")

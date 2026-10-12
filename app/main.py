@@ -1,10 +1,12 @@
 """Точка входа Flet-приложения DeepSeek Chat (миграция с Tkinter).
 
 Экраны (вкладки): 💬 Чат (RAG всегда включён, источники с цитатами,
-память задачи: «Состояние диалога» и «Новый диалог»), 📚 База знаний
+память задачи: «Состояние диалога» и «Новый диалог», команда /help —
+вопросы о проекте по документации с git-контекстом), 📚 База знаний
 (индексация MD), ⚖️ Сравнение (10 вопросов × 2 режима), 🔀 Сравнение
 RAG-режимов (5 режимов + автоматические метрики), ⚙️ Настройки
-(профиль, температура, max_tokens, модель).
+(профиль, температура, max_tokens, модель, оптимизация, удалённый
+доступ, документация проекта).
 
 Ядро агента — то же, что в Tkinter-версии (src.agent.DeepSeekAgent:
 профили, память, FSM задач, инварианты, MCP-инструменты).
@@ -38,6 +40,8 @@ import flet as ft
 
 from app.agent import RAGChatAgent
 from app.chat_handler import ChatHandler, build_chat_extractor
+from app.help_pipeline import HelpPipeline, build_git_mcp_client
+from app.rag.project_rag import PROJECT_DOCS_PATH_KEY, ProjectRAG
 from app.task_state import TaskStateRepository
 from app.ui.chat_view import ACTIVE_PROVIDER_KEY, ChatView
 from app.ui.comparison_view import ComparisonView
@@ -130,10 +134,23 @@ class ChatApp:
         if config.get("STORAGE_ENABLED", True):
             self.task_state_repo = TaskStateRepository(
                 get_project_path(config, "STORAGE_PATH"))
+
+        # RAG по документации проекта + команда /help: отдельная
+        # коллекция project_docs, git-контекст через my_git_server.py;
+        # /help идёт по изолированному ядру (история и память задачи
+        # основного диалога не затрагиваются)
+        self.project_rag = ProjectRAG(agent.vector_store, agent.embedder)
+        self.help_pipeline = HelpPipeline(
+            self.project_rag,
+            build_git_mcp_client(config),
+            agent,
+            project_path=self._initial_project_path(),
+        )
         self.chat_handler = ChatHandler(
             agent,
             task_state_repo=self.task_state_repo,
             extractor=build_chat_extractor(config),
+            help_pipeline=self.help_pipeline,
         )
 
         page.title = str(config.get("UI_TITLE", "DeepSeek Chat")) + " (Flet)"
@@ -176,6 +193,15 @@ class ChatApp:
         page.add(ft.Column([self.tabs, body], expand=True, spacing=8))
         page.on_disconnect = self._on_disconnect
         self._restore_saved_provider()
+
+    def _initial_project_path(self) -> str:
+        """Путь проекта для /help: сохранённый в app_state → корень из
+        конфига (MCP_GIT_REPO_PATH, по умолчанию — сам проект)."""
+        saved = (self.app_state.get(PROJECT_DOCS_PATH_KEY)
+                 if self.app_state is not None else None)
+        if saved and Path(saved).is_dir():
+            return saved
+        return str(get_project_path(self.config, "MCP_GIT_REPO_PATH"))
 
     def _restore_saved_provider(self) -> None:
         """Восстанавливает провайдера, выбранного в прошлой сессии (ai_1_25).

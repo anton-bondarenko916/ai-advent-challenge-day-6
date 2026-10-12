@@ -349,6 +349,15 @@ class RAGChatAgent:
         self._config = config
         return self
 
+    def isolated_core(self) -> DeepSeekAgent:
+        """Отдельный агент без хранилища (режим /help, как answer_once).
+
+        Лениво создаётся из копии конфигурации с STORAGE_ENABLED=False:
+        ходы не пишут историю основного чата в SQLite и не трогают его
+        память задачи/FSM. Требует bind_config (RuntimeError без него).
+        """
+        return self._comparison_agent()
+
     async def answer_once(
         self,
         question: str,

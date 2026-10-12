@@ -152,14 +152,16 @@ class _RepoCase(unittest.TestCase):
 class GitServerRegistrationTest(unittest.TestCase):
     """my_git_server: инструменты зарегистрированы, схемы корректны."""
 
-    def test_server_module_registers_three_tools(self) -> None:
-        """Сценарий 2: в FastMCP зарегистрированы все 3 инструмента."""
+    def test_server_module_registers_four_tools(self) -> None:
+        """Сценарий 2: в FastMCP зарегистрированы все 4 инструмента."""
         import my_git_server
 
         tools = asyncio.run(my_git_server.mcp.list_tools())
         names = {t.name for t in tools}
         self.assertEqual(
-            names, {"get_git_log", "get_git_status", "get_git_branches"}
+            names,
+            {"get_git_log", "get_git_status", "get_git_branches",
+             "get_current_branch"},
         )
         by_name = {t.name: t for t in tools}
         for tool in tools:
@@ -174,7 +176,8 @@ class GitServerRegistrationTest(unittest.TestCase):
         self.assertEqual(log_schema["properties"]["limit"]["default"], 10)
 
         # Остальные: единственный обязательный строковый repo_path.
-        for name in ("get_git_status", "get_git_branches"):
+        for name in ("get_git_status", "get_git_branches",
+                     "get_current_branch"):
             schema = by_name[name].inputSchema
             self.assertEqual(schema.get("required"), ["repo_path"])
             self.assertEqual(schema["properties"]["repo_path"]["type"], "string")
@@ -337,6 +340,91 @@ class GitToolsDirectTest(_RepoCase):
 
 
 # ---------------------------------------------------------------------------
+# get_current_branch: git-контекст команды /help (прямые вызовы + MCP)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(GIT_AVAILABLE, "git недоступен")
+class GetCurrentBranchDirectTest(_RepoCase):
+    """get_current_branch: имя ветки, unborn/detached HEAD, ошибки."""
+
+    def _import_server(self):
+        import my_git_server
+
+        return my_git_server
+
+    def test_returns_checked_out_branch(self) -> None:
+        server = self._import_server()
+        repo = self.make_repo("current_branch", commits=1,
+                              branches=("feature_x",))
+        _git(repo, "checkout", "feature_x")
+        self.assertEqual(
+            server.get_current_branch(str(repo)), "feature_x")
+
+    def test_returns_default_branch_without_commits(self) -> None:
+        server = self._import_server()
+        repo = self.make_repo("current_unborn")
+        self.assertIn(
+            server.get_current_branch(str(repo)), ("master", "main"))
+
+    def test_detached_head_reports_hash(self) -> None:
+        server = self._import_server()
+        repo = self.make_repo("current_detached", commits=2)
+        _git(repo, "checkout", "--detach", "HEAD")
+        result = server.get_current_branch(str(repo))
+        self.assertTrue(
+            result.startswith("detached HEAD ("), result)
+
+    def test_missing_path(self) -> None:
+        server = self._import_server()
+        result = server.get_current_branch(
+            str(_FIXTURE_BASE / "no_such_repo_branch"))
+        self.assertIn("не существует", result)
+
+    def test_not_a_repo(self) -> None:
+        server = self._import_server()
+        # ВАЖНО: каталог ВНЕ репозитория проекта — внутри tests/tmp_git_server
+        # git найдёт внешние .git (родительский репозиторий) и вернёт ветку
+        import tempfile as _tempfile
+
+        directory = Path(_tempfile.mkdtemp(prefix="not_a_repo_"))
+        try:
+            result = server.get_current_branch(str(directory))
+            self.assertIn("Ошибка git", result)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+@unittest.skipUnless(MCP_SDK and GIT_AVAILABLE, "нужны SDK mcp и git")
+class GetCurrentBranchClientTest(_RepoCase):
+    """get_current_branch через MCPClient (пайплайн /help зовёт так же)."""
+
+    def test_call_returns_branch_name(self) -> None:
+        repo = self.make_repo("client_branch", commits=1,
+                              branches=("help_branch",))
+        _git(repo, "checkout", "help_branch")
+        client = MCPClient(
+            server_command=_server_command(),
+            timeout=30.0,
+            log_path=_new_repo_dir("logs") / "mcp.log",
+        )
+        text = asyncio.run(client.call_tool(
+            "get_current_branch", {"repo_path": str(repo)}))
+        self.assertEqual(_unwrap(json.loads(text)), "help_branch")
+
+    def test_call_missing_path_returns_error_text(self) -> None:
+        client = MCPClient(
+            server_command=_server_command(),
+            timeout=30.0,
+            log_path=_new_repo_dir("logs") / "mcp.log",
+        )
+        text = asyncio.run(client.call_tool(
+            "get_current_branch",
+            {"repo_path": str(_FIXTURE_BASE / "no_such_repo_cb")},
+        ))
+        self.assertIn("не существует", _unwrap(json.loads(text)))
+
+
+# ---------------------------------------------------------------------------
 # 3-7. Клиент: интеграция с собственным сервером (stdio-подпроцесс)
 # ---------------------------------------------------------------------------
 
@@ -362,13 +450,15 @@ class MCPClientGitServerTest(_RepoCase):
             log_path=_new_repo_dir("logs") / "mcp.log",
         )
 
-    def test_list_tools_returns_three_git_tools(self) -> None:
-        """Сценарий 3: tools/list отдаёт 3 инструмента с описаниями."""
+    def test_list_tools_returns_four_git_tools(self) -> None:
+        """Сценарий 3: tools/list отдаёт 4 инструмента с описаниями."""
         tools = asyncio.run(self._client().list_tools())
         names = [t.name for t in tools]
         # Сортировка по имени — как в панели.
         self.assertEqual(
-            names, ["get_git_branches", "get_git_log", "get_git_status"]
+            names,
+            ["get_current_branch", "get_git_branches", "get_git_log",
+             "get_git_status"],
         )
         for tool in tools:
             self.assertIn("git", tool.description.lower())

@@ -20,6 +20,13 @@
        task_state}; цитаты дословно проверяются по чанкам
        (validate_quotes), память мерджится и сохраняется в SQLite.
 
+Команда /help (ТЗ отдельного режима): parse_command перехватывает
+сообщения, начинающиеся с «/help», и передаёт вопрос HelpPipeline
+(RAG по коллекции project_docs + git-контекст через my_git_server).
+/help НЕ читает и НЕ обновляет память задачи, ход не влияет на FSM
+основного диалога; пайплайн не настроен (help_pipeline=None) —
+сообщение уходит обычным ходом чата (деградация без падения).
+
 Отказоустойчивость — в духе остальных ступеней: недоступный Ollama,
 пустая база, ошибка JSON-вызова или БД не ломают ход (ответ показывается,
 причина — в логах и диагностике результата).
@@ -120,6 +127,23 @@ TASK_EXTRACTION_PROMPT = """Ты — аналитик диалога с памя
 
 class TaskStateError(RuntimeError):
     """Ошибка JSON-вызова экстрактора: API недоступен/ответ не разобрался."""
+
+
+def parse_command(user_input: str) -> tuple:
+    """Разбирает команду пользователя (Модуль 3 ТЗ).
+
+    Args:
+        user_input: сырое сообщение из поля чата.
+
+    Returns:
+        (command, payload): ("help", текст вопроса после "/help") для
+        команд режима помощи; ("chat", исходный текст) для обычного
+        диалога. Пустой вопрос после команды — валиден ("help", "").
+    """
+    text = str(user_input or "")
+    if text.startswith("/help"):
+        return ("help", text[len("/help"):].strip())
+    return ("chat", text)
 
 
 def format_context_for_extraction(chunks: List[RetrievedChunk]) -> str:
@@ -458,6 +482,8 @@ class ChatHandler:
         extractor: ChatTurnExtractor (None — ход без обновления памяти
             и цитат: деградация, ответ и источники остаются).
         abstain_threshold: порог стратегии C (0.6, nomic-embed-text).
+        help_pipeline: HelpPipeline команды /help (None — сообщения
+            с «/help» уходят обычным ходом чата: деградация).
     """
 
     def __init__(
@@ -466,11 +492,13 @@ class ChatHandler:
         task_state_repo: Optional[TaskStateRepository] = None,
         extractor: Optional[ChatTurnExtractor] = None,
         abstain_threshold: float = ABSTAIN_THRESHOLD,
+        help_pipeline: Optional[Any] = None,
     ) -> None:
         self.agent = agent
         self.task_state_repo = task_state_repo
         self.extractor = extractor
         self.abstain_threshold = float(abstain_threshold)
+        self.help_pipeline = help_pipeline
 
     # ------------------------------------------------------------------
     # Память задачи
@@ -507,8 +535,16 @@ class ChatHandler:
             "quotes" (валидированные), "task_state" (обновлённый словарь),
             "retrieval" (диагностика + avg_score), "rag_error"? ,
             "task_state_error"? (сбой экстрактора, ход не сломан).
+            Для /help — результат HelpPipeline (память задачи не
+            затрагивается, "is_help": True).
         """
         user_input = str(user_input or "")
+        # Командный режим: /help идёт отдельным пайплайном, НЕ обновляет
+        # память задачи; без help_pipeline — обычный ход (деградация)
+        command, payload = parse_command(user_input)
+        if command == "help" and self.help_pipeline is not None:
+            return await self.help_pipeline.handle_help(payload)
+
         # 1. Память задачи
         task_state = self.load_state(session_id, profile_id)
 

@@ -14,6 +14,7 @@ import flet as ft
 
 from app.ui import components
 from app.ui.optimization_view import OptimizationPanel
+from app.ui.project_docs_view import ProjectDocsPanel
 from app.ui.remote_access_view import RemoteAccessPanel
 from src.utils import (
     validate_max_tokens,
@@ -80,6 +81,8 @@ class SettingsView:
         self.optimization_panel = OptimizationPanel(app)
         # Удалённый доступ (ТЗ ai_1_30): URL прокси + API Key + DDNS
         self.remote_access_panel = RemoteAccessPanel(app)
+        # Документация проекта (/help): путь + индексация project_docs
+        self.project_docs_panel = ProjectDocsPanel(app)
 
     # ------------------------------------------------------------------
     # Компоновка
@@ -98,6 +101,7 @@ class SettingsView:
             self.rag_info_text,
             self.optimization_panel.build(),
             self.remote_access_panel.build(),
+            self.project_docs_panel.build(),
         ], spacing=12, scroll=ft.ScrollMode.AUTO)
 
     def on_show(self) -> None:
@@ -119,6 +123,7 @@ class SettingsView:
         )
         self.optimization_panel.on_show()
         self.remote_access_panel.on_show()
+        self.project_docs_panel.on_show()
         self.update()
 
     def _core_agent(self):
