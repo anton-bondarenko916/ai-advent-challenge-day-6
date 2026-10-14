@@ -39,3 +39,4 @@ docs/screenshots/
 # --- Временные каталоги тестов ---
 tests/tmp*/
 fsm_warnings.log
+.inspectra.yml

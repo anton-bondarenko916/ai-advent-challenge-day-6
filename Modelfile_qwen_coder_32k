@@ -1,0 +1,11 @@
+# Модель для AI-ревью PR (Inspectra): qwen2.5-coder 14b с контекстом 32k.
+#
+# Создание (из корня проекта):
+#   ollama pull qwen2.5-coder:14b
+#   ollama create qwen2.5-coder-14b-32k -f Modelfile_qwen_coder_32k
+#   ollama show qwen2.5-coder-14b-32k   # в блоке Parameters должно быть num_ctx 32768
+#
+# ВАЖНО: num_ctx задаётся ТОЛЬКО через Modelfile — при запуске модели
+# (ollama run / параметры API) его переопределить нельзя.
+FROM qwen2.5-coder:14b
+PARAMETER num_ctx 32768

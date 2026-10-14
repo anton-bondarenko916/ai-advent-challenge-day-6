@@ -86,6 +86,7 @@
   сервере
 - ✅ **Удалённый доступ к Ollama через Nginx** (ai_1_30): три схемы — классическая (DDNS + проброс портов + HTTPS), Cloudflare Tunnel (без DDNS и проброса) и локальная сеть (HTTP, API Key опционален, веб-чат chat.html по `/`); API Key + rate limit + генерация nginx.conf из UI
 - ✅ **Telegram-бот для локальной модели** (ai_1_31): `python telegram_bot.py` — long polling (порты наружу не открываются), белый список Telegram ID, раздельная история диалогов в SQLite, команды /start /help /clear /model, ответы из Ollama из любой точки мира
+- ✅ **AI-ревью PR: watcher GitHub + RAG по коду + Inspectra**: `python run_pr_watcher.py` — polling GitHub API каждые 5 минут, RAG по `*.py` проекта (коллекция `project_code` в Chroma), ревью локальной моделью `qwen2.5-coder-14b-32k` (Modelfile, num_ctx 32768) через `inspectra review --post-comment --pr-summary`, промпт с фокусом «баги и edge cases», повторное ревью по новому head_sha
 - ✅ Встроенные офлайн-тесты (`unittest`)
 
 ## Структура проекта

@@ -79,6 +79,10 @@ ollama-models>=0.3,<1
 # + RecursiveCharacterTextSplitter (structure).
 langchain-text-splitters>=1.0,<2
 
+# YAML-конфиг ревью (src/inspectra_runner.py): временный
+# .inspectra.yml с промптом «баги и edge cases» для Inspectra CLI.
+pyyaml>=6.0
+
 # ------------------------------------------------------------------
 # Реранкер RAG (app/rag/reranker.py) — ОПЦИОНАЛЬНО.
 # Fallback-цепочка реранкера: Ollama (кастомная сборка

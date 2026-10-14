@@ -188,6 +188,21 @@ DEFAULTS: Dict[str, Any] = {
     "TELEGRAM_MODEL": "",            # модель по умолчанию; "" — первая из /api/tags
     "TELEGRAM_HISTORY_LIMIT": 20,    # последних сообщений уходит в контекст
     "TELEGRAM_DB_PATH": "data/telegram_bot.db",  # история диалогов (относительно корня)
+    # ------------------------------------------------------------------
+    # AI-ревью PR (run_pr_watcher.py): polling GitHub API + Inspectra
+    # CLI с RAG-контекстом из кода (коллекция project_code) и локальной
+    # моделью qwen2.5-coder-14b-32k (Modelfile_qwen_coder_32k, num_ctx
+    # 32768). Токен — только через .env, в коде НЕ хардкодится.
+    # ------------------------------------------------------------------
+    "GITHUB_TOKEN": "",              # персональный токен с правами repo; пусто — watcher не стартует
+    "GITHUB_REPO": "",               # репозиторий "owner/repo" для polling
+    "PR_WATCHER_PROJECT_PATH": "",   # индексируемый проект; "" — корень этого проекта
+    "PR_WATCHER_INTERVAL": 5,        # минуты между опросами GitHub API
+    "PR_WATCHER_MODEL": "qwen2.5-coder-14b-32k",  # модель ревью (с num_ctx 32768)
+    "PR_WATCHER_PROVIDER": "ollama", # провайдер Inspectra (локальная Ollama)
+    "PR_WATCHER_DB_PATH": "data/reviewed_prs.db", # просмотренные (pr_number, head_sha)
+    "PR_WATCHER_TIMEOUT": 600,       # таймаут одного запуска inspectra, сек
+    "PR_WATCHER_TOP_K": 5,           # чанков RAG-контекста в промпт ревью
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
@@ -217,6 +232,7 @@ _INT_KEYS = (
     "NEWS_SERVER_PORT", "NEWS_SUMMARY_MAX_TOKENS",
     "GEO_SERVER_PORT", "WEATHER_SERVER_PORT",
     "TELEGRAM_HISTORY_LIMIT",
+    "PR_WATCHER_INTERVAL", "PR_WATCHER_TIMEOUT", "PR_WATCHER_TOP_K",
 )
 _FLOAT_KEYS = (
     "DEFAULT_TEMPERATURE", "PRICE_INPUT_PER_1M", "PRICE_OUTPUT_PER_1M",
@@ -1057,4 +1073,70 @@ def get_weather_settings(
         "host": host,
         "port": port,
         "url": f"http://{host}:{port}/mcp",
+    }
+
+
+def get_pr_watcher_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки AI-ревью PR (watcher + Inspectra).
+
+    Некорректные значения заменяются дефолтами с предупреждением в лог
+    (watcher не должен падать из-за конфигурации). Токен и репозиторий
+    приходят только из окружения/.env — в коде их нет.
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"token", "repo", "project_path", "interval_minutes",
+        "model", "provider", "db_path", "timeout", "top_k"}:
+        project_path — абсолютный путь индексируемого проекта
+        (пустой ключ — корень этого проекта); db_path — абсолютный
+        путь (относительный отсчитывается от корня проекта).
+    """
+    cfg = config if config is not None else get_config()
+    logger = get_logger("deepseek-chat.config")
+
+    def _int(key: str, default: int, low: int, high: int) -> int:
+        raw = cfg.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Некорректное значение %s=%r — беру %d.", key, raw, default)
+            return default
+        if not (low <= value <= high):
+            logger.warning(
+                "%s=%d вне диапазона [%d, %d] — беру %d.",
+                key, value, low, high, default,
+            )
+            return default
+        return value
+
+    # Индексируемый проект: пусто — корень этого приложения
+    raw_project = str(cfg.get("PR_WATCHER_PROJECT_PATH") or "").strip()
+    if raw_project:
+        project = Path(raw_project)
+        if not project.is_absolute():
+            project = PROJECT_ROOT / project
+    else:
+        project = PROJECT_ROOT
+
+    # Репозиторий нормализуем ЗДЕСЬ (единственная точка): из настроек
+    # его берут и PRWatcher, и InspectraRunner (GITHUB_REPOSITORY для
+    # inspectra — там 'owner/repo', полный URL даёт 404 «PR not found»)
+    from .pr_watcher import normalize_repo
+
+    return {
+        "token": str(cfg.get("GITHUB_TOKEN") or "").strip(),
+        "repo": normalize_repo(
+            str(cfg.get("GITHUB_REPO") or "").strip()),
+        "project_path": str(project),
+        "interval_minutes": _int("PR_WATCHER_INTERVAL", 5, 1, 1440),
+        "model": str(cfg.get("PR_WATCHER_MODEL")
+                     or DEFAULTS["PR_WATCHER_MODEL"]).strip(),
+        "provider": str(cfg.get("PR_WATCHER_PROVIDER")
+                        or DEFAULTS["PR_WATCHER_PROVIDER"]).strip(),
+        "db_path": str(get_project_path(cfg, "PR_WATCHER_DB_PATH")),
+        "timeout": float(_int("PR_WATCHER_TIMEOUT", 600, 60, 14400)),
+        "top_k": _int("PR_WATCHER_TOP_K", 5, 1, 20),
     }
