@@ -1,0 +1,44 @@
+{
+  "users": [
+    {
+      "id": 42,
+      "name": "Иван Петров",
+      "email": "ivan@example.com",
+      "status": "active",
+      "created_at": "2024-01-15",
+      "tickets": [
+        {
+          "id": 101,
+          "subject": "Не работает авторизация",
+          "status": "open",
+          "created_at": "2026-10-14",
+          "priority": "high"
+        }
+      ]
+    },
+    {
+      "id": 43,
+      "name": "Мария Сидорова",
+      "email": "maria@example.com",
+      "status": "pending_verification",
+      "created_at": "2025-06-20",
+      "tickets": []
+    },
+    {
+      "id": 44,
+      "name": "Алексей Смирнов",
+      "email": "alexey@example.com",
+      "status": "active",
+      "created_at": "2025-11-02",
+      "tickets": [
+        {
+          "id": 102,
+          "subject": "Не приходят уведомления по напоминаниям",
+          "status": "waiting",
+          "created_at": "2026-10-10",
+          "priority": "medium"
+        }
+      ]
+    }
+  ]
+}

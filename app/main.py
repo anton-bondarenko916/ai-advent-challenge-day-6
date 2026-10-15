@@ -2,11 +2,13 @@
 
 Экраны (вкладки): 💬 Чат (RAG всегда включён, источники с цитатами,
 память задачи: «Состояние диалога» и «Новый диалог», команда /help —
-вопросы о проекте по документации с git-контекстом), 📚 База знаний
-(индексация MD), ⚖️ Сравнение (10 вопросов × 2 режима), 🔀 Сравнение
-RAG-режимов (5 режимов + автоматические метрики), ⚙️ Настройки
-(профиль, температура, max_tokens, модель, оптимизация, удалённый
-доступ, документация проекта).
+вопросы о проекте по документации с git-контекстом, команда /support —
+поддержка пользователей: FAQ + контекст CRM, выпадающий список
+пользователей, автодополнение «/»), 📚 База знаний (индексация MD),
+⚖️ Сравнение (10 вопросов × 2 режима), 🔀 Сравнение RAG-режимов
+(5 режимов + автоматические метрики), ⚙️ Настройки (профиль,
+температура, max_tokens, модель, оптимизация, удалённый доступ,
+документация проекта, поддержка).
 
 Ядро агента — то же, что в Tkinter-версии (src.agent.DeepSeekAgent:
 профили, память, FSM задач, инварианты, MCP-инструменты).
@@ -24,6 +26,7 @@ RAGChatAgent; UI обновляется только из event loop Flet.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import traceback
 import uuid
@@ -42,7 +45,14 @@ from app.agent import RAGChatAgent
 from app.chat_handler import ChatHandler, build_chat_extractor
 from app.help_pipeline import HelpPipeline, build_git_mcp_client
 from app.rag.project_rag import PROJECT_DOCS_PATH_KEY, ProjectRAG
+from app.rag.support_rag import (
+    SUPPORT_DOCS_PATH_KEY,
+    SupportRAG,
+    default_support_docs_path,
+)
+from app.support_pipeline import SupportPipeline
 from app.task_state import TaskStateRepository
+from app.ui import components
 from app.ui.chat_view import ACTIVE_PROVIDER_KEY, ChatView
 from app.ui.comparison_view import ComparisonView
 from app.ui.knowledge_view import KnowledgeView
@@ -50,15 +60,18 @@ from app.ui.rag_comparison_view import RAGModesView
 from app.ui.settings_view import SettingsView
 from src.app_state import AppStateStore
 from src.config import (
+    get_crm_settings,
     get_geo_settings,
     get_news_settings,
     get_project_path,
     get_reminder_settings,
+    get_support_settings,
     get_weather_settings,
     load_config,
     validate_api_key,
 )
 from src.llm_providers import LLMProviderFactory
+from src.reminder_client import ReminderMCPClient
 from src.utils import get_logger
 
 logger = get_logger("deepseek-chat.flet")
@@ -146,11 +159,24 @@ class ChatApp:
             agent,
             project_path=self._initial_project_path(),
         )
+        # Поддержка (ТЗ ai_1_34): RAG по коллекции support_faq + CRM
+        # через crm_server.py (HTTP, порт 8004); /support тоже идёт по
+        # изолированному ядру, память задачи не трогается. user_id
+        # выбирается в выпадающем списке чата (НЕ хардкодится).
+        self.support_rag = SupportRAG(agent.vector_store, agent.embedder)
+        crm = get_crm_settings(config)
+        self.support_client = ReminderMCPClient(
+            server_url=crm["url"], label="CRM-сервер")
+        self.support_pipeline = SupportPipeline(
+            self.support_rag, self.support_client, agent)
+        self.support_user_id = 0
         self.chat_handler = ChatHandler(
             agent,
             task_state_repo=self.task_state_repo,
             extractor=build_chat_extractor(config),
             help_pipeline=self.help_pipeline,
+            support_pipeline=self.support_pipeline,
+            get_support_user_id=lambda: getattr(self, "support_user_id", 0),
         )
 
         page.title = str(config.get("UI_TITLE", "DeepSeek Chat")) + " (Flet)"
@@ -193,6 +219,10 @@ class ChatApp:
         page.add(ft.Column([self.tabs, body], expand=True, spacing=8))
         page.on_disconnect = self._on_disconnect
         self._restore_saved_provider()
+        # Список пользователей CRM для /support + первичное наполнение
+        # support_faq (если коллекция пуста) — фоном, старт не блокируется
+        self._schedule_background(self.chat_view.refresh_support_users_async)
+        self._schedule_background(self._support_autoidx_async)
 
     def _initial_project_path(self) -> str:
         """Путь проекта для /help: сохранённый в app_state → корень из
@@ -202,6 +232,47 @@ class ChatApp:
         if saved and Path(saved).is_dir():
             return saved
         return str(get_project_path(self.config, "MCP_GIT_REPO_PATH"))
+
+    def _support_docs_path(self) -> str:
+        """Папка поддержки для автоиндексации: app_state → конфиг."""
+        saved = (self.app_state.get(SUPPORT_DOCS_PATH_KEY)
+                 if self.app_state is not None else None)
+        if saved and Path(saved).is_dir():
+            return saved
+        docs_path = get_support_settings(self.config)["docs_path"]
+        return docs_path if Path(docs_path).is_dir() \
+            else default_support_docs_path()
+
+    def _schedule_background(self, handler, *args) -> None:
+        """Фоновая задача старта через event loop Flet.
+
+        Гард (components.guarded_task): ошибка — traceback в лог +
+        SnackBar, интерфейс не «падает». Ошибки запуска самой задачи
+        не критичны (старт приложения продолжается).
+        """
+        try:
+            self.page.run_task(
+                components.guarded_task(self, handler), *args)
+        except Exception as exc:  # noqa: BLE001 — старт не должен падать
+            logger.warning("Фоновая задача не запущена (%s): %s",
+                           getattr(handler, "__qualname__", handler), exc)
+
+    async def _support_autoidx_async(self) -> None:
+        """Первичное наполнение support_faq, если коллекция пуста.
+
+        FAQ поставляется с приложением (support_docs/) — /support
+        работает сразу после первого запуска. Ollama недоступна —
+        коллекция остаётся пустой (индексация через панель в Настройках).
+        """
+        try:
+            if self.support_rag.count() > 0:
+                return
+            stats = await asyncio.to_thread(
+                self.support_rag.index_support_docs,
+                self._support_docs_path())
+            logger.info("Автоиндексация поддержки: %s", stats)
+        except Exception as exc:  # noqa: BLE001 — не критично
+            logger.warning("Автоиндексация поддержки не удалась: %s", exc)
 
     def _restore_saved_provider(self) -> None:
         """Восстанавливает провайдера, выбранного в прошлой сессии (ai_1_25).
@@ -302,6 +373,7 @@ def launch_mcp_servers(config: Dict[str, Any]) -> List[str]:
     Returns:
         Список сообщений для лога (метка сервера: результат).
     """
+    from src.crm_launcher import CrmServerLauncher
     from src.geo_launcher import GeoServerLauncher
     from src.news_launcher import NewsServerLauncher
     from src.reminder_launcher import ReminderServerLauncher
@@ -322,6 +394,9 @@ def launch_mcp_servers(config: Dict[str, Any]) -> List[str]:
     if weather["enabled"]:
         specs.append(WeatherServerLauncher(host=weather["host"],
                                            port=weather["port"]))
+    crm = get_crm_settings(config)
+    if crm["enabled"]:
+        specs.append(CrmServerLauncher(host=crm["host"], port=crm["port"]))
 
     messages: List[str] = []
     for launcher in specs:

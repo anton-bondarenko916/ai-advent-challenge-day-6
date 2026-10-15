@@ -125,9 +125,12 @@ class SuggestionTest(unittest.TestCase):
         self.assertIs(controls[index + 1], self.view.status_text)
 
     def test_suggestion_text_mentions_help(self) -> None:
+        """Подсказки команд: /support и /help (ТЗ ai_1_34)."""
         controls = self.view._suggestion_controls()
-        self.assertEqual(len(controls), 1)
-        self.assertIn("/help", controls[0].content.value)
+        self.assertEqual(len(controls), 2)
+        texts = [str(control.content.value) for control in controls]
+        self.assertTrue(any("/support" in text for text in texts))
+        self.assertTrue(any("/help" in text for text in texts))
 
 
 # ----------------------------------------------------------------------

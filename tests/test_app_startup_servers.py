@@ -41,11 +41,12 @@ class _FakeLauncher:
 class LaunchMcpServersTest(unittest.TestCase):
     """Автозапуск серверов при старте Flet-версии."""
 
-    def _run(self, fail_labels=()):
+    def _run(self, fail_labels=(), crm_enabled: bool = False):
         """Зпатчит настройки и лаунчеры, возвращает (messages, instances).
 
         reminder и geo включены, news и weather выключены — проверяет
-        фильтрацию по enabled.
+        фильтрацию по enabled. CRM по умолчанию выключен (включается
+        отдельным тестом, ai_1_34).
         """
         settings = {
             "get_reminder_settings": {"enabled": True,
@@ -56,12 +57,15 @@ class LaunchMcpServersTest(unittest.TestCase):
                                  "host": "127.0.0.1", "port": 8002},
             "get_weather_settings": {"enabled": False,
                                      "host": "127.0.0.1", "port": 8003},
+            "get_crm_settings": {"enabled": crm_enabled,
+                                 "host": "127.0.0.1", "port": 8004},
         }
         classes = {
             "src.reminder_launcher.ReminderServerLauncher": "Reminder",
             "src.news_launcher.NewsServerLauncher": "News",
             "src.geo_launcher.GeoServerLauncher": "Geo",
             "src.weather_launcher.WeatherServerLauncher": "Weather",
+            "src.crm_launcher.CrmServerLauncher": "CRM-сервер",
         }
         instances = {
             name: _FakeLauncher(label, fail=(label in fail_labels))
@@ -83,7 +87,8 @@ class LaunchMcpServersTest(unittest.TestCase):
 
     def test_launches_enabled_servers(self) -> None:
         messages, instances = self._run()
-        # Включены reminder и geo (news/weather выключены — не запускаются)
+        # Включены reminder и geo (news/weather/CRM выключены — не
+        # запускаются)
         self.assertEqual(len(messages), 2, messages)
         self.assertIn("Reminder: запущен", messages)
         self.assertIn("Geo: запущен", messages)
@@ -91,6 +96,17 @@ class LaunchMcpServersTest(unittest.TestCase):
             instances["src.reminder_launcher.ReminderServerLauncher"].calls, 1)
         self.assertEqual(
             instances["src.news_launcher.NewsServerLauncher"].calls, 0)
+        self.assertEqual(
+            instances["src.crm_launcher.CrmServerLauncher"].calls, 0)
+
+    def test_launches_crm_server_when_enabled(self) -> None:
+        """CRM-сервер запускается автостартом (ТЗ ai_1_34)."""
+        messages, instances = self._run(crm_enabled=True)
+        self.assertEqual(len(messages), 3, messages)
+        self.assertEqual(
+            instances["src.crm_launcher.CrmServerLauncher"].calls, 1)
+        self.assertTrue(
+            any(message.startswith("CRM-сервер: ") for message in messages))
 
     def test_error_does_not_break_startup(self) -> None:
         messages, _ = self._run(fail_labels=("Reminder",))

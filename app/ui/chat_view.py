@@ -23,6 +23,13 @@ app_state (SQLite) и восстанавливается при следующе
 перехватывается HelpPipeline (документация проекта + git-контекст),
 память задачи не затрагивается.
 
+Команда /support (ТЗ ai_1_34): та же панель автодополнения предлагает
+/support; рядом с провайдером — выпадающий список «Пользователь (для
+/support)», заполняемый из CRM (list_users через crm_server.py) при
+старте приложения. Выбранный user_id уходит в SupportPipeline через
+app.support_user_id (НЕ хардкодится); недоступный CRM — список пуст,
+ход /support отвечает только по FAQ (фолбэк).
+
 RAG по умолчанию включён, но переключатель разблокирован: выключенное
 положение отправляет вопрос ядру без поиска по базе знаний (память
 задачи и инструменты MCP работают как раньше). Положение переключателя
@@ -35,6 +42,7 @@ page вынесена в schedule-обёртки (_on_send и т.п.).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from typing import Any, Dict, List, Optional
@@ -50,6 +58,9 @@ from src.llm_providers import (
     ProviderUnavailableError,
 )
 from src.ollama_launcher import OllamaLauncher
+from src.utils import get_logger
+
+logger = get_logger("deepseek-chat.chat-view")
 
 # Ключ выбора провайдера в app_state (SQLite)
 ACTIVE_PROVIDER_KEY = "active_provider"
@@ -120,6 +131,27 @@ def build_provider_warning_dialog(message: str, on_close) -> ft.AlertDialog:
     )
 
 
+def parse_crm_users(raw: Any) -> List[Dict[str, Any]]:
+    """Список пользователей из ответа MCP (list_users CRM-сервера).
+
+    FastMCP оборачивает список в ``{"result": [...]}`` — клиент
+    возвращает его pretty-JSON'ом; принимается и сырой JSON-список.
+    Элементы без id отбрасываются.
+    """
+    try:
+        payload = json.loads(str(raw or ""))
+    except (TypeError, ValueError):
+        return []
+    if isinstance(payload, dict) and set(payload) == {"result"}:
+        payload = payload["result"]
+    if not isinstance(payload, list):
+        return []
+    return [
+        user for user in payload
+        if isinstance(user, dict) and user.get("id") is not None
+    ]
+
+
 class ChatView:
     """Чат: RAG всегда включён, источники с цитатами, память задачи.
 
@@ -149,7 +181,7 @@ class ChatView:
             min_lines=1,
             max_lines=4,
             shift_enter=True,
-            hint_text="Сообщение (Enter — отправить, Shift+Enter — новая строка; /help — вопросы о проекте)",
+            hint_text="Сообщение (Enter — отправить, Shift+Enter — новая строка; /support — поддержка, /help — о проекте)",
             border=ft.OutlineInputBorder(border_radius=8),
             expand=True,
             on_change=self._on_input_change,
@@ -198,9 +230,18 @@ class ChatView:
             tooltip="DeepSeek — облако; Ollama — локальные модели "
                     "(нужен запущенный ollama serve)",
         )
+        # ТЗ ai_1_34: пользователь CRM для /support (список заполняется
+        # из CRM при старте приложения; user_id НЕ хардкодится)
+        self.support_user_dropdown = ft.Dropdown(
+            width=250,
+            label="Пользователь (для /support)",
+            options=[],
+            on_select=self._on_support_user_change,
+            tooltip="Контекст CRM (тикеты, статус) для команды /support",
+        )
         self.chat_actions_row = ft.Row(
-            [self.provider_dropdown, self.state_button,
-             self.new_dialog_button],
+            [self.provider_dropdown, self.support_user_dropdown,
+             self.state_button, self.new_dialog_button],
             spacing=8, wrap=True,
         )
         self.top_k_field = ft.TextField(
@@ -324,6 +365,13 @@ class ChatView:
         )
         if sources_panel is not None:
             content.controls.append(sources_panel)
+        if result.get("is_support") and not result.get("crm_available"):
+            # /support без CRM (ТЗ: фолбэк) — предупреждение под ответом
+            crm_error = str(result.get("crm_error") or "CRM недоступен")
+            content.controls.append(ft.Text(
+                f"👤 {crm_error} — ответ дан только по FAQ поддержки.",
+                size=12, color=components.RAG_WARNING_COLOR,
+                selectable=True))
         if result.get("is_help") and result.get("git_context"):
             # /help: git-контекст хода (ветка или пометка о недоступности)
             content.controls.append(ft.Text(
@@ -355,8 +403,19 @@ class ChatView:
     # Автодополнение команд при вводе «/» (ТЗ)
     # ------------------------------------------------------------------
     def _suggestion_controls(self) -> List[ft.Control]:
-        """Подсказки команд (сейчас одна: /help)."""
+        """Подсказки команд (/help, /support — ТЗ ai_1_34)."""
         return [
+            ft.Container(
+                content=ft.Text(
+                    "/support <вопрос> — поддержка пользователей "
+                    "(контекст CRM + FAQ)",
+                    size=13,
+                ),
+                on_click=lambda _: self._fill_suggestion("/support "),
+                ink=True,
+                border_radius=8,
+                padding=ft.Padding(left=12, top=6, right=12, bottom=6),
+            ),
             ft.Container(
                 content=ft.Text(
                     "/help — вопросы о проекте (документация, архитектура, git)",
@@ -366,7 +425,7 @@ class ChatView:
                 ink=True,
                 border_radius=8,
                 padding=ft.Padding(left=12, top=6, right=12, bottom=6),
-            )
+            ),
         ]
 
     def _on_input_change(self, event=None) -> None:
@@ -447,6 +506,59 @@ class ChatView:
     def _on_provider_change(self, event=None) -> None:
         self._schedule(self._switch_provider_async,
                        str(self.provider_dropdown.value or ""))
+
+    # ------------------------------------------------------------------
+    # Пользователь CRM для /support (ТЗ ai_1_34)
+    # ------------------------------------------------------------------
+    def _on_support_user_change(self, event=None) -> None:
+        """Выбор пользователя: user_id запоминается в приложении и
+        используется следующим ходом /support."""
+        try:
+            user_id = int(self.support_user_dropdown.value or 0)
+        except (TypeError, ValueError):
+            user_id = 0
+        self.app.support_user_id = user_id
+
+    async def refresh_support_users_async(self) -> None:
+        """Заполняет список пользователей из CRM (list_users, HTTP).
+
+        Вызывается при старте приложения (page.run_task): ход не
+        блокирует интерфейс. CRM недоступен — список остаётся пустым
+        (ход /support возможен: фолбэк без контекста пользователя).
+        """
+        client = getattr(self.app, "support_client", None)
+        if client is None:
+            return
+        try:
+            raw = await client.call_tool("list_users", {})
+            users = parse_crm_users(raw)
+        except Exception as exc:  # noqa: BLE001 — деградация вместо падения
+            logger.warning("Список пользователей CRM недоступен: %s", exc)
+            users = []
+        if users:
+            self.support_user_dropdown.options = [
+                ft.DropdownOption(
+                    key=str(user.get("id")),
+                    content=ft.Text(
+                        f"{user.get('name', '')} ({user.get('id')})",
+                        size=12),
+                )
+                for user in users
+            ]
+            if not self.selected_support_user_id():
+                first = str(users[0].get("id"))
+                self.support_user_dropdown.value = first
+                self.app.support_user_id = int(first)
+        else:
+            self.support_user_dropdown.disabled = True
+        self.update()
+
+    def selected_support_user_id(self) -> int:
+        """user_id выбранного пользователя (0 — не выбран)."""
+        try:
+            return int(getattr(self.app, "support_user_id", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def _on_clear(self, event=None) -> None:
         self._schedule(self._clear_async)

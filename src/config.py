@@ -176,6 +176,13 @@ DEFAULTS: Dict[str, Any] = {
     "WEATHER_SERVER_HOST": "127.0.0.1",  # только локально, не хостить!
     "WEATHER_SERVER_PORT": 8003,     # порт http://127.0.0.1:<порт>/mcp
     # ------------------------------------------------------------------
+    # MCP-сервер CRM (crm_server.py, HTTP-транспорт 24/7): пользователи
+    # и тикеты поддержки для команды /support (ТЗ ai_1_34)
+    # ------------------------------------------------------------------
+    "CRM_ENABLED": True,             # False — без CRM и автозапуска
+    "CRM_SERVER_HOST": "127.0.0.1",  # только локально, не хостить!
+    "CRM_SERVER_PORT": 8004,         # порт http://127.0.0.1:<порт>/mcp
+    # ------------------------------------------------------------------
     # Состояние UI (сворачивание панели MCP и т.п.): SQLite key-value
     # ------------------------------------------------------------------
     "APP_STATE_PATH": "data/app_state.db",  # путь к БД (относительно корня)
@@ -203,6 +210,12 @@ DEFAULTS: Dict[str, Any] = {
     "PR_WATCHER_DB_PATH": "data/reviewed_prs.db", # просмотренные (pr_number, head_sha)
     "PR_WATCHER_TIMEOUT": 600,       # таймаут одного запуска inspectra, сек
     "PR_WATCHER_TOP_K": 5,           # чанков RAG-контекста в промпт ревью
+    # ------------------------------------------------------------------
+    # RAG поддержки (ТЗ ai_1_34): FAQ и документация для /support,
+    # отдельная коллекция support_faq. Папка с *.md; "" — support_docs/
+    # в корне проекта.
+    # ------------------------------------------------------------------
+    "SUPPORT_DOCS_PATH": "",         # "" — support_docs/ в корне проекта
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
@@ -217,6 +230,7 @@ _BOOL_KEYS = (
     "NEWS_ENABLED",
     "GEO_ENABLED",
     "WEATHER_ENABLED",
+    "CRM_ENABLED",
 )
 
 # Переменные, значения которых нужно приводить к числу
@@ -230,7 +244,7 @@ _INT_KEYS = (
     "TASKS_MAX_RETRIES",
     "REMINDER_SERVER_PORT", "REMINDER_TOOLCALL_MAX_ROUNDS",
     "NEWS_SERVER_PORT", "NEWS_SUMMARY_MAX_TOKENS",
-    "GEO_SERVER_PORT", "WEATHER_SERVER_PORT",
+    "GEO_SERVER_PORT", "WEATHER_SERVER_PORT", "CRM_SERVER_PORT",
     "TELEGRAM_HISTORY_LIMIT",
     "PR_WATCHER_INTERVAL", "PR_WATCHER_TIMEOUT", "PR_WATCHER_TOP_K",
 )
@@ -1018,6 +1032,56 @@ def get_telegram_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, 
         "db_path": str(get_project_path(
             cfg, "TELEGRAM_DB_PATH")),
     }
+
+
+def get_crm_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки MCP-сервера CRM (ТЗ ai_1_34).
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "host", "port", "url"}: host — только
+        127.0.0.1 (хостить в интернете запрещено); url — MCP-эндпоинт
+        ``http://<host>:<port>/mcp``.
+    """
+    cfg = config if config is not None else get_config()
+
+    host, port = _local_host_and_port(
+        cfg, "CRM_SERVER_HOST", "CRM_SERVER_PORT", 8004
+    )
+    return {
+        "enabled": _coerce_bool(cfg.get("CRM_ENABLED", True)),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}/mcp",
+    }
+
+
+def get_support_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает настройки RAG поддержки (ТЗ ai_1_34).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"docs_path"} — абсолютный путь к папке с FAQ и
+        документацией поддержки (*.md индексируются в коллекцию
+        support_faq). Пустой SUPPORT_DOCS_PATH — support_docs/ в корне
+        проекта; относительный путь отсчитывается от корня.
+    """
+    cfg = config if config is not None else get_config()
+
+    raw = str(cfg.get("SUPPORT_DOCS_PATH") or "").strip()
+    if not raw:
+        return {"docs_path": str(PROJECT_ROOT / "support_docs")}
+    path = Path(raw)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return {"docs_path": str(path)}
 
 
 def get_geo_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

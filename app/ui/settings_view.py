@@ -16,6 +16,7 @@ from app.ui import components
 from app.ui.optimization_view import OptimizationPanel
 from app.ui.project_docs_view import ProjectDocsPanel
 from app.ui.remote_access_view import RemoteAccessPanel
+from app.ui.support_docs_view import SupportDocsPanel
 from src.utils import (
     validate_max_tokens,
     validate_model,
@@ -83,6 +84,8 @@ class SettingsView:
         self.remote_access_panel = RemoteAccessPanel(app)
         # Документация проекта (/help): путь + индексация project_docs
         self.project_docs_panel = ProjectDocsPanel(app)
+        # Поддержка (/support, ТЗ ai_1_34): путь + индексация support_faq
+        self.support_docs_panel = SupportDocsPanel(app)
 
     # ------------------------------------------------------------------
     # Компоновка
@@ -102,6 +105,7 @@ class SettingsView:
             self.optimization_panel.build(),
             self.remote_access_panel.build(),
             self.project_docs_panel.build(),
+            self.support_docs_panel.build(),
         ], spacing=12, scroll=ft.ScrollMode.AUTO)
 
     def on_show(self) -> None:
@@ -124,6 +128,7 @@ class SettingsView:
         self.optimization_panel.on_show()
         self.remote_access_panel.on_show()
         self.project_docs_panel.on_show()
+        self.support_docs_panel.on_show()
         self.update()
 
     def _core_agent(self):

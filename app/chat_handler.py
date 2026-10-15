@@ -20,12 +20,14 @@
        task_state}; цитаты дословно проверяются по чанкам
        (validate_quotes), память мерджится и сохраняется в SQLite.
 
-Команда /help (ТЗ отдельного режима): parse_command перехватывает
-сообщения, начинающиеся с «/help», и передаёт вопрос HelpPipeline
-(RAG по коллекции project_docs + git-контекст через my_git_server).
-/help НЕ читает и НЕ обновляет память задачи, ход не влияет на FSM
-основного диалога; пайплайн не настроен (help_pipeline=None) —
-сообщение уходит обычным ходом чата (деградация без падения).
+Команды отдельных режимов: parse_command перехватывает сообщения,
+начинающиеся с «/help» (вопросы о проекте: RAG по project_docs +
+git-контекст) и «/support» (поддержка пользователей: RAG по support_faq
++ контекст CRM через crm_server.py). Обе команды НЕ читают и НЕ
+обновляют память задачи, ход не влияет на FSM основного диалога;
+пайплайн не настроен (help_pipeline/support_pipeline=None) — сообщение
+уходит обычным ходом чата (деградация без падения). user_id для
+/support приходит из UI через get_support_user_id (НЕ хардкодится).
 
 Отказоустойчивость — в духе остальных ступеней: недоступный Ollama,
 пустая база, ошибка JSON-вызова или БД не ломают ход (ответ показывается,
@@ -132,17 +134,25 @@ class TaskStateError(RuntimeError):
 def parse_command(user_input: str) -> tuple:
     """Разбирает команду пользователя (Модуль 3 ТЗ).
 
+    Команда распознаётся по границе слова: после «/support»/«/help»
+    должен идти пробел или конец строки — «/supported» остаётся
+    обычным сообщением.
+
     Args:
         user_input: сырое сообщение из поля чата.
 
     Returns:
-        (command, payload): ("help", текст вопроса после "/help") для
-        команд режима помощи; ("chat", исходный текст) для обычного
-        диалога. Пустой вопрос после команды — валиден ("help", "").
+        (command, payload): ("support", текст вопроса после "/support")
+        для поддержки, ("help", текст после "/help") для вопросов о
+        проекте; ("chat", исходный текст) для обычного диалога. Пустой
+        вопрос после команды — валиден ("support", "").
     """
     text = str(user_input or "")
-    if text.startswith("/help"):
-        return ("help", text[len("/help"):].strip())
+    for name, command in (("/support", "support"), ("/help", "help")):
+        if text.startswith(name):
+            rest = text[len(name):]
+            if not rest or rest[0].isspace():
+                return (command, rest.strip())
     return ("chat", text)
 
 
@@ -484,6 +494,11 @@ class ChatHandler:
         abstain_threshold: порог стратегии C (0.6, nomic-embed-text).
         help_pipeline: HelpPipeline команды /help (None — сообщения
             с «/help» уходят обычным ходом чата: деградация).
+        support_pipeline: SupportPipeline команды /support (None —
+            сообщения с «/support» уходят обычным ходом чата).
+        get_support_user_id: callable, возвращающий user_id выбранного
+            в UI пользователя CRM (0/None — не выбран); вызывается
+            только для команды /support.
     """
 
     def __init__(
@@ -493,12 +508,16 @@ class ChatHandler:
         extractor: Optional[ChatTurnExtractor] = None,
         abstain_threshold: float = ABSTAIN_THRESHOLD,
         help_pipeline: Optional[Any] = None,
+        support_pipeline: Optional[Any] = None,
+        get_support_user_id: Optional[Any] = None,
     ) -> None:
         self.agent = agent
         self.task_state_repo = task_state_repo
         self.extractor = extractor
         self.abstain_threshold = float(abstain_threshold)
         self.help_pipeline = help_pipeline
+        self.support_pipeline = support_pipeline
+        self.get_support_user_id = get_support_user_id
 
     # ------------------------------------------------------------------
     # Память задачи
@@ -535,15 +554,26 @@ class ChatHandler:
             "quotes" (валидированные), "task_state" (обновлённый словарь),
             "retrieval" (диагностика + avg_score), "rag_error"? ,
             "task_state_error"? (сбой экстрактора, ход не сломан).
-            Для /help — результат HelpPipeline (память задачи не
-            затрагивается, "is_help": True).
+            Для /help — результат HelpPipeline, для /support — результат
+            SupportPipeline (обе команды: память задачи не затрагивается,
+            "is_help"/"is_support": True).
         """
         user_input = str(user_input or "")
-        # Командный режим: /help идёт отдельным пайплайном, НЕ обновляет
-        # память задачи; без help_pipeline — обычный ход (деградация)
+        # Командный режим: /help и /support идут отдельными пайплайнами,
+        # НЕ обновляют память задачи; без пайплайна — обычный ход
+        # (деградация)
         command, payload = parse_command(user_input)
         if command == "help" and self.help_pipeline is not None:
             return await self.help_pipeline.handle_help(payload)
+        if command == "support" and self.support_pipeline is not None:
+            user_id = 0
+            if callable(self.get_support_user_id):
+                try:
+                    user_id = int(self.get_support_user_id() or 0)
+                except (TypeError, ValueError):
+                    user_id = 0
+            return await self.support_pipeline.handle_support(
+                payload, user_id)
 
         # 1. Память задачи
         task_state = self.load_state(session_id, profile_id)
