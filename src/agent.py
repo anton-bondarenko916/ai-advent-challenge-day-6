@@ -127,19 +127,37 @@ _MOCK_ANSWERS = [
 # Блок правил инструментов: добавляется в конец system-сообщения запроса,
 # когда у агента есть tools напоминаний/новостей. Без него LLM может
 # ограничиться текстом сводки в чате и не вызвать save_to_file — тогда
-# пользователь не получит файл (и кнопку «Открыть файл»).
+# пользователь не получит файл (и кнопку «Открыть файл»). То же с
+# файловыми инструментами (ТЗ ai_1_35): без правила «сгенерируй файл =
+# ОБЯЗАТЕЛЬНО write_file» модель отвечает текстом в чате, не создавая
+# файл (прецедент: «Сгенерируй servers.md …» → только поиск).
 _TOOL_USAGE_RULES = (
     "[ПРАВИЛА РАБОТЫ С ИНСТРУМЕНТАМИ]\n"
-    "Тебе доступны инструменты напоминаний, новостей, геолокации и погоды "
-    "— вызывай их сразу, без переспрашивания.\n"
+    "Тебе доступны инструменты напоминаний, новостей, геолокации, погоды "
+    "и файловой системы проекта — вызывай их сразу, без переспрашивания.\n"
     "- Напоминание: add_reminder(text, interval_minutes, repeat).\n"
     "- Новости: search_news(topic, limit) — поиск; summarize_text(text) — "
     "краткая сводка; save_to_file(content) — сохранение текста в файл.\n"
     "- Гео и погода: get_user_city() — город пользователя; "
     "get_weather(city) — текущая погода в городе.\n"
+    "- Файлы проекта: search_within_files(substring, directory) — поиск "
+    "подстроки по содержимому; search_files(pattern, directory) — поиск "
+    "файлов по шаблону; list_directory(path) и tree(path, depth) — "
+    "структура каталогов; read_file(path) / read_multiple_files(paths) — "
+    "чтение; write_file(path, content) — создать или перезаписать файл.\n"
     "Сценарий «найди новости / сделай сводку (и сохрани)»: search_news → "
     "summarize_text → save_to_file.\n"
     "Сценарий «какая погода»: get_user_city() → get_weather(city).\n"
+    "Сценарий «найди, где используется X»: search_within_files → "
+    "read_multiple_files (если нужно больше контекста).\n"
+    "Сценарий «сгенерируй/создай файл …»: собери информацию "
+    "(list_directory / search_files / search_within_files / read_file), "
+    "затем ОБЯЗАТЕЛЬНО запиши результат в файл через write_file — "
+    "ответ без вызова write_file означает, что задание не выполнено. "
+    "На сбор информации — 2–4 операции, одинаковые поиски не повторяй; "
+    "собрал достаточно — сразу пиши файл. В чате после записи отвечай "
+    "кратко: путь файла и 1–2 предложения сути, не дублируя всё "
+    "содержимое.\n"
     "ВАЖНО: полный текст сводки сохраняй в ФАЙЛ через save_to_file; "
     "в чате после этого отвечай кратко — что сделано, путь к файлу и "
     "1–2 предложения сути, не дублируя весь текст сводки.\n"
@@ -198,6 +216,7 @@ class DeepSeekAgent:
         news_client: Optional[Any] = None,
         geo_client: Optional[Any] = None,
         weather_client: Optional[Any] = None,
+        fs_client: Optional[Any] = None,
         max_tool_rounds: Optional[int] = None,
         provider: Optional[BaseLLMProvider] = None,
     ) -> None:
@@ -267,6 +286,10 @@ class DeepSeekAgent:
             weather_client: HTTP MCP-клиент погоды
                 (:class:`src.reminder_client.ReminderMCPClient` на
                 weather_server.py); None — инструмент get_weather выключен.
+            fs_client: HTTP MCP-клиент файловой системы (ТЗ ai_1_35,
+                fs_server.py: read/write/search/tree); None — файловые
+                инструменты выключены. Доступны LLM в agentic loop
+                наравне с остальными серверами (маршрутизация по имени).
             max_tool_rounds: лимит циклов «LLM → tool_calls → результат →
                 LLM» за один ход (agentic loop); None — 5.
             provider: провайдер LLM (BaseLLMProvider, ТЗ ai_1_25); None —
@@ -463,9 +486,11 @@ class DeepSeekAgent:
         self._news_client = news_client
         self._geo_client = geo_client
         self._weather_client = weather_client
+        self._fs_client = fs_client
         self._tool_clients: List[Any] = [
             client for client in (
                 reminder_client, news_client, geo_client, weather_client,
+                fs_client,
             )
             if client is not None
         ]
@@ -2012,6 +2037,15 @@ class DeepSeekAgent:
         if tools:
             request["tools"] = tools
             request["tool_choice"] = "auto"
+            # Бюджет completion для ходов с инструментами: пользовательский
+            # max_tokens (по умолчанию 1000) задан для обычных ответов, но
+            # thinking-модель тратит его на reasoning ЕЩЁ ДО текста/вызова
+            # инструментов — на большом контексте (файловые результаты)
+            # ответ обрезается в пустоту (прецедент: «Сгенерируй
+            # servers.md…» → 6 раундов finish_reason=length). Минимум:
+            MIN_TOOL_MAX_TOKENS = 4000
+            request["max_tokens"] = max(
+                int(request.get("max_tokens") or 0), MIN_TOOL_MAX_TOKENS)
             # Правила использования инструментов — в конец system-промпта
             messages = list(request.get("messages") or [])
             if messages:
@@ -2028,7 +2062,37 @@ class DeepSeekAgent:
         executed: List[Dict[str, Any]] = []
         tokens_acc: Optional[Dict[str, Any]] = payload.get("tokens")
         rounds = 0
+        # Ретрай обрезанного ответа (однократный): thinking-модель на
+        # большом контексте (жирные результаты инструментов) тратит
+        # бюджет max_tokens на reasoning — ответ приходит с
+        # finish_reason=length и ПУСТЫМ контентом. Прецедент: запрос
+        # «Сгенерируй servers.md…» — 7 раундов подряд обрезались, цикл
+        # крутился на неполных tool_calls (7 одинаковых write_file),
+        # финальный ответ пуст. Лечение: один повтор с удвоенным
+        # бюджетом (как у JSON-экстрактора памяти задачи), при повторной
+        # обрезке — остановка с честным сообщением.
+        length_retried = False
         while payload.get("tool_calls") and rounds < self._max_tool_rounds:
+            truncated = (payload.get("finish_reason") == "length"
+                         and not str(payload.get("content") or "").strip())
+            if truncated and not length_retried:
+                length_retried = True
+                request = dict(request)
+                request["max_tokens"] = min(
+                    int(request.get("max_tokens") or 1000) * 2, 16000)
+                logger.warning(
+                    "Ответ модели обрезан лимитом max_tokens — повтор с "
+                    "бюджетом %s", request["max_tokens"])
+                response = self._send_completion(request)
+                payload = self._handle_response(response)
+                tokens_acc = self._merge_tokens(tokens_acc,
+                                                payload.get("tokens"))
+                continue
+            if truncated:
+                # Повторный ретрай тоже обрезан: tool_calls из него
+                # ненадёжны — прекращаем цикл (сообщение ниже)
+                payload["tool_calls"] = []
+                break
             rounds += 1
             assistant_msg, tool_msgs, events = self._execute_tool_calls(payload)
             executed.extend(events)
@@ -2041,6 +2105,23 @@ class DeepSeekAgent:
 
         payload["tokens"] = tokens_acc
         payload["tool_calls_executed"] = executed
+        if payload.get("tool_calls"):
+            # Лимит раундов исчерпан, а LLM всё ещё просит инструменты:
+            # честное сообщение вместо пустого ответа (ТЗ ai_1_35 —
+            # защита от зацикливания)
+            payload["content"] = (
+                f"Достигнут лимит итераций инструментов "
+                f"({self._max_tool_rounds}). Работа выполнена частично — "
+                f"продолжите диалог, чтобы я завершил задачу."
+            )
+        elif not str(payload.get("content") or "").strip():
+            # Пустой финальный ответ без tool_calls (обрезка бюджета, сбой
+            # модели) — честная подсказка вместо «(пустой ответ)»
+            payload["content"] = (
+                "Модель не вернула текст — вероятно, ответ обрезан лимитом "
+                "max_tokens (thinking-модель тратит бюджет на рассуждения). "
+                "Попробуйте ещё раз или увеличьте max_tokens в Настройках."
+            )
         # Путь сохранённого файла (инструмент save_to_file news-сервера) —
         # UI показывает по нему кнопку «Открыть файл»
         payload["saved_file_path"] = self._extract_saved_file_path(executed)
@@ -2050,15 +2131,19 @@ class DeepSeekAgent:
     def _extract_saved_file_path(
         events: List[Dict[str, Any]],
     ) -> Optional[str]:
-        """Путь из последнего успешного вызова save_to_file (или None).
+        """Путь из последнего успешного вызова save_to_file/write_file
+        (или None).
 
         Результат инструмента — текст; у FastMCP это pretty-JSON
         ``{"result": "<путь>"}``, на всякий случай принимается и «сырой»
         путь. Строки с ошибками («Ошибка сохранения: …») путём не
-        считаются.
+        считаются. write_file fs-сервера отвечает «Файл создан: <путь>»
+        (ТЗ ai_1_35: путь созданного файла — в сообщение и кнопку
+        «Открыть файл»).
         """
         for event in reversed(events):
-            if event.get("name") != "save_to_file":
+            name = event.get("name")
+            if name not in ("save_to_file", "write_file"):
                 continue
             result = str(event.get("result") or "")
             try:
@@ -2068,8 +2153,19 @@ class DeepSeekAgent:
             if (isinstance(parsed, dict)
                     and isinstance(parsed.get("result"), str)):
                 result = parsed["result"]
+            elif isinstance(parsed, str):
+                # «Сырой» JSON-инструмент (тесты дергают функции напрямую):
+                # строка результата закодирована как JSON-строка
+                result = parsed
             result = result.strip()
-            if result and not result.lower().startswith("ошибка"):
+            if result.lower().startswith("ошибка"):
+                continue
+            if name == "write_file":
+                marker = "Файл создан:"
+                if not result.startswith(marker):
+                    continue
+                result = result[len(marker):].strip().strip('"')
+            if result:
                 return result
         return None
 

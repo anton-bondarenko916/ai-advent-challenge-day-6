@@ -41,12 +41,13 @@ class _FakeLauncher:
 class LaunchMcpServersTest(unittest.TestCase):
     """Автозапуск серверов при старте Flet-версии."""
 
-    def _run(self, fail_labels=(), crm_enabled: bool = False):
+    def _run(self, fail_labels=(), crm_enabled: bool = False,
+             fs_enabled: bool = False):
         """Зпатчит настройки и лаунчеры, возвращает (messages, instances).
 
         reminder и geo включены, news и weather выключены — проверяет
-        фильтрацию по enabled. CRM по умолчанию выключен (включается
-        отдельным тестом, ai_1_34).
+        фильтрацию по enabled. CRM и FS по умолчанию выключены
+        (включаются отдельными тестами, ai_1_34/ai_1_35).
         """
         settings = {
             "get_reminder_settings": {"enabled": True,
@@ -59,6 +60,8 @@ class LaunchMcpServersTest(unittest.TestCase):
                                      "host": "127.0.0.1", "port": 8003},
             "get_crm_settings": {"enabled": crm_enabled,
                                  "host": "127.0.0.1", "port": 8004},
+            "get_fs_settings": {"enabled": fs_enabled,
+                                "host": "127.0.0.1", "port": 8005},
         }
         classes = {
             "src.reminder_launcher.ReminderServerLauncher": "Reminder",
@@ -66,6 +69,7 @@ class LaunchMcpServersTest(unittest.TestCase):
             "src.geo_launcher.GeoServerLauncher": "Geo",
             "src.weather_launcher.WeatherServerLauncher": "Weather",
             "src.crm_launcher.CrmServerLauncher": "CRM-сервер",
+            "src.fs_launcher.FsServerLauncher": "FS-сервер",
         }
         instances = {
             name: _FakeLauncher(label, fail=(label in fail_labels))
@@ -107,6 +111,15 @@ class LaunchMcpServersTest(unittest.TestCase):
             instances["src.crm_launcher.CrmServerLauncher"].calls, 1)
         self.assertTrue(
             any(message.startswith("CRM-сервер: ") for message in messages))
+
+    def test_launches_fs_server_when_enabled(self) -> None:
+        """FS-сервер запускается автостартом (ТЗ ai_1_35)."""
+        messages, instances = self._run(fs_enabled=True)
+        self.assertEqual(len(messages), 3, messages)
+        self.assertEqual(
+            instances["src.fs_launcher.FsServerLauncher"].calls, 1)
+        self.assertTrue(
+            any(message.startswith("FS-сервер: ") for message in messages))
 
     def test_error_does_not_break_startup(self) -> None:
         messages, _ = self._run(fail_labels=("Reminder",))

@@ -100,3 +100,17 @@ pyyaml>=6.0
 # только через .env (TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_IDS).
 # ------------------------------------------------------------------
 aiogram>=3.7,<4
+
+# ------------------------------------------------------------------
+# PDF-конспекты платформы обучения (app/learning/pdf.py, ТЗ ai_1_36):
+# HTML+CSS → PDF локально. На Windows WeasyPrint требует GTK runtime
+# с Pango ≥ 1.44 — «GTK3-Runtime Win64» с github.com/tschoonj/
+# GTK-for-Windows-Runtime-Environment-Installer/releases
+# (winget-пакет GTK.GTK3 больше НЕ существует, а GtkD.GtkPlusRuntime.x64
+# несёт Pango 1.43 — WeasyPrint с ним не работает). Рантайм в
+# стандартном каталоге C:\Program Files\GTK3-Runtime Win64 подхватывается
+# автоматически; нестандартный — переменная GTK_RUNTIME_BIN.
+# Пакет ОПЦИОНАЛЕН для приложения: без него вкладка «Обучение»
+# работает, кнопка PDF показывает подсказку по установке.
+# ------------------------------------------------------------------
+weasyprint>=60

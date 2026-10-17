@@ -816,12 +816,14 @@ class CreateAgentWiringTest(unittest.TestCase):
         config.update(overrides)
         return config
 
-    def test_all_enabled_builds_four_clients(self) -> None:
+    def test_all_enabled_builds_five_clients(self) -> None:
+        """reminder/news/geo/weather + fs (ТЗ ai_1_35) — пять клиентов."""
         import main as app_main
 
         agent = app_main.create_agent(self._config())
         try:
-            self.assertEqual(len(agent._tool_clients), 4)
+            self.assertEqual(len(agent._tool_clients), 5)
+            self.assertIsNotNone(agent._fs_client)
         finally:
             agent.close()
 
@@ -829,7 +831,7 @@ class CreateAgentWiringTest(unittest.TestCase):
         import main as app_main
 
         agent = app_main.create_agent(self._config(
-            GEO_ENABLED=False, WEATHER_ENABLED=False,
+            GEO_ENABLED=False, WEATHER_ENABLED=False, FS_ENABLED=False,
         ))
         try:
             self.assertEqual(len(agent._tool_clients), 2)

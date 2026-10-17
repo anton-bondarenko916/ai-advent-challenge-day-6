@@ -3,7 +3,7 @@
 Функция :func:`create_agent` переехала сюда из ``main.py`` (миграция UI на
 Flet): и Tkinter-приложение, и новое Flet-приложение (``app/main.py``)
 собирают один и тот же агент — профили, память, FSM задач, инварианты,
-MCP-клиенты напоминаний/новостей/гео/погоды.
+MCP-клиенты напоминаний/новостей/гео/погоды/файловой системы.
 
 ``main.create_agent`` сохранён как реэкспорт для обратной совместимости
 с тестами (tests/test_startup.py, tests/test_geo_weather.py).
@@ -17,6 +17,7 @@ from typing import Any, Dict
 from src.agent import DeepSeekAgent
 from src.config import (
     PROJECT_ROOT,
+    get_fs_settings,
     get_geo_settings,
     get_invariant_settings,
     get_memory_settings,
@@ -27,6 +28,7 @@ from src.config import (
     get_task_settings,
     get_weather_settings,
 )
+from src.fs_launcher import FsServerLauncher
 from src.geo_launcher import GeoServerLauncher
 from src.news_launcher import NewsServerLauncher
 from src.reminder_client import ReminderMCPClient
@@ -179,6 +181,22 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
             host=weather_settings["host"],
             port=weather_settings["port"],
         ).ensure_running
+
+    # MCP-сервер файловой системы (ТЗ ai_1_35): read/write/search/tree —
+    # LLM в agentic loop сама решает, какие файловые операции выполнить
+    # (сценарии «найти использования компонента» и «сгенерировать файл»).
+    # Доступ ограничен корнем проекта на стороне fs_server.py.
+    fs_client = None
+    fs_settings = get_fs_settings(config)
+    if fs_settings["enabled"]:
+        fs_client = ReminderMCPClient(
+            server_url=fs_settings["url"],
+            label="FS-сервер",
+        )
+        fs_client.restart_hook = FsServerLauncher(
+            host=fs_settings["host"],
+            port=fs_settings["port"],
+        ).ensure_running
     max_tool_rounds = reminder_settings["max_tool_rounds"]
 
     return DeepSeekAgent(
@@ -218,5 +236,7 @@ def create_agent(config: Dict[str, Any]) -> DeepSeekAgent:
         # строит LLM в agentic loop, маршрутизация — по имени инструмента)
         geo_client=geo_client,
         weather_client=weather_client,
+        # Tool calling файловой системы (ТЗ ai_1_35): read/write/search
+        fs_client=fs_client,
         max_tool_rounds=max_tool_rounds,
     )

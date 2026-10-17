@@ -146,7 +146,11 @@ DEFAULTS: Dict[str, Any] = {
     "REMINDER_ENABLED": True,        # False — без напоминаний и автозапуска
     "REMINDER_SERVER_HOST": "127.0.0.1",  # только локально, не хостить!
     "REMINDER_SERVER_PORT": 8000,    # порт http://127.0.0.1:<порт>/mcp
-    "REMINDER_TOOLCALL_MAX_ROUNDS": 5,  # лимит циклов tool calling за ход
+    "REMINDER_TOOLCALL_MAX_ROUNDS": 10,  # лимит циклов tool calling за ход
+                                         # (agentic loop общий для всех
+                                         # MCP-серверов: напоминания,
+                                         # новости, гео/погода, fs — ТЗ
+                                         # ai_1_35: 10 итераций)
     # ------------------------------------------------------------------
     # MCP-сервер новостей (news_server.py, HTTP-транспорт 24/7):
     # search_news (RSS) → summarize_text (DeepSeek) → save_to_file
@@ -183,6 +187,15 @@ DEFAULTS: Dict[str, Any] = {
     "CRM_SERVER_HOST": "127.0.0.1",  # только локально, не хостить!
     "CRM_SERVER_PORT": 8004,         # порт http://127.0.0.1:<порт>/mcp
     # ------------------------------------------------------------------
+    # MCP-сервер файловой системы (fs_server.py, HTTP-транспорт 24/7):
+    # read/write/search/tree — agentic loop сам работает с файлами
+    # проекта (ТЗ ai_1_35). Корень доступа — сам проект (FS_ROOT
+    # переопределяет, вне корня доступ запрещён).
+    # ------------------------------------------------------------------
+    "FS_ENABLED": True,              # False — без файловых инструментов
+    "FS_SERVER_HOST": "127.0.0.1",   # только локально, не хостить!
+    "FS_SERVER_PORT": 8005,          # порт http://127.0.0.1:<порт>/mcp
+    # ------------------------------------------------------------------
     # Состояние UI (сворачивание панели MCP и т.п.): SQLite key-value
     # ------------------------------------------------------------------
     "APP_STATE_PATH": "data/app_state.db",  # путь к БД (относительно корня)
@@ -216,6 +229,13 @@ DEFAULTS: Dict[str, Any] = {
     # в корне проекта.
     # ------------------------------------------------------------------
     "SUPPORT_DOCS_PATH": "",         # "" — support_docs/ в корне проекта
+    # ------------------------------------------------------------------
+    # Платформа обучения (ТЗ ai_1_36): мок-авторизация, план обучения
+    # с ленивой генерацией, проверка заданий через fs MCP, PDF-конспекты
+    # (WeasyPrint). Напоминания идут в существующий reminder-сервер.
+    # ------------------------------------------------------------------
+    "LEARNING_DB_PATH": "data/learning.db",  # БД платформы (относительно корня)
+    "LEARNING_PDF_DIR": "",          # "" — output/pdf в корне проекта
 }
 
 # Переменные, значения которых нужно приводить к логическому типу
@@ -231,6 +251,7 @@ _BOOL_KEYS = (
     "GEO_ENABLED",
     "WEATHER_ENABLED",
     "CRM_ENABLED",
+    "FS_ENABLED",
 )
 
 # Переменные, значения которых нужно приводить к числу
@@ -245,6 +266,7 @@ _INT_KEYS = (
     "REMINDER_SERVER_PORT", "REMINDER_TOOLCALL_MAX_ROUNDS",
     "NEWS_SERVER_PORT", "NEWS_SUMMARY_MAX_TOKENS",
     "GEO_SERVER_PORT", "WEATHER_SERVER_PORT", "CRM_SERVER_PORT",
+    "FS_SERVER_PORT",
     "TELEGRAM_HISTORY_LIMIT",
     "PR_WATCHER_INTERVAL", "PR_WATCHER_TIMEOUT", "PR_WATCHER_TOP_K",
 )
@@ -1061,6 +1083,34 @@ def get_crm_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     }
 
 
+def get_fs_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает и валидирует настройки MCP-сервера файловой системы
+    (ТЗ ai_1_35).
+
+    Некорректные значения заменяются значениями по умолчанию с записью
+    предупреждения в лог (приложение не должно падать из-за конфигурации).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"enabled", "host", "port", "url"}: host — только
+        127.0.0.1 (хостить в интернете запрещено); url — MCP-эндпоинт
+        ``http://<host>:<port>/mcp``.
+    """
+    cfg = config if config is not None else get_config()
+
+    host, port = _local_host_and_port(
+        cfg, "FS_SERVER_HOST", "FS_SERVER_PORT", 8005
+    )
+    return {
+        "enabled": _coerce_bool(cfg.get("FS_ENABLED", True)),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}/mcp",
+    }
+
+
 def get_support_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Собирает настройки RAG поддержки (ТЗ ai_1_34).
 
@@ -1082,6 +1132,30 @@ def get_support_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, A
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return {"docs_path": str(path)}
+
+
+def get_learning_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Собирает настройки платформы обучения (ТЗ ai_1_36).
+
+    Args:
+        config: словарь конфигурации; None — взять из get_config().
+
+    Returns:
+        Словарь {"db_path", "pdf_dir"} — абсолютные пути: БД платформы
+        (пользователи, темы, подтемы, прогресс) и папка PDF-конспектов
+        (пустой LEARNING_PDF_DIR — output/pdf в корне проекта).
+    """
+    cfg = config if config is not None else get_config()
+
+    db_path = Path(str(cfg.get("LEARNING_DB_PATH") or "data/learning.db"))
+    if not db_path.is_absolute():
+        db_path = PROJECT_ROOT / db_path
+
+    raw_pdf = str(cfg.get("LEARNING_PDF_DIR") or "").strip()
+    pdf_dir = Path(raw_pdf) if raw_pdf else PROJECT_ROOT / "output" / "pdf"
+    if not pdf_dir.is_absolute():
+        pdf_dir = PROJECT_ROOT / pdf_dir
+    return {"db_path": str(db_path), "pdf_dir": str(pdf_dir)}
 
 
 def get_geo_settings(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

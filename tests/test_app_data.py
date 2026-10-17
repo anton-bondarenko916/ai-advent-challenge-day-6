@@ -87,13 +87,14 @@ class SampleDocsTest(unittest.TestCase):
 class MainModuleTest(unittest.TestCase):
     """app/main.py: вкладки и дефолтная папка документов."""
 
-    def test_five_tabs(self) -> None:
-        self.assertEqual(len(TAB_TITLES), 5)
+    def test_six_tabs(self) -> None:
+        self.assertEqual(len(TAB_TITLES), 6)
         self.assertIn("Чат", TAB_TITLES[0])
-        self.assertIn("База знаний", TAB_TITLES[1])
-        self.assertIn("Сравнение", TAB_TITLES[2])
-        self.assertIn("RAG-режимы", TAB_TITLES[3])
-        self.assertIn("Настройки", TAB_TITLES[4])
+        self.assertIn("Обучение", TAB_TITLES[1])
+        self.assertIn("База знаний", TAB_TITLES[2])
+        self.assertIn("Сравнение", TAB_TITLES[3])
+        self.assertIn("RAG-режимы", TAB_TITLES[4])
+        self.assertIn("Настройки", TAB_TITLES[5])
 
     def test_default_docs_dir_is_sample_docs(self) -> None:
         self.assertEqual(DEFAULT_DOCS_DIR.name, "docs")

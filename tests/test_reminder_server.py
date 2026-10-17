@@ -881,7 +881,7 @@ class ReminderSettingsTest(unittest.TestCase):
         self.assertEqual(settings["host"], "127.0.0.1")
         self.assertEqual(settings["port"], 8000)
         self.assertEqual(settings["url"], "http://127.0.0.1:8000/mcp")
-        self.assertEqual(settings["max_tool_rounds"], 5)
+        self.assertEqual(settings["max_tool_rounds"], 10)  # ТЗ ai_1_35: agentic loop общий с fs-инструментами
 
     def test_unsafe_host_rejected(self) -> None:
         """Хостить сервер в интернете нельзя — внешний хост → 127.0.0.1."""

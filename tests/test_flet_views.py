@@ -267,7 +267,8 @@ class ComponentsTest(unittest.TestCase):
         panel = components.tools_panel([
             {"name": "create_reminder", "arguments": {}, "result": "ok"}])
         self.assertEqual(panel.title.color, ft.Colors.TEAL_200)
-        self.assertEqual(panel.controls[0].color, ft.Colors.TEAL_200)
+        row = panel.controls[0].controls[0]  # шаги внутри скролл-Column
+        self.assertEqual(row.color, ft.Colors.TEAL_200)
 
 
 class ChatViewTest(unittest.TestCase):

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import traceback
 from typing import Any, Dict, List, Optional
 
@@ -241,28 +242,62 @@ def sources_panel(sources: List[Dict[str, Any]],
     )
 
 
+# Иконки инструментов лога шагов (ТЗ ai_1_35, Модуль 3): fs-сервер +
+# узнаваемые инструменты других серверов; неизвестный — 🔧
+TOOL_ICONS: Dict[str, str] = {
+    "search_within_files": "🔍",
+    "search_files": "🔍",
+    "read_file": "📄",
+    "read_multiple_files": "📚",
+    "write_file": "✍️",
+    "list_directory": "📁",
+    "tree": "🌳",
+    "add_reminder": "⏰",
+    "get_user_city": "📍",
+    "get_weather": "⛅",
+    "search_news": "📰",
+    "get_user_context": "👤",
+    "list_users": "👥",
+}
+
+
+def tool_icon(name: str) -> str:
+    """Иконка инструмента для лога шагов (неизвестный — 🔧)."""
+    return TOOL_ICONS.get(str(name or ""), "🔧")
+
+
 def tools_panel(tool_calls: List[Dict[str, Any]]) -> Optional[ft.ExpansionTile]:
-    """Панель выполненных MCP-инструментов под ответом (напоминания,
-    новости, гео/погода — функциональность agentic loop из src).
-    Светлые цвета — на тёмном пузыре сообщения."""
+    """Панель выполненных MCP-инструментов под ответом — лог шагов
+    agentic loop (напоминания, новости, гео/погода, файловая система).
+    Каждый шаг: номер, иконка, имя, аргументы, обрезанный результат.
+    Скролл с ограничением высоты: длинный лог не растягивает чат
+    (ТЗ ai_1_35). Светлые цвета — на тёмном пузыре сообщения."""
     if not tool_calls:
         return None
     rows: List[ft.Control] = []
-    for call in tool_calls:
+    for step, call in enumerate(tool_calls, 1):
         name = call.get("name") or "?"
         arguments = call.get("arguments") or {}
         result = truncate(str(call.get("result")))
         rows.append(ft.Text(
-            f"🛠 {name} {arguments}\n   → {result}",
+            f"Шаг {step}: {tool_icon(name)} {name} {arguments}\n"
+            f"   → {result}",
             size=12,
             selectable=True,
             color=ft.Colors.TEAL_200,
         ))
+    # Высота панели растёт с числом шагов, но ограничена: дальше — скролл
+    panel_height = min(340.0, 40.0 + 64.0 * len(rows))
     return ft.ExpansionTile(
         title=ft.Text(f"🛠 Инструменты ({len(tool_calls)})", size=13,
                       weight=ft.FontWeight.BOLD,
                       color=ft.Colors.TEAL_200),
-        controls=rows,
+        controls=[ft.Column(
+            rows,
+            scroll=ft.ScrollMode.AUTO,
+            height=panel_height,
+            spacing=6,
+        )],
         expanded=False,
         tile_padding=6,
         icon_color=ft.Colors.TEAL_200,
@@ -270,6 +305,170 @@ def tools_panel(tool_calls: List[Dict[str, Any]]) -> Optional[ft.ExpansionTile]:
         text_color=ft.Colors.TEAL_100,
         collapsed_text_color=ft.Colors.TEAL_200,
     )
+
+
+# ----------------------------------------------------------------------
+# Сводка файловых операций в самом сообщении (ТЗ ai_1_35)
+# ----------------------------------------------------------------------
+FS_SUMMARY_MAX_HITS = 8    # записей search_within_files в сообщении
+FS_SUMMARY_MAX_FILES = 10  # путей search_files в сообщении
+FS_SUMMARY_MAX_BLOCKS = 3  # поисковых блоков в сообщении (модель может
+                           # искать несколько раз — поток блоков топит ответ)
+FS_SUMMARY_SNIPPET = 90    # символов текста найденной строки
+
+# Цвета сводки (светлые — на тёмном пузыре сообщения)
+FS_SEARCH_COLOR = ft.Colors.TEAL_200
+FS_CREATED_COLOR = ft.Colors.GREEN_300
+
+
+def parse_tool_result_json(text: Any) -> Any:
+    """Значение из JSON-результата MCP-инструмента.
+
+    FastMCP оборачивает значение в ``{"result": …}``; принимается и
+    «сырой» JSON (тесты вызывают инструменты напрямую). Не-JSON — None.
+    """
+    try:
+        payload = json.loads(str(text or ""))
+    except (TypeError, ValueError):
+        return None
+    if isinstance(payload, dict) and set(payload) == {"result"}:
+        payload = payload["result"]
+    return payload
+
+
+def _is_error_payload(payload: Any) -> bool:
+    """True, если результат инструмента — ошибка ({"error": …})."""
+    if isinstance(payload, dict):
+        return "error" in payload
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+        return isinstance(first, dict) and "error" in first
+    if isinstance(payload, str):
+        return payload.lstrip().startswith('{"error"')
+    return False
+
+
+def fs_summary_controls(tool_calls: List[Dict[str, Any]]) -> List[ft.Control]:
+    """Сводка файловых операций в ТЕЛЕ сообщения (шаги — в панели ниже).
+
+    Поиск (search_within_files/search_files): что искали и что нашлось —
+    файлы, строки, фрагменты. Создание (write_file): путь сохранённого
+    файла. Ошибки инструментов в сводку не попадают — они видны в логе
+    шагов. Не-fs инструменты игнорируются. Поисковых блоков — не больше
+    FS_SUMMARY_MAX_BLOCKS (модель может искать несколько раз подряд,
+    поток блоков топит ответ).
+    """
+    controls: List[ft.Control] = []
+    search_blocks = 0
+    search_calls = sum(
+        1 for call in (tool_calls or [])
+        if str(call.get("name") or "") in ("search_within_files",
+                                           "search_files"))
+    for call in tool_calls or []:
+        name = str(call.get("name") or "")
+        if name in ("search_within_files", "search_files"):
+            if search_blocks >= FS_SUMMARY_MAX_BLOCKS:
+                continue
+            block = (_search_within_summary(call)
+                     if name == "search_within_files"
+                     else _search_files_summary(call))
+            if block:
+                search_blocks += 1
+                if (search_blocks == FS_SUMMARY_MAX_BLOCKS
+                        and search_calls > FS_SUMMARY_MAX_BLOCKS):
+                    block.append(_summary_text(
+                        f"… ещё {search_calls - FS_SUMMARY_MAX_BLOCKS} "
+                        f"поисков — полные результаты в шагах ниже",
+                        FS_SEARCH_COLOR))
+            controls.extend(block)
+        elif name == "write_file":
+            controls.extend(_write_file_summary(call))
+    return controls
+
+
+def _summary_text(text: str, color: Any) -> ft.Text:
+    """Абзац сводки (выделаемый, размер как у заметок под ответом)."""
+    return ft.Text(text, size=12, selectable=True, color=color)
+
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """Русская форма существительного по числу (1 вхождение, 2 входжения,
+    5 вхождений)."""
+    n = abs(int(count)) % 100
+    if 11 <= n <= 19:
+        return many
+    digit = n % 10
+    if digit == 1:
+        return one
+    if 2 <= digit <= 4:
+        return few
+    return many
+
+
+def _search_within_summary(call: Dict[str, Any]) -> List[ft.Control]:
+    """«🔍 Поиск «X»: N вхождений в M файлах» + список находок."""
+    hits = parse_tool_result_json(call.get("result"))
+    if not isinstance(hits, list) or not hits or _is_error_payload(hits):
+        return []
+    entries = [hit for hit in hits if isinstance(hit, dict) and hit.get("file")]
+    if not entries:
+        return []
+
+    arguments = call.get("arguments") or {}
+    needle = str(arguments.get("substring") or "").strip()
+    directory = str(arguments.get("directory") or "").strip()
+    where = f" (в {directory})" if directory not in ("", ".") else ""
+    files = {str(hit.get("file")) for hit in entries}
+    header = (f"🔍 Поиск «{needle}»{where}: найдено {len(entries)} "
+              f"{_plural(len(entries), 'вхождение', 'вхождения', 'вхождений')} "
+              f"в {len(files)} "
+              f"{_plural(len(files), 'файле', 'файлах', 'файлах')}")
+    lines = [header]
+    for hit in entries[:FS_SUMMARY_MAX_HITS]:
+        snippet = str(hit.get("content") or "")[:FS_SUMMARY_SNIPPET]
+        lines.append(f"   • {hit.get('file')}:{hit.get('line')} — {snippet}")
+    hidden = len(entries) - FS_SUMMARY_MAX_HITS
+    if hidden > 0:
+        lines.append(f"   … ещё {hidden} "
+                     f"{_plural(hidden, 'вхождение', 'вхождения', 'вхождений')} "
+                     f"(полный список — в шагах)")
+    return [_summary_text("\n".join(lines), FS_SEARCH_COLOR)]
+
+
+def _search_files_summary(call: Dict[str, Any]) -> List[ft.Control]:
+    """«🔍 Файлы по шаблону «X»: N» + список путей."""
+    paths = parse_tool_result_json(call.get("result"))
+    if not isinstance(paths, list) or not paths or _is_error_payload(paths):
+        return []
+    entries = [str(path) for path in paths if str(path)]
+    if not entries:
+        return []
+
+    pattern = str((call.get("arguments") or {}).get("pattern") or "*")
+    header = (f"🔍 Файлы по шаблону «{pattern}»: "
+              f"найдено {len(entries)}")
+    lines = [header]
+    lines.extend(f"   • {path}" for path in entries[:FS_SUMMARY_MAX_FILES])
+    hidden = len(entries) - FS_SUMMARY_MAX_FILES
+    if hidden > 0:
+        lines.append(f"   … ещё {hidden} "
+                     f"{_plural(hidden, 'файл', 'файла', 'файлов')} "
+                     f"(полный список — в шагах)")
+    return [_summary_text("\n".join(lines), FS_SEARCH_COLOR)]
+
+
+def _write_file_summary(call: Dict[str, Any]) -> List[ft.Control]:
+    """«✍️ Создан файл: <полный путь>» (путь — куда реально сохранился)."""
+    message = parse_tool_result_json(call.get("result"))
+    if not isinstance(message, str):
+        return []
+    marker = "Файл создан:"
+    if not message.startswith(marker):
+        return []  # ошибка записи — только в логе шагов
+    path = message[len(marker):].strip().strip('"')
+    if not path:
+        return []
+    return [_summary_text(f"✍️ Создан файл: {path}", FS_CREATED_COLOR)]
 
 
 def file_open_button(file_path: str, on_open) -> ft.FilledTonalButton:

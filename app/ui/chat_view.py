@@ -359,6 +359,12 @@ class ChatView:
             content.controls.append(ft.Text(
                 STRATEGY_C_NOTE, size=12,
                 color=components.RAG_WARNING_COLOR, selectable=True))
+        # Сводка файловых операций в самом сообщении (ТЗ ai_1_35):
+        # что нашли поиском по файлам и куда сохранились созданные файлы
+        fs_summary = components.fs_summary_controls(
+            result.get("tool_calls") or [])
+        if fs_summary:
+            content.controls.extend(fs_summary)
         sources_panel = components.sources_panel(
             result.get("sources") or [],
             quotes=result.get("quotes") or None,

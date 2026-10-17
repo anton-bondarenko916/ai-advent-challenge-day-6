@@ -4,11 +4,13 @@
 память задачи: «Состояние диалога» и «Новый диалог», команда /help —
 вопросы о проекте по документации с git-контекстом, команда /support —
 поддержка пользователей: FAQ + контекст CRM, выпадающий список
-пользователей, автодополнение «/»), 📚 База знаний (индексация MD),
-⚖️ Сравнение (10 вопросов × 2 режима), 🔀 Сравнение RAG-режимов
-(5 режимов + автоматические метрики), ⚙️ Настройки (профиль,
-температура, max_tokens, модель, оптимизация, удалённый доступ,
-документация проекта, поддержка).
+пользователей, автодополнение «/»), 🎓 Обучение (платформа обучения
+Android-разработке: мок-авторизация, план 5 тем с ленивой генерацией,
+проверка заданий через fs MCP, PDF-конспекты, напоминания),
+📚 База знаний (индексация MD), ⚖️ Сравнение (10 вопросов × 2 режима),
+🔀 Сравнение RAG-режимов (5 режимов + автоматические метрики),
+⚙️ Настройки (профиль, температура, max_tokens, модель, оптимизация,
+удалённый доступ, документация проекта, поддержка).
 
 Ядро агента — то же, что в Tkinter-версии (src.agent.DeepSeekAgent:
 профили, память, FSM задач, инварианты, MCP-инструменты).
@@ -44,6 +46,11 @@ import flet as ft
 from app.agent import RAGChatAgent
 from app.chat_handler import ChatHandler, build_chat_extractor
 from app.help_pipeline import HelpPipeline, build_git_mcp_client
+from app.learning.db import LearningRepository
+from app.learning.llm import build_json_llm
+from app.learning.pdf import PDFService
+from app.learning.plan import PlanService
+from app.learning.review import ReviewService
 from app.rag.project_rag import PROJECT_DOCS_PATH_KEY, ProjectRAG
 from app.rag.support_rag import (
     SUPPORT_DOCS_PATH_KEY,
@@ -56,12 +63,15 @@ from app.ui import components
 from app.ui.chat_view import ACTIVE_PROVIDER_KEY, ChatView
 from app.ui.comparison_view import ComparisonView
 from app.ui.knowledge_view import KnowledgeView
+from app.ui.learning_view import LearningView
 from app.ui.rag_comparison_view import RAGModesView
 from app.ui.settings_view import SettingsView
 from src.app_state import AppStateStore
 from src.config import (
     get_crm_settings,
+    get_fs_settings,
     get_geo_settings,
+    get_learning_settings,
     get_news_settings,
     get_project_path,
     get_reminder_settings,
@@ -76,7 +86,7 @@ from src.utils import get_logger
 
 logger = get_logger("deepseek-chat.flet")
 
-TAB_TITLES = ("💬 Чат", "📚 База знаний", "⚖️ Сравнение",
+TAB_TITLES = ("💬 Чат", "🎓 Обучение", "📚 База знаний", "⚖️ Сравнение",
               "🔀 RAG-режимы", "⚙️ Настройки")
 
 DEFAULT_DOCS_DIR = PROJECT_ROOT / "app" / "data" / "docs"
@@ -179,6 +189,39 @@ class ChatApp:
             get_support_user_id=lambda: getattr(self, "support_user_id", 0),
         )
 
+        # Платформа обучения (ТЗ ai_1_36): мок-авторизация (SQLite),
+        # ленивая генерация плана (DeepSeek JSON-режим), проверка
+        # заданий через fs MCP (эфемерный fs_server.py с корнем в
+        # папке пользователя), PDF-конспекты (WeasyPrint), напоминания
+        # reminder-сервера. Ошибка сборки не ломает приложение —
+        # вкладка покажет «Модуль обучения недоступен».
+        self.learning_repo = None
+        self.learning_plan = None
+        self.learning_review = None
+        self.learning_pdf = None
+        try:
+            from src.reminder_launcher import ReminderServerLauncher
+            learning = get_learning_settings(config)
+            self.learning_repo = LearningRepository(learning["db_path"])
+            learning_llm = build_json_llm(config)
+            learning_reminder = None
+            reminder_settings = get_reminder_settings(config)
+            if reminder_settings["enabled"]:
+                learning_reminder = ReminderMCPClient(
+                    server_url=reminder_settings["url"],
+                    label="Сервер напоминаний")
+                learning_reminder.restart_hook = ReminderServerLauncher(
+                    host=reminder_settings["host"],
+                    port=reminder_settings["port"]).ensure_running
+            self.learning_plan = PlanService(
+                self.learning_repo, learning_llm, learning_reminder)
+            self.learning_review = ReviewService(
+                self.learning_repo, learning_llm)
+            self.learning_pdf = PDFService(
+                output_dir=learning["pdf_dir"])
+        except Exception as exc:  # noqa: BLE001 — модуль не критичен
+            logger.warning("Платформа обучения недоступна: %s", exc)
+
         page.title = str(config.get("UI_TITLE", "DeepSeek Chat")) + " (Flet)"
         page.padding = 16
         page.window.width = int(config.get("UI_WIDTH", 1000) or 1000)
@@ -189,13 +232,14 @@ class ChatApp:
         page.services.append(self.file_picker)
 
         self.chat_view = ChatView(self)
+        self.learning_view = LearningView(self)
         self.knowledge_view = KnowledgeView(
             self, default_folder=str(DEFAULT_DOCS_DIR))
         self.comparison_view = ComparisonView(self)
         self.rag_modes_view = RAGModesView(self)
         self.settings_view = SettingsView(self)
         self._views = (
-            self.chat_view, self.knowledge_view,
+            self.chat_view, self.learning_view, self.knowledge_view,
             self.comparison_view, self.rag_modes_view,
             self.settings_view,
         )
@@ -374,6 +418,7 @@ def launch_mcp_servers(config: Dict[str, Any]) -> List[str]:
         Список сообщений для лога (метка сервера: результат).
     """
     from src.crm_launcher import CrmServerLauncher
+    from src.fs_launcher import FsServerLauncher
     from src.geo_launcher import GeoServerLauncher
     from src.news_launcher import NewsServerLauncher
     from src.reminder_launcher import ReminderServerLauncher
@@ -397,6 +442,9 @@ def launch_mcp_servers(config: Dict[str, Any]) -> List[str]:
     crm = get_crm_settings(config)
     if crm["enabled"]:
         specs.append(CrmServerLauncher(host=crm["host"], port=crm["port"]))
+    fs = get_fs_settings(config)
+    if fs["enabled"]:
+        specs.append(FsServerLauncher(host=fs["host"], port=fs["port"]))
 
     messages: List[str] = []
     for launcher in specs:
